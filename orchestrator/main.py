@@ -25,6 +25,8 @@ from fastapi import FastAPI
 from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
 from langgraph.store.postgres.aio import AsyncPostgresStore
 
+from orchestrator.graph import build_per_strategy_graph
+
 load_dotenv()
 
 
@@ -54,6 +56,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 
         app.state.saver = saver
         app.state.store = store
+        app.state.graph = build_per_strategy_graph(saver, store)
 
         yield
 
