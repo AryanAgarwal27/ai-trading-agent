@@ -74,3 +74,8 @@ logs/
 # ───────────── LangSmith / runtime caches ─────────────
 .langgraph_cache/
 .langchain_cache/
+
+# ───────────── per-stage test scratch ─────────────
+# Stage 4c integration test writes parallel-fan-out metrics here for
+# operator review; not committed.
+tests/integration/_last_*.txt
