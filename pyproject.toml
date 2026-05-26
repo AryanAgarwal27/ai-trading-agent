@@ -1,0 +1,124 @@
+# Pins follow BRD §4 (tech stack table) and Stage 0 install commands in BRD §13.
+# Later stages will add more deps in their own commits (per SPEC §4.4 rule 3).
+
+[build-system]
+requires = ["hatchling>=1.25"]
+build-backend = "hatchling.build"
+
+[project]
+name = "ai-trading-agent"
+version = "0.0.1"
+description = "LangGraph-orchestrated autonomous agent that proposes, validates, paper-trades and (with HITL approval) live-trades crypto-spot strategies via Freqtrade."
+readme = "README.md"
+requires-python = ">=3.11,<3.14"
+license = { text = "Proprietary — All rights reserved" }
+authors = [
+    { name = "Aryan Agarwal" },
+]
+keywords = ["langgraph", "freqtrade", "freqai", "crypto", "trading", "agent"]
+classifiers = [
+    "Private :: Do Not Upload",
+    "Programming Language :: Python :: 3.12",
+]
+
+# Runtime deps mirror BRD §13 Stage 0 install list.
+# Versions match BRD §4.
+dependencies = [
+    "langgraph==1.2.*",
+    "langgraph-checkpoint-postgres==3.1.*",
+    "langgraph-store-postgres==0.3.*",
+    "langchain==1.3.*",
+    "langchain-anthropic==1.3.*",
+    "fastapi==0.115.*",
+    "uvicorn[standard]>=0.30,<1.0",
+    "streamlit==1.40.*",
+    "apscheduler==3.10.*",
+    "httpx==0.27.*",
+    "pydantic==2.9.*",
+    "alembic==1.13.*",
+    "psycopg[binary]==3.2.*",
+    "sqlalchemy==2.0.*",
+    "redis==5.0.*",
+    "python-dotenv==1.0.*",
+]
+
+[dependency-groups]
+# Dev tooling — PEP 735 dependency group. Install with `pip install --group dev`.
+# Matches BRD §13 Stage 0 dev install.
+dev = [
+    "pytest==8.*",
+    "pytest-asyncio==0.24.*",
+    "ruff==0.7.*",
+    "mypy==1.13.*",
+    "pre-commit==4.*",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["orchestrator"]
+
+# ───────────────────────── Ruff ─────────────────────────
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+extend-exclude = [
+    "freqtrade/user_data",
+    "strategy_templates/_generated",
+    ".venv",
+]
+
+[tool.ruff.lint]
+# Conservative initial selection; tighten in Stage 11 hardening.
+select = [
+    "E",   # pycodestyle errors
+    "F",   # pyflakes
+    "W",   # pycodestyle warnings
+    "I",   # isort
+    "B",   # flake8-bugbear
+    "UP",  # pyupgrade
+    "ASYNC", # flake8-async
+]
+ignore = [
+    "E501",  # line length is enforced by formatter
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**/*.py" = ["B011"]  # allow assert False in test scaffolds
+
+# ───────────────────────── mypy ─────────────────────────
+[tool.mypy]
+python_version = "3.12"
+strict = true
+warn_unused_ignores = true
+warn_redundant_casts = true
+warn_return_any = true
+no_implicit_optional = true
+disallow_untyped_decorators = false  # langchain/langgraph decorators are partially untyped
+plugins = ["pydantic.mypy"]
+
+# Per-module relaxations for third-party libs without stubs.
+[[tool.mypy.overrides]]
+module = [
+    "apscheduler.*",
+    "freqtrade.*",
+]
+ignore_missing_imports = true
+
+# ───────────────────────── pytest ─────────────────────────
+[tool.pytest.ini_options]
+minversion = "8.0"
+testpaths = ["tests"]
+asyncio_mode = "auto"
+addopts = [
+    "-ra",
+    "--strict-markers",
+    "--strict-config",
+]
+markers = [
+    "integration: marks integration tests (deselect with -m 'not integration')",
+    "freqtrade: tests that require a Freqtrade container or subprocess",
+]
+filterwarnings = [
+    "error",
+    # langchain/pydantic deprecation noise can be allowlisted here as needed
+    "ignore::DeprecationWarning:pydantic.*",
+]

@@ -1,0 +1,73 @@
+# Stage 0 infra: Postgres (with pgvector) + Redis.
+#
+# Conventions (BRD §15):
+#   - All ports bound to 127.0.0.1 only. No public exposure.
+#   - Postgres uses SCRAM-SHA-256 (set via POSTGRES_HOST_AUTH_METHOD).
+#   - Named volumes; data survives `docker compose down` (not `down -v`).
+#
+# Compose v2 — no `version:` key needed.
+
+name: ai-trading-agent
+
+services:
+  postgres:
+    # pgvector/pgvector:pg15 = postgres:15 with pgvector extension preinstalled
+    # (BRD §4 pins Postgres 15.x; pgvector required per BRD §5.8 #2).
+    image: pgvector/pgvector:pg15
+    container_name: ait-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-trading_agent}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-change_me_local_only}
+      # Bootstrap DB; the three logical DBs are created by 01_create_databases.sql.
+      POSTGRES_DB: postgres
+      POSTGRES_HOST_AUTH_METHOD: scram-sha-256
+      POSTGRES_INITDB_ARGS: "--auth-host=scram-sha-256 --auth-local=scram-sha-256"
+    ports:
+      # Host port is overridable per machine (e.g. if 5432 is taken by another
+      # local project). Container port is fixed at 5432.
+      - "127.0.0.1:${POSTGRES_HOST_PORT:-5432}:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./db/init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test:
+        - "CMD-SHELL"
+        - "pg_isready -U ${POSTGRES_USER:-trading_agent} -d postgres -h 127.0.0.1"
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 10s
+
+  redis:
+    # APScheduler jobstore (BRD §4) + pubsub for kill_switch events (BRD §5.6).
+    image: redis:7-alpine
+    container_name: ait-redis
+    restart: unless-stopped
+    command:
+      - "redis-server"
+      - "--save"
+      - "60"
+      - "1"
+      - "--loglevel"
+      - "warning"
+      - "--bind"
+      - "0.0.0.0"
+      - "--protected-mode"
+      - "yes"
+    ports:
+      - "127.0.0.1:${REDIS_HOST_PORT:-6379}:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 5s
+
+volumes:
+  postgres_data:
+    name: ait_postgres_data
+  redis_data:
+    name: ait_redis_data

@@ -1,0 +1,76 @@
+# ───────────── secrets & local config ─────────────
+.env
+.env.*
+!.env.example
+secrets/
+*.pem
+*.key
+*.crt
+
+# ───────────── Freqtrade per-host artefacts ─────────────
+# Shared OHLCV cache and per-worker userdirs are local/large; never commit.
+freqtrade/user_data/data/
+freqtrade/user_data/_workers/
+freqtrade/user_data/backtest_results/
+freqtrade/user_data/hyperopt_results/
+freqtrade/user_data/logs/
+freqtrade/user_data/models/
+freqtrade/user_data/strategies/*.json  # exchange-pair caches
+
+# LLM-rendered strategies (generator output is regenerated per run; only templates are versioned)
+strategy_templates/_generated/
+
+# ───────────── Python ─────────────
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+.venv/
+venv/
+env/
+.eggs/
+*.egg-info/
+*.egg
+build/
+dist/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+.nox/
+
+# ───────────── alembic local cache ─────────────
+db/migrations/__pycache__/
+
+# ───────────── Office / Word lockfiles & stray docs ─────────────
+# Office writes ~$Foo.docx lockfiles next to open files; never commit.
+~$*
+*.docx
+*.doc
+*.xlsx
+*.xls
+*.pptx
+*.ppt
+
+# ───────────── OS / IDE ─────────────
+.DS_Store
+Thumbs.db
+desktop.ini
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# ───────────── Docker volumes / runtime ─────────────
+.docker-volumes/
+*.log
+logs/
+
+# ───────────── LangSmith / runtime caches ─────────────
+.langgraph_cache/
+.langchain_cache/
