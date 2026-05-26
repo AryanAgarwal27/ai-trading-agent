@@ -106,3 +106,4 @@ Per BRD §13 Stage 0 DoD:
 |---|---|---|
 | 2026-05-26 | Initial SPEC — §18 Q1–Q8 locked; BRD §13 backup-target deviation documented (§3.1); operator-experience notes added (§4) | Aryan + Claude Code |
 | 2026-05-26 | Added kill-switch row to §4.1 dashboard table; added §4.4 session protocol (binding on every session); added LICENSE + tests skeleton + smoke test to §5 deliverables; aligned §5 with git standing rules (no auto-push, no auto-tag) | Aryan + Claude Code |
+| 2026-05-27 | BRD §4 + §13 corrected: dropped phantom `langgraph-store-postgres==0.3.*` pin (no such PyPI distribution); `AsyncPostgresStore` ships in `langgraph-checkpoint-postgres` per the official langgraph 1.x docs. `pyproject.toml` runtime deps updated atomically in the same commit. | Aryan + Claude Code |

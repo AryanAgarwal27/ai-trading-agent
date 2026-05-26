@@ -107,8 +107,7 @@ Claude Code is responsible for everything else: installing Freqtrade, FreqAI, La
 | Freqtrade | **2026.4** | latest stable; monthly release cadence. |
 | FreqAI | bundled in Freqtrade 2026.4 | install via the `freqtradeorg/freqtrade:stable_freqai` Docker image (or `:stable_freqairl` for RL). |
 | LangGraph | **1.2.x** (≥1.2.0) | functional API GA; `interrupt()` dynamic form is the recommended HITL primitive. |
-| langgraph-checkpoint-postgres | **3.1.x** | required for the PostgresSaver. |
-| langgraph-store-postgres | **0.3.x** | required for the long-term Store. |
+| langgraph-checkpoint-postgres | **3.1.x** | required for the PostgresSaver **and** the PostgresStore — `AsyncPostgresStore` (and its sync counterpart) ships in `langgraph.store.postgres[.aio]` inside this package. There is no separate `langgraph-store-postgres` distribution on PyPI (verified against the official LangChain langgraph docs install snippet). |
 | LangChain | **1.3.x** (≥1.3.1) | use `langchain.agents.create_agent` — NOT the deprecated `langgraph.prebuilt.create_react_agent`. |
 | langchain-anthropic | **1.3.3+** | `ChatAnthropic` integration. |
 | Anthropic Claude models | `claude-opus-4-7`, `claude-sonnet-4-6`, `claude-haiku-4-5-20251001` | Opus for ideation/critic/risk; Sonnet for researcher/coordinator; Haiku for routine paper monitor. |
@@ -804,7 +803,6 @@ python -m pip install -U pip
 pip install \
   "langgraph==1.2.*" \
   "langgraph-checkpoint-postgres==3.1.*" \
-  "langgraph-store-postgres==0.3.*" \
   "langchain==1.3.*" \
   "langchain-anthropic==1.3.*" \
   "fastapi==0.115.*" "uvicorn[standard]" \
