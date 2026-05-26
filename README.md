@@ -22,6 +22,16 @@ git log --oneline -20
 git tag --list 'stage-*-complete'
 ```
 
+## Resetting local infrastructure
+
+`docker compose down -v` wipes the named Postgres volume (`ait_postgres_data`). The init script in [db/init/01_create_databases.sql](db/init/01_create_databases.sql) re-creates the three logical DBs + pgvector on the next `docker compose up`, but the `app` schema (the five tables from BRD §5.8) is Alembic-owned and **must be re-applied manually**:
+
+```sh
+.\.venv\Scripts\alembic.exe upgrade head
+```
+
+The LangGraph saver/store tables (`checkpoints*`, `store*`) are recreated automatically by the FastAPI lifespan calling `checkpointer.setup()` / `store.setup()` on next app start.
+
 ## License
 
 Private; all rights reserved. See [`LICENSE`](LICENSE).
