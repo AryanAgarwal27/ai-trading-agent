@@ -8,6 +8,8 @@ node persists as a terminal sink across the full lifecycle (BRD §5.3, §5.9).
 
 from __future__ import annotations
 
+from typing import Any
+
 from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
 from langgraph.graph import END, START, StateGraph
 from langgraph.graph.state import CompiledStateGraph
@@ -16,11 +18,11 @@ from langgraph.store.postgres.aio import AsyncPostgresStore
 from orchestrator.state import StrategyState
 
 
-def research_stub(state: StrategyState) -> dict:
+def research_stub(state: StrategyState) -> dict[str, Any]:
     return {"stage": "archived"}
 
 
-def archive(state: StrategyState) -> dict:
+def archive(state: StrategyState) -> dict[str, Any]:
     return {
         "failure_reason": state.get("failure_reason") or "stage_2_skeleton_run",
     }
@@ -29,8 +31,10 @@ def archive(state: StrategyState) -> dict:
 def build_per_strategy_graph(
     saver: AsyncPostgresSaver,
     store: AsyncPostgresStore,
-) -> CompiledStateGraph:
-    builder: StateGraph = StateGraph(StrategyState)
+) -> CompiledStateGraph[StrategyState, StrategyState, StrategyState, StrategyState]:
+    builder: StateGraph[StrategyState, StrategyState, StrategyState, StrategyState] = StateGraph(
+        StrategyState
+    )
     builder.add_node("research_stub", research_stub)
     builder.add_node("archive", archive)
     builder.add_edge(START, "research_stub")

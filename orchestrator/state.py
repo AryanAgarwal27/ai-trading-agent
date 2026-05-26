@@ -8,7 +8,7 @@ parallel workers' writes overwrite each other.
 from __future__ import annotations
 
 from operator import add
-from typing import Annotated, Literal, Optional, TypedDict
+from typing import Annotated, Any, Literal, TypedDict
 
 
 class BacktestResult(TypedDict):
@@ -26,7 +26,7 @@ class BacktestResult(TypedDict):
 
 class RobustnessResult(TypedDict):
     kind: Literal["monte_carlo", "regime", "fee_stress", "walk_forward"]
-    payload: dict
+    payload: dict[str, Any]
 
 
 class AgentVote(TypedDict):
@@ -53,8 +53,8 @@ class StrategyState(TypedDict):
     name: str
     hypothesis: str
     template: str
-    params: dict
-    freqai_config: Optional[dict]
+    params: dict[str, Any]
+    freqai_config: dict[str, Any] | None
     pairs: list[str]
     timeframe: str
 
@@ -71,17 +71,17 @@ class StrategyState(TypedDict):
     critic_notes: list[str]
 
     # Gate audit
-    gate_decisions: dict
+    gate_decisions: dict[str, Any]
 
     # Execution
-    freqtrade_userdir: Optional[str]
-    freqtrade_process_id: Optional[int]
-    freqtrade_api_url: Optional[str]
-    artifacts: dict
+    freqtrade_userdir: str | None
+    freqtrade_process_id: int | None
+    freqtrade_api_url: str | None
+    artifacts: dict[str, Any]
 
     # Timestamps
     started_at: str
     last_updated: str
 
     # Terminal
-    failure_reason: Optional[str]
+    failure_reason: str | None

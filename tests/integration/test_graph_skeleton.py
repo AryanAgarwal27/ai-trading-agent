@@ -23,7 +23,7 @@ from __future__ import annotations
 
 import os
 import uuid
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 import psycopg
 import pytest
@@ -33,7 +33,7 @@ from orchestrator.state import StrategyState
 
 
 def _initial_state(strategy_id: str) -> StrategyState:
-    now = datetime.now(timezone.utc).isoformat()
+    now = datetime.now(UTC).isoformat()
     return {
         "strategy_id": strategy_id,
         "name": "stage-2-skeleton",
@@ -91,6 +91,6 @@ async def test_skeleton_graph_persists_checkpoint_under_thread_id() -> None:
                 row = await cur.fetchone()
 
         assert row is not None
-        assert row[0] >= 1, (
-            f"expected at least one checkpoints row for thread_id={thread_id}, got {row[0]}"
-        )
+        assert (
+            row[0] >= 1
+        ), f"expected at least one checkpoints row for thread_id={thread_id}, got {row[0]}"

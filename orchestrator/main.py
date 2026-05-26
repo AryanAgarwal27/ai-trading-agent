@@ -17,8 +17,8 @@ dev and pytest both see the right values without extra wiring.
 from __future__ import annotations
 
 import os
+from collections.abc import AsyncIterator
 from contextlib import AsyncExitStack, asynccontextmanager
-from typing import AsyncIterator
 
 from dotenv import load_dotenv
 from fastapi import FastAPI
@@ -33,9 +33,7 @@ load_dotenv()
 def _require_env(name: str) -> str:
     value = os.environ.get(name)
     if not value:
-        raise RuntimeError(
-            f"{name} is not set. Copy .env.example to .env and fill it in."
-        )
+        raise RuntimeError(f"{name} is not set. Copy .env.example to .env and fill it in.")
     return value
 
 
@@ -45,12 +43,8 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     store_uri = _require_env("LANGGRAPH_STORE_URI")
 
     async with AsyncExitStack() as stack:
-        saver = await stack.enter_async_context(
-            AsyncPostgresSaver.from_conn_string(checkpoint_uri)
-        )
-        store = await stack.enter_async_context(
-            AsyncPostgresStore.from_conn_string(store_uri)
-        )
+        saver = await stack.enter_async_context(AsyncPostgresSaver.from_conn_string(checkpoint_uri))
+        store = await stack.enter_async_context(AsyncPostgresStore.from_conn_string(store_uri))
         await saver.setup()
         await store.setup()
 
