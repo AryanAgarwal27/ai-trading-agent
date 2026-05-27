@@ -200,14 +200,12 @@ def test_build_interrupt_payload_live_pause_review_coordinator_path_when_no_kill
 # ─── autoresume_for_test ────────────────────────────────────────────────
 
 
+# NOTE: bare ``dict[str, Any]`` as a StateGraph schema causes LangGraph to
+# REPLACE the values dict on each node return instead of merging per-key —
+# intermediate writes (``approved``/``notes`` from a gate) get dropped by the
+# next node. A TypedDict (even total=False) restores per-key merge semantics.
 class _TestState(TypedDict, total=False):
-    """Minimal TypedDict schema for the autoresume test graphs.
-
-    Using a TypedDict (rather than bare ``dict[str, Any]``) gives the
-    LangGraph state merger per-key semantics — without it the framework
-    replaces the whole values dict on each node return, dropping the
-    ``approved`` / ``notes`` keys the gate wrote.
-    """
+    """Minimal TypedDict schema for the autoresume test graphs."""
 
     strategy_id: str
     touched: bool
