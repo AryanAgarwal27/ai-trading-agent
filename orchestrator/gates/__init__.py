@@ -8,7 +8,7 @@ risk:
   threshold values. The validation, paper, and live subgraphs all import from
   here. SPEC §2 confirms no v1 overrides; re-tuning lands here (and only
   here) per the BRD's "do not put thresholds anywhere else" rule.
-- :mod:`orchestrator.gates.hitl` (Stage 6) — ``interrupt()`` helpers and the
-  ``resume_thread`` plumbing. Not present yet; placeholder so the package
-  shape doesn't churn between stages.
+- :mod:`orchestrator.gates.hitl` (Stage 6) — ``interrupt()`` payload builder
+  + autoresume test helper. No FastAPI / Streamlit imports here; the
+  resume endpoint lands in Stage 6c on top of these primitives.
 """
