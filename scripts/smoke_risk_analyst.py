@@ -6,6 +6,12 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import asyncio  # noqa: E402
 
+# Windows event-loop convention (see scripts/README.md). MUST be set
+# BEFORE any psycopg / langgraph import, including transitive ones via
+# the dotenv / orchestrator imports below.
+if sys.platform == "win32":
+    asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+
 from dotenv import load_dotenv  # noqa: E402
 
 load_dotenv()

@@ -53,8 +53,13 @@ services:
       - "warning"
       - "--bind"
       - "0.0.0.0"
+      # protected-mode no: the host port mapping (127.0.0.1:6379:6379 below)
+      # is the real network boundary, and the orchestrator + future sibling
+      # containers reach Redis over the docker bridge — non-loopback from
+      # Redis's view — so protected-mode-yes would silently reject every
+      # publisher. See SPEC §6 change log 2026-05-27 Stage 6 finding.
       - "--protected-mode"
-      - "yes"
+      - "no"
     ports:
       - "127.0.0.1:${REDIS_HOST_PORT:-6379}:6379"
     volumes:
