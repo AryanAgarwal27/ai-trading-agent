@@ -60,10 +60,11 @@ from typing import Annotated, Any, Literal, TypedDict
 from langgraph.checkpoint.base import BaseCheckpointSaver
 from langgraph.graph import END, START, StateGraph
 from langgraph.graph.state import CompiledStateGraph
-from langgraph.types import Command, Send
+from langgraph.types import Command, Send, interrupt
 
+from orchestrator.agents.risk_analyst import risk_analyst_node
 from orchestrator.gates import thresholds
-from orchestrator.state import BacktestResult, RobustnessResult
+from orchestrator.state import AgentVote, BacktestResult, RobustnessResult
 from orchestrator.tools.backtest_runner import (
     SHARED_DATA_DIR,
     cleanup_stale_workers,
@@ -81,6 +82,13 @@ CheckpointSaver = BaseCheckpointSaver[Any]
 # Freqtrade subprocess and we want the orchestrator's event loop to schedule
 # other Sends while one is in-flight.
 BacktestWorkerFn = Callable[[dict[str, Any]], Awaitable[BacktestResult]]
+
+# ─── Risk analyst injection seam (Stage 4e) ────────────────────────────
+# The default is the real Opus 4.7 agent from orchestrator.agents.risk_analyst.
+# Integration tests pass a stub returning a deterministic Command so the
+# CI gate doesn't burn LLM tokens; the operator's manual smoke check is
+# what exercises the real path before tagging.
+RiskAnalystFn = Callable[[dict[str, Any]], Awaitable[Command[Literal["paper_gate", "archive"]]]]
 
 
 class ValidationState(TypedDict, total=False):
@@ -112,6 +120,17 @@ class ValidationState(TypedDict, total=False):
     # Send fan-out is incorrect without these — parallel writes overwrite.
     backtest_results: Annotated[list[BacktestResult], add]
     robustness_results: Annotated[list[RobustnessResult], add]
+
+    # ─── Agent votes (reducer) ───────────────────────────────────
+    # risk_analyst (Stage 4e), critic (Stage 5), monitors (Stage 7+) all
+    # append to this list. Annotated reducer means a multi-agent fan-out
+    # (live coordinator, Stage 8) can write in parallel.
+    agent_votes: Annotated[list[AgentVote], add]
+
+    # ─── Identity (passed through from parent graph) ─────────────
+    # Stage 4 tests omit this; the parent per-strategy graph (Stage 5+)
+    # populates it. paper_gate's interrupt payload uses it.
+    strategy_id: str
 
     # ─── Gate verdicts + lifecycle ────────────────────────────────
     gate_decisions: dict[str, Any]
@@ -832,26 +851,62 @@ def archive(state: ValidationState) -> dict[str, Any]:
     }
 
 
-# ─── 4e placeholder ────────────────────────────────────────────────────
+# ─── paper_gate HITL interrupt stub (BRD §6.2, full impl in Stage 6) ───
 
 
-def risk_analyst_placeholder(state: ValidationState) -> dict[str, Any]:
-    """4e will replace this with the real Opus 4.7 ReAct agent.
+def paper_gate(state: ValidationState) -> dict[str, Any]:
+    """Minimal HITL gate stub. Full implementation lands in Stage 6.
 
-    For 4d, the gate_robustness pass-path needs a destination node; this
-    stub satisfies that requirement without introducing the LLM
-    dependency. It writes a benign sentinel into gate_decisions so the
-    integration test can verify the pass-path is reachable.
+    Calls ``interrupt()`` with a structured payload (BRD §6.2 pattern);
+    LangGraph pauses the graph until a ``Command(resume=...)`` arrives.
+    Stage 6's ``gates/hitl.py`` will add the resume payload validation,
+    audit-log writing, and the Streamlit dashboard wiring.
+
+    The interrupt payload includes everything the dashboard needs to
+    render the gate per SPEC §4.1: backtest summary, robustness summary,
+    risk_analyst rationale and verdict — agent rationale prominent above
+    metrics tables.
+
+    Important property of ``interrupt()`` (BRD §6.2): when resumed, this
+    node REPLAYS from its start, so it must be side-effect-free. The
+    actual paper-instance spawn happens in the next node (Stage 7's
+    ``paper_spawn``); this one only decides "advance to paper" vs
+    "archive".
     """
-    gates = state.get("gate_decisions") or {}
-    return {
-        "gate_decisions": {
-            **gates,
-            "paper_gate": {
-                "stage_4d_placeholder": True,
-                "note": "Stage 4e replaces this with risk_analyst (Opus 4.7) + paper_gate interrupt.",
+    decision = interrupt(
+        {
+            "kind": "paper_gate",
+            "strategy_id": state.get("strategy_id", "<unset>"),
+            "summary": {
+                "backtest": (state.get("gate_decisions") or {}).get("backtest", {}),
+                "robustness": (state.get("gate_decisions") or {}).get("robustness", {}),
+                "risk_analyst": (state.get("gate_decisions") or {}).get("risk_analyst", {}),
             },
         }
+    )
+
+    # Stage 6 will validate the resume payload shape and write a
+    # gate_audits row. For 4e's stub we trust the payload and record
+    # the human decision under gate_decisions["paper_gate"].
+    existing_gates = state.get("gate_decisions") or {}
+    notes = decision.get("notes", "") if isinstance(decision, dict) else ""
+    approved = bool(decision.get("approved", False)) if isinstance(decision, dict) else False
+
+    if not approved:
+        return {
+            "stage": "archived",
+            "failure_reason": f"paper_gate_rejected: {notes}",
+            "gate_decisions": {
+                **existing_gates,
+                "paper_gate": {"approved": False, "notes": notes, "by": "human"},
+            },
+        }
+    return {
+        "stage": "paper",
+        "gate_decisions": {
+            **existing_gates,
+            "paper_gate": {"approved": True, "notes": notes, "by": "human"},
+        },
     }
 
 
@@ -863,9 +918,10 @@ def risk_analyst_placeholder(state: ValidationState) -> dict[str, Any]:
 def build_validation_subgraph(
     worker_fn: BacktestWorkerFn,
     *,
+    risk_analyst_fn: RiskAnalystFn | None = None,
     checkpointer: CheckpointSaver | None = None,
 ) -> CompiledStateGraph[ValidationState, ValidationState, ValidationState, ValidationState]:
-    """Compile the Stage 4d validation subgraph.
+    """Compile the Stage 4e validation subgraph.
 
     Topology::
 
@@ -886,14 +942,22 @@ def build_validation_subgraph(
                                                  ↓
                                           gate_robustness ──fail──> archive ──> END
                                                  ↓ pass
-                                          risk_analyst (4e replaces stub)
-                                                 ↓
-                                                END
+                                          risk_analyst (Opus 4.7) ──reject──> archive
+                                                 ↓ approve
+                                          paper_gate (interrupt → HITL)
+                                                 ├──approved──> stage="paper" → END
+                                                 └──rejected──> archive ──> END
 
     Parameters
     ----------
     worker_fn
         Async function mapping a Send payload to a ``BacktestResult``.
+    risk_analyst_fn
+        Optional override for the risk_analyst node. Defaults to the
+        real Opus 4.7 ReAct agent from
+        :mod:`orchestrator.agents.risk_analyst`. Integration tests pass
+        a stub returning a deterministic ``Command`` so CI doesn't burn
+        LLM tokens.
     checkpointer
         Optional saver. Unit tests pass ``InMemorySaver``; production
         wires ``AsyncPostgresSaver`` from the FastAPI lifespan.
@@ -902,6 +966,8 @@ def build_validation_subgraph(
     async def backtest_worker(payload: dict[str, Any]) -> dict[str, Any]:
         result = await worker_fn(payload)
         return {"backtest_results": [result]}
+
+    risk_analyst = risk_analyst_fn or risk_analyst_node
 
     builder: StateGraph[ValidationState, ValidationState, ValidationState, ValidationState] = (
         StateGraph(ValidationState)
@@ -920,15 +986,18 @@ def build_validation_subgraph(
     builder.add_node("aggregate_robustness", aggregate_robustness)
     builder.add_node("gate_robustness", gate_robustness)
 
-    builder.add_node("risk_analyst", risk_analyst_placeholder)
+    # risk_analyst returns Command(goto=...) routing to paper_gate or
+    # archive. Same "closure-async LangGraph generic" false positive
+    # as backtest_worker hits here.
+    builder.add_node("risk_analyst", risk_analyst)  # type: ignore[arg-type]
+    builder.add_node("paper_gate", paper_gate)
     builder.add_node("archive", archive)
 
     builder.add_edge(START, "plan_backtests")
     builder.add_conditional_edges("plan_backtests", plan_backtests, ["backtest_worker"])
     builder.add_edge("backtest_worker", "aggregate_results")
     builder.add_edge("aggregate_results", "gate_backtest")
-    # gate_backtest returns Command(goto=...) so no explicit edge needed
-    # — but LangGraph still requires the destination nodes to exist.
+    # gate_backtest returns Command(goto=...) so no explicit edge needed.
 
     builder.add_conditional_edges(
         "plan_robustness",
@@ -940,8 +1009,8 @@ def build_validation_subgraph(
     builder.add_edge("fee_stress_worker", "aggregate_robustness")
     builder.add_edge("aggregate_robustness", "gate_robustness")
     # gate_robustness returns Command(goto=...).
-
-    builder.add_edge("risk_analyst", END)
+    # risk_analyst returns Command(goto="paper_gate" | "archive").
+    builder.add_edge("paper_gate", END)
     builder.add_edge("archive", END)
 
     return builder.compile(checkpointer=checkpointer)

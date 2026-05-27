@@ -38,7 +38,9 @@ from typing import Any
 import pytest
 from langchain_core.runnables import RunnableConfig
 from langgraph.checkpoint.memory import InMemorySaver
+from langgraph.types import Command
 
+from orchestrator.agents.risk_analyst import RiskVerdict, verdict_to_command
 from orchestrator.state import BacktestResult
 from orchestrator.subgraphs.validation import (
     ValidationState,
@@ -50,6 +52,27 @@ from orchestrator.tools.backtest_runner import (
     cleanup_worker,
     run_backtest,
 )
+
+
+async def _stub_risk_analyst(state: dict[str, Any]) -> Command[Any]:
+    """Deterministic risk_analyst stub for integration tests.
+
+    Per Stage 4e precision #5: the real Opus call is the operator's
+    manual smoke check, not part of CI. This stub always returns an
+    approve verdict so any test path that reaches risk_analyst routes
+    forward (the test's earlier-gate assertions will still archive
+    failing baselines before this stub fires).
+    """
+    return verdict_to_command(
+        RiskVerdict(
+            decision="approve",
+            primary_concern="stub: deterministic approve for integration testing",
+            rationale="Integration tests stub risk_analyst; real Opus is operator smoke.",
+            confidence=1.0,
+        ),
+        existing_gates=state.get("gate_decisions") or {},
+    )
+
 
 REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 STRATEGY_PATH = REPO_ROOT / "strategy_templates" / "mean_reversion_template.py"
@@ -159,7 +182,11 @@ async def test_five_parallel_real_freqtrade_workers_aggregate_and_gate(
             param_set_id=ps["id"],
         )
 
-    graph = build_validation_subgraph(real_worker, checkpointer=InMemorySaver())
+    graph = build_validation_subgraph(
+        real_worker,
+        risk_analyst_fn=_stub_risk_analyst,
+        checkpointer=InMemorySaver(),
+    )
 
     initial: ValidationState = {
         "strategy_path": str(STRATEGY_PATH),
@@ -334,7 +361,11 @@ async def test_full_pipeline_runs_robustness_when_gate_backtest_passes(
             raw_zip_path=real["raw_zip_path"],
         )
 
-    graph = build_validation_subgraph(passing_worker, checkpointer=InMemorySaver())
+    graph = build_validation_subgraph(
+        passing_worker,
+        risk_analyst_fn=_stub_risk_analyst,
+        checkpointer=InMemorySaver(),
+    )
 
     initial: ValidationState = {
         "strategy_path": str(STRATEGY_PATH),
