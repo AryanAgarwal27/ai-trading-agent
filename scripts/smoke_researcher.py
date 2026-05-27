@@ -1,15 +1,18 @@
-"""Operator-run smoke probe: real Sonnet 4.6 researcher → generator end-to-end.
+"""Operator-run smoke probe: real Sonnet/Opus end-to-end research subgraph.
 
-Mirrors scripts/smoke_risk_analyst.py shape. Loads .env, invokes the
-research subgraph against a synthetic post-validation state, prints the
-metrics-pause report the operator asked for after Stage 5c:
+Loads .env, invokes the full Stage 5e research subgraph (load_context
+→ researcher → generator → critic → revise_or_proceed → lookahead_gate)
+against a synthetic post-validation state, prints:
 
   (a) Wall-clock time
   (b) Selected template + one-line rationale
   (c) Structured-output verdict (binary yes/no)
   (d) AST validator verdict on rendered output
   (e) Size of strategy_templates/_generated/<strategy_id>.py
-  (f) Token cost (sum across researcher + generator Sonnet calls)
+  (f) Token cost (LangSmith pointer)
+  (g) Critic loop: revision_count + per-verdict pass/revise/primary_concern
+  (h) Lookahead gate: passed/details/worker_dir
+  (i) Agent vote trail: end-to-end lifecycle audit
 
 Run from the repo root::
 
@@ -17,7 +20,10 @@ Run from the repo root::
 
 Requires ANTHROPIC_API_KEY in .env. No PostgresStore needed — an
 InMemoryStore pre-seeded with one fake failure + one fake win exercises
-the query_store tool path without standing up Postgres.
+the query_store tool path without standing up Postgres. The lookahead
+gate invokes the REAL Freqtrade Docker subprocess; ensure docker is
+running and the BTC/USDT 5m feather is cached under
+freqtrade/user_data/data/binance/ before the smoke.
 """
 
 from __future__ import annotations
@@ -107,7 +113,7 @@ async def main() -> None:
     wall_clock = time.perf_counter() - t0
 
     print("\n" + "=" * 72)
-    print(" 5c METRICS REPORT")
+    print(" 5e METRICS REPORT")
     print("=" * 72)
 
     # (a) Wall clock
@@ -166,19 +172,58 @@ async def main() -> None:
 
     # (f) Token cost — extract from each agent vote's rationale where
     # available, plus walk the checkpoint history to sum usage_metadata.
-    # In 5c we don't aggregate token cost directly because the agent
-    # doesn't surface it through Command/state; the operator should
-    # check LangSmith for the per-call breakdown.
+    # The agents don't surface token usage through Command/state in 5e;
+    # the operator should check LangSmith for the per-call breakdown.
     print(f"\n(f) Token cost:")
-    print(f"    Not surfaced in state in 5c — check LangSmith for")
+    print(f"    Not surfaced in state — check LangSmith for")
     print(f"    per-call breakdown (project: ai-trading-agent, thread_id={strategy_id}).")
     print(f"    LangSmith trace URL appears in agent logs above this report.")
+
+    # (g) Critic loop (Stage 5d)
+    revision_count = final.get("revision_count", 0)
+    critic_verdicts = (final.get("artifacts") or {}).get("critic_verdicts") or []
+    critic_notes = final.get("critic_notes") or []
+    print(f"\n(g) Critic loop:")
+    print(f"    revision_count: {revision_count}")
+    print(f"    critic_notes accumulated: {len(critic_notes)}")
+    if critic_verdicts:
+        print(f"    critic_verdicts ({len(critic_verdicts)} total):")
+        for i, v in enumerate(critic_verdicts, start=1):
+            verdict_str = v.get("verdict", "<missing>").upper()
+            conf = v.get("confidence", "<n/a>")
+            concern = v.get("primary_concern", "<missing>")
+            print(f"      [{i}] {verdict_str} (conf={conf})")
+            print(f"          primary_concern: {concern}")
+    else:
+        print(f"    (no critic_verdicts recorded — strategy archived before critic?)")
+
+    # (h) Lookahead gate (Stage 5e)
+    la = (final.get("artifacts") or {}).get("lookahead_analysis")
+    print(f"\n(h) Lookahead gate:")
+    if la is None:
+        print(f"    not reached (final stage: {stage or '<unset>'})")
+    else:
+        print(f"    passed: {la.get('passed', '<missing>')}")
+        print(f"    details: {la.get('details', '<missing>')}")
+        print(f"    worker_dir: {la.get('worker_dir', '<missing>')}")
+
+    # (i) Agent vote trail — full lifecycle audit
+    votes = final.get("agent_votes") or []
+    print(f"\n(i) Agent vote trail ({len(votes)} total):")
+    if votes:
+        for v in votes:
+            agent = v.get("agent", "<missing>")
+            verdict_str = v.get("verdict", "<missing>")
+            conf = v.get("confidence", "<n/a>")
+            print(f"    {agent}: {verdict_str} (conf={conf})")
+    else:
+        print(f"    (no votes recorded)")
 
     print("\n" + "=" * 72)
     if stage == "archived":
         print(f" RESULT: archived ({failure_reason})")
     else:
-        print(" RESULT: research subgraph completed (ready for 5d critic loop)")
+        print(" RESULT: research subgraph completed (ready for validation subgraph, Stage 6+)")
     print("=" * 72)
 
 
