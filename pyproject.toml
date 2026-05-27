@@ -66,10 +66,11 @@ extend-exclude = [
     "freqtrade/user_data",
     "strategy_templates/_generated",
     ".venv",
-    # Operator-authored scratch scripts (smoke checks, etc.) live at the
-    # repo root and are not part of the project tree; ruff would
-    # otherwise flag their import ordering / formatting.
-    "smoke_*.py",
+    # Operator-authored manual smoke probes under scripts/ — see
+    # scripts/README.md. These hit the real Anthropic API and are not
+    # part of the pytest suite; ruff would otherwise flag their import
+    # ordering / formatting.
+    "scripts/smoke_*.py",
 ]
 
 [tool.ruff.lint]
