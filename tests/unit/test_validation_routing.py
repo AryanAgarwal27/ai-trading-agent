@@ -125,9 +125,11 @@ async def test_approve_reaches_paper_gate_interrupt_with_full_payload() -> None:
     payload = interrupts[0].value
     assert payload["kind"] == "paper_gate"
     assert payload["strategy_id"] == "test_strategy_4e"
-    # Full summary present per SPEC §4.1 dashboard contract.
-    assert payload["summary"]["backtest"]["passed"] is True
-    assert payload["summary"]["robustness"]["passed"] is True
+    # Stage 6e: payload shape is the build_interrupt_payload contract —
+    # rationale primary at summary.risk_analyst, metrics secondary under
+    # summary.metrics.{backtest, robustness} (SPEC §4.1).
+    assert payload["summary"]["metrics"]["backtest"]["passed"] is True
+    assert payload["summary"]["metrics"]["robustness"]["passed"] is True
     assert payload["summary"]["risk_analyst"]["decision"] == "approve"
     assert payload["summary"]["risk_analyst"]["confidence"] == 0.85
 
@@ -191,10 +193,12 @@ async def test_paper_gate_resume_approved_advances_to_paper_stage() -> None:
     )
 
     assert final["stage"] == "paper"
-    paper_gate_block = final["gate_decisions"]["paper_gate"]
-    assert paper_gate_block["approved"] is True
-    assert paper_gate_block["by"] == "human"
-    assert "30-day paper" in paper_gate_block["notes"]
+    # Stage 6e: human approval lands under gate_decisions["paper"] (was
+    # "paper_gate" in 4e's stub — node name vs lifecycle stage).
+    paper_block = final["gate_decisions"]["paper"]
+    assert paper_block["approved"] is True
+    assert paper_block["by"] == "human"
+    assert "30-day paper" in paper_block["notes"]
 
 
 # ─── 4. paper_gate resume — rejected ────────────────────────────────────
@@ -222,5 +226,7 @@ async def test_paper_gate_resume_rejected_archives_with_human_reason() -> None:
     assert final["stage"] == "archived"
     assert final["failure_reason"].startswith("paper_gate_rejected:")
     assert "BTC regime feels off" in final["failure_reason"]
-    paper_gate_block = final["gate_decisions"]["paper_gate"]
-    assert paper_gate_block["approved"] is False
+    # Stage 6e: gate_decisions key is "paper" (the lifecycle stage),
+    # not "paper_gate" (the node name).
+    paper_block = final["gate_decisions"]["paper"]
+    assert paper_block["approved"] is False

@@ -57,6 +57,7 @@ from operator import add
 from pathlib import Path
 from typing import Annotated, Any, Literal, TypedDict
 
+from langchain_core.runnables import RunnableConfig
 from langgraph.checkpoint.base import BaseCheckpointSaver
 from langgraph.graph import END, START, StateGraph
 from langgraph.graph.state import CompiledStateGraph
@@ -64,6 +65,8 @@ from langgraph.types import Command, Send, interrupt
 
 from orchestrator.agents.risk_analyst import risk_analyst_node
 from orchestrator.gates import thresholds
+from orchestrator.gates.hitl import build_interrupt_payload
+from orchestrator.observability.events import publish_gate_pending
 from orchestrator.state import AgentVote, BacktestResult, RobustnessResult
 from orchestrator.tools.backtest_runner import (
     SHARED_DATA_DIR,
@@ -851,46 +854,86 @@ def archive(state: ValidationState) -> dict[str, Any]:
     }
 
 
-# ─── paper_gate HITL interrupt stub (BRD §6.2, full impl in Stage 6) ───
+# ─── paper_gate HITL interrupt (Stage 6e — real impl) ─────────────────
 
 
-def paper_gate(state: ValidationState) -> dict[str, Any]:
-    """Minimal HITL gate stub. Full implementation lands in Stage 6.
+async def paper_gate(state: ValidationState, config: RunnableConfig) -> dict[str, Any]:
+    """HITL gate: publish-then-interrupt, decision-on-resume (BRD §6.2).
 
-    Calls ``interrupt()`` with a structured payload (BRD §6.2 pattern);
-    LangGraph pauses the graph until a ``Command(resume=...)`` arrives.
-    Stage 6's ``gates/hitl.py`` will add the resume payload validation,
-    audit-log writing, and the Streamlit dashboard wiring.
+    Stage 6e wiring:
 
-    The interrupt payload includes everything the dashboard needs to
-    render the gate per SPEC §4.1: backtest summary, robustness summary,
-    risk_analyst rationale and verdict — agent rationale prominent above
-    metrics tables.
+    1. Build the interrupt payload via
+       :func:`orchestrator.gates.hitl.build_interrupt_payload` — single
+       source of truth for the SPEC §4.1 dashboard contract (rationale
+       primary, metrics secondary).
+    2. ``await publish_gate_pending(thread_id, payload)`` BEFORE
+       ``interrupt()``. The interrupt halts execution; if publish ran
+       afterwards the dashboard would never see the new card. Best-
+       effort: a Redis outage logs a warning and returns (see
+       :mod:`orchestrator.observability.events`).
+    3. ``interrupt(payload)`` parks the graph. On
+       ``Command(resume=ApprovalDecision)`` from
+       ``POST /threads/{tid}/approve`` (Stage 6d), the node re-enters
+       from the top and ``interrupt()`` returns the decision dict.
+    4. Validate the decision shape defensively. Out-of-band
+       ``Command(resume=...)`` callers (CLI dev tools, malformed test
+       fixtures) could theoretically send a non-dict — refuse rather
+       than crash.
+    5. Approve → ``stage="paper"`` + ``gate_decisions["paper"]`` record.
+       Reject → ``stage="archived"`` + ``failure_reason`` carrying the
+       operator's notes.
 
-    Important property of ``interrupt()`` (BRD §6.2): when resumed, this
-    node REPLAYS from its start, so it must be side-effect-free. The
-    actual paper-instance spawn happens in the next node (Stage 7's
-    ``paper_spawn``); this one only decides "advance to paper" vs
-    "archive".
+    Idempotency contract (CRITICAL — read before changing this node):
+    LangGraph replays this node from its start on resume. Every replay
+    fires ``publish_gate_pending`` AGAIN. That is safe because:
+
+    - Redis pubsub has no persistence — re-publishing has no
+      cumulative side effect; subscribers see the same payload twice
+      (debouncing is their responsibility).
+    - The ``gate_audits`` row is written by the FastAPI endpoint
+      (:func:`orchestrator.main.approve_thread`), NOT this node — the
+      endpoint runs ONCE per resume call, while the node replays.
+    - The actual paper-instance spawn happens in the next node (Stage
+      7's ``paper_spawn``), not here. This node only DECIDES; it never
+      provisions.
+
+    Adding any other side effect here (DB write, exchange call, file
+    write) breaks the contract — push it to the next node.
     """
-    decision = interrupt(
-        {
-            "kind": "paper_gate",
-            "strategy_id": state.get("strategy_id", "<unset>"),
-            "summary": {
-                "backtest": (state.get("gate_decisions") or {}).get("backtest", {}),
-                "robustness": (state.get("gate_decisions") or {}).get("robustness", {}),
-                "risk_analyst": (state.get("gate_decisions") or {}).get("risk_analyst", {}),
+    payload = build_interrupt_payload(state, "paper_gate")  # type: ignore[arg-type]
+
+    thread_id = (config.get("configurable") or {}).get("thread_id", "")
+    # Best-effort publish — failures inside events.py are logged and
+    # swallowed; even a totally absent Redis must not strand a graph
+    # mid-interrupt.
+    await publish_gate_pending(thread_id, payload)
+
+    decision = interrupt(payload)
+
+    existing_gates = state.get("gate_decisions") or {}
+
+    # Defensive shape validation: out-of-band resume callers could
+    # send something other than {"approved": bool, "notes": str}. The
+    # legitimate path (Stage 6d endpoint) sends an ApprovalDecisionBody-
+    # dumped dict — but the test helper :func:`autoresume_for_test`
+    # forwards whatever the caller hands it.
+    if not isinstance(decision, dict) or "approved" not in decision:
+        return {
+            "stage": "archived",
+            "failure_reason": "paper_gate_invalid_decision_payload",
+            "gate_decisions": {
+                **existing_gates,
+                "paper": {
+                    "approved": False,
+                    "notes": "",
+                    "by": "human",
+                    "error": "invalid_decision_payload",
+                },
             },
         }
-    )
 
-    # Stage 6 will validate the resume payload shape and write a
-    # gate_audits row. For 4e's stub we trust the payload and record
-    # the human decision under gate_decisions["paper_gate"].
-    existing_gates = state.get("gate_decisions") or {}
-    notes = decision.get("notes", "") if isinstance(decision, dict) else ""
-    approved = bool(decision.get("approved", False)) if isinstance(decision, dict) else False
+    notes = str(decision.get("notes", ""))
+    approved = bool(decision.get("approved", False))
 
     if not approved:
         return {
@@ -898,14 +941,14 @@ def paper_gate(state: ValidationState) -> dict[str, Any]:
             "failure_reason": f"paper_gate_rejected: {notes}",
             "gate_decisions": {
                 **existing_gates,
-                "paper_gate": {"approved": False, "notes": notes, "by": "human"},
+                "paper": {"approved": False, "notes": notes, "by": "human"},
             },
         }
     return {
         "stage": "paper",
         "gate_decisions": {
             **existing_gates,
-            "paper_gate": {"approved": True, "notes": notes, "by": "human"},
+            "paper": {"approved": True, "notes": notes, "by": "human"},
         },
     }
 
