@@ -1,0 +1,86 @@
+# Stage 7 infra: templated per-strategy Freqtrade paper-trading container.
+#
+# This file is NOT booted by `docker compose up` directly. It is invoked by
+# `paper_spawn` (lands in 7c) which:
+#   1. Picks a free port in [9001-9100], assigns to PAPER_PORT.
+#   2. Writes the per-strategy config to freqtrade/user_data/configs/
+#      config-paper-<strategy_id>.json (deep-merged from paper-base.json),
+#      sets PAPER_CONFIG_PATH to that path (relative to repo root).
+#   3. Ensures freqtrade/user_data/_workers/<strategy_id>/ exists.
+#   4. Runs:
+#        docker compose -f docker-compose.freqtrade.yml \
+#          -p ait-paper-<strategy_id> \
+#          up -d
+#      with STRATEGY_ID / PAPER_PORT / PAPER_CONFIG_PATH exported to env.
+#
+# Conventions (BRD §7.4, §15):
+#   - Loopback-only port binding (127.0.0.1).
+#   - Per-strategy --userdir mount (BRD §7.1: no shared userdirs).
+#   - Read-only OHLCV cache mount (data dir shared, results dir per-strategy).
+#   - mem_limit 1g / cpus 0.5 (BRD §7.4 — paper containers are long-lived;
+#     light resource cap leaves headroom for the orchestrator on a single host).
+#   - restart: "no" — lifecycle is owned by paper_spawn / paper_teardown,
+#     NOT by docker. A crashed paper container should be observed by the
+#     APScheduler wake job (kill-switch path) and surfaced to live_pause,
+#     not silently restarted.
+#
+# Compose v2 — no `version:` key needed.
+
+name: ait-paper-${STRATEGY_ID}
+
+services:
+  freqtrade:
+    # FreqAI-enabled image (BRD §4 — bundled in Freqtrade 2026.4).
+    # The classifier and regressor templates from Stage 5 both require FreqAI;
+    # the mean-reversion template does not, but uses the same image for parity.
+    image: freqtradeorg/freqtrade:stable_freqai
+    container_name: ait-paper-${STRATEGY_ID}
+    restart: "no"
+    mem_limit: 1g
+    cpus: 0.5
+    ports:
+      # Loopback-only host binding (BRD §15). The container listens on 8080;
+      # paper_spawn picks the host-side PAPER_PORT and the orchestrator's
+      # freqtrade_api_url field points at 127.0.0.1:${PAPER_PORT}.
+      - "127.0.0.1:${PAPER_PORT}:8080"
+    volumes:
+      # Per-strategy writable userdir. Holds logs, trade DB (sqlite), and
+      # any per-strategy artifacts Freqtrade writes. The strategy file
+      # itself is symlinked in by paper_spawn from strategy_templates/_generated/.
+      - ./freqtrade/user_data/_workers/${STRATEGY_ID}:/freqtrade/user_data
+      # Shared OHLCV cache, read-only. Docker sub-mount overlays this onto
+      # the userdir mount above so Freqtrade sees both as one tree.
+      - ./freqtrade/user_data/data:/freqtrade/user_data/data:ro
+      # The per-strategy config lives in the host configs/ dir and is bind-
+      # mounted in at a stable path. PAPER_CONFIG_PATH is the *host* path
+      # relative to the repo root (e.g. freqtrade/user_data/configs/
+      # config-paper-<strategy_id>.json); compose resolves it at up-time.
+      - ./${PAPER_CONFIG_PATH}:/freqtrade/user_data/configs/config-paper.json:ro
+    environment:
+      # Paper subaccount credentials — distinct from live (BRD §1.1 rule 5).
+      # Passed through from the host .env at compose-up time. paper_spawn
+      # substitutes these into the per-strategy config before writing it,
+      # but they are also passed into the container env so Freqtrade's own
+      # `${VAR}` substitution path works as a belt-and-braces measure.
+      BINANCE_PAPER_API_KEY: ${BINANCE_PAPER_API_KEY}
+      BINANCE_PAPER_API_SECRET: ${BINANCE_PAPER_API_SECRET}
+      # Freqtrade REST API password — Streamlit / FastAPI / paper_monitor
+      # use this to authenticate against /api/v1/* on the container.
+      PAPER_API_PASSWORD: ${PAPER_API_PASSWORD}
+      # Identify logs by strategy.
+      FREQTRADE__BOT_NAME: ${STRATEGY_ID}
+    command:
+      - "trade"
+      - "--config"
+      - "/freqtrade/user_data/configs/config-paper.json"
+    healthcheck:
+      # /api/v1/ping is unauthenticated in Freqtrade — used by paper_spawn
+      # to know the container is ready. Use python (always present in the
+      # freqtrade image) rather than curl/wget which may not be installed.
+      test:
+        - "CMD-SHELL"
+        - "python -c \"import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8080/api/v1/ping', timeout=2).status == 200 else 1)\""
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 20s

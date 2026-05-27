@@ -1,0 +1,107 @@
+{
+    // Stage 7 paper-trading base config. paper_spawn (lands in 7c)
+    // deep-merges this with per-strategy fields (pair_whitelist, strategy
+    // class name, stake_amount per LIVE_CAPITAL_CAP_USD / max_open_trades,
+    // timeframe, freqai block if applicable) and writes the result to
+    // freqtrade/user_data/configs/config-paper-<strategy_id>.json.
+    //
+    // Anything in this file is the contract surface. Don't edit per-strategy
+    // values here — pass them through paper_spawn's merge.
+    //
+    // Freqtrade accepts // and /* */ comments in JSON configs.
+
+    "dry_run": true,
+    "dry_run_wallet": 1000,
+    "stake_currency": "USDT",
+    "stake_amount": 100,
+    "max_open_trades": 4,
+    "tradable_balance_ratio": 1.0,
+    "trading_mode": "spot",
+    "margin_mode": "",
+    "cancel_open_orders_on_exit": false,
+
+    // BRD §11 daily loss limit (-3% rolling 24h → stopbuy).
+    // GAP: Freqtrade 2026.4 has no native `dry_run_wallet_threshold` /
+    // `daily_loss_limit` field. The canonical Freqtrade mechanism is the
+    // `protections` block below (MaxDrawdown), which works on a sliding
+    // window over recent trades — close to but not identical to a rolling
+    // 24h loss check. The orchestrator-side paper_monitor (Stage 7d+) is
+    // the authoritative enforcer of the BRD §11 layered safeguards;
+    // protections below are an in-container safety net.
+    "protections": [
+        {
+            "method": "MaxDrawdown",
+            "lookback_period_candles": 288,
+            "trade_limit": 4,
+            "stop_duration_candles": 12,
+            "max_allowed_drawdown": 0.12
+        }
+    ],
+
+    // pair_whitelist intentionally empty; paper_spawn fills from state.pairs.
+    // SPEC §1 Q2 universe is BTC/USDT, ETH/USDT, SOL/USDT, BNB/USDT — the
+    // strategy proposal picks a subset.
+    "exchange": {
+        "name": "binance",
+        "key": "${BINANCE_PAPER_API_KEY}",
+        "secret": "${BINANCE_PAPER_API_SECRET}",
+        "ccxt_config": {},
+        "ccxt_async_config": {},
+        "pair_whitelist": [],
+        "pair_blacklist": [
+            "BNB/.*"
+        ]
+    },
+
+    "entry_pricing": {
+        "price_side": "same",
+        "use_order_book": true,
+        "order_book_top": 1,
+        "price_last_balance": 0.0,
+        "check_depth_of_market": {
+            "enabled": false,
+            "bids_to_ask_delta": 1
+        }
+    },
+
+    "exit_pricing": {
+        "price_side": "same",
+        "use_order_book": true,
+        "order_book_top": 1
+    },
+
+    "pairlists": [
+        {
+            "method": "StaticPairList"
+        }
+    ],
+
+    "api_server": {
+        "enabled": true,
+        // Listens on 0.0.0.0 INSIDE the container; the host-side mapping
+        // in docker-compose.freqtrade.yml is 127.0.0.1:${PAPER_PORT}:8080,
+        // which is the real network boundary (BRD §15).
+        "listen_ip_address": "0.0.0.0",
+        "listen_port": 8080,
+        "verbosity": "error",
+        "enable_openapi": false,
+        "jwt_secret_key": "${PAPER_API_PASSWORD}",
+        "ws_token": "${PAPER_API_PASSWORD}",
+        "CORS_origins": [],
+        "username": "freqtrader",
+        "password": "${PAPER_API_PASSWORD}"
+    },
+
+    "bot_name": "${STRATEGY_ID}",
+
+    "initial_state": "running",
+    "force_entry_enable": false,
+
+    "internals": {
+        "process_throttle_secs": 5
+    },
+
+    // Logging — paper_spawn appends a strategy-specific suffix; this is
+    // the default that applies if not overridden.
+    "logfile": "/freqtrade/user_data/logs/freqtrade.log"
+}
