@@ -186,14 +186,21 @@ def _build_risk_analyst_agent() -> Any:
     from langchain.agents import create_agent
     from langchain_anthropic import ChatAnthropic
 
-    # BRD §4 pins Opus 4.7 for risk_analyst (and SPEC §1 Q6 confirms
-    # operator decision). Temperature 0 for deterministic verdicts —
-    # the agent's job is reading evidence, not creative writing.
+    # BRD §4 pins Opus 4.7 for risk_analyst (SPEC §1 Q6 confirms).
+    # NOTE: temperature/top_p/top_k are intentionally omitted. Claude
+    # Opus 4.7 rejects non-default values for these sampling parameters
+    # with a 400 error per the official migration guide
+    # (https://platform.claude.com/docs/en/about-claude/models/migration-guide
+    # — "Setting temperature, top_p, or top_k to any non-default value on
+    # Claude Opus 4.7 returns a 400 error. The safest migration path is
+    # to omit these parameters entirely from request payloads.").
+    # Sonnet 4.6 and Haiku 4.5 still accept temperature, so this caveat
+    # is Opus-only — if a future agent module constructs Sonnet/Haiku,
+    # passing temperature is fine there. Do NOT re-add temperature here.
     model = ChatAnthropic(
         model="claude-opus-4-7",
         timeout=60.0,
         stop=None,
-        temperature=0.0,
     )
     return create_agent(
         model=model,

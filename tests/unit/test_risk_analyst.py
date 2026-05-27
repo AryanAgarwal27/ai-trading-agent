@@ -18,12 +18,15 @@ Three groups, all offline (no LLM, no Docker):
 from __future__ import annotations
 
 import json
+from typing import Any
+from unittest.mock import MagicMock, patch
 
 import pytest
 from pydantic import ValidationError
 
 from orchestrator.agents.risk_analyst import (
     RiskVerdict,
+    _build_risk_analyst_agent,
     _current_robustness_summary,
     read_robustness_summary,
     verdict_to_command,
@@ -154,3 +157,60 @@ def test_risk_verdict_accepts_both_decision_literals() -> None:
         RiskVerdict(decision="reject", primary_concern="x", rationale="y", confidence=0.0).decision
         == "reject"
     )
+
+
+# ─── 4. Regression: no temperature kwarg in Opus 4.7 construction ───────
+
+
+def test_build_risk_analyst_agent_does_not_pass_temperature_to_opus_4_7() -> None:
+    """Regression guard for the Stage 4e smoke-check fix.
+
+    Opus 4.7 rejects ``temperature``/``top_p``/``top_k`` with a 400 error
+    ("Setting temperature, top_p, or top_k to any non-default value on
+    Claude Opus 4.7 returns a 400 error.") per the official Anthropic
+    migration guide:
+    https://platform.claude.com/docs/en/about-claude/models/migration-guide
+
+    The first smoke check failed with::
+
+        anthropic.BadRequestError: Error code: 400 - ... 'message':
+        '`temperature` is deprecated for this model.'
+
+    This test mocks ``ChatAnthropic`` and ``create_agent`` so no real
+    LLM call happens, then asserts the constructor invocation does NOT
+    include any of the three sampling kwargs. Sonnet 4.6 and Haiku 4.5
+    still accept ``temperature``; if a future agent constructs those
+    models, the constraint here applies only to Opus.
+    """
+    captured_kwargs: dict[str, Any] = {}
+
+    def fake_chat_anthropic(*args: Any, **kwargs: Any) -> Any:
+        captured_kwargs.update(kwargs)
+        return MagicMock(name="ChatAnthropicMock")
+
+    # The imports are local to _build_risk_analyst_agent (so the module can
+    # be imported without ANTHROPIC_API_KEY), so we patch them at their
+    # source modules rather than as attributes of risk_analyst.
+    with (
+        patch(
+            "langchain_anthropic.ChatAnthropic",
+            side_effect=fake_chat_anthropic,
+        ),
+        patch(
+            "langchain.agents.create_agent",
+            return_value=MagicMock(name="AgentMock"),
+        ),
+    ):
+        _build_risk_analyst_agent()
+
+    # The Opus model must be selected.
+    assert (
+        captured_kwargs.get("model") == "claude-opus-4-7"
+    ), f"agent must construct Opus 4.7, got {captured_kwargs.get('model')!r}"
+    # The three sampling parameters Opus 4.7 rejects must NOT appear.
+    for forbidden in ("temperature", "top_p", "top_k"):
+        assert forbidden not in captured_kwargs, (
+            f"{forbidden!r} kwarg was passed to ChatAnthropic for Opus 4.7; "
+            "this triggers a 400 deprecation error. See "
+            "https://platform.claude.com/docs/en/about-claude/models/migration-guide"
+        )

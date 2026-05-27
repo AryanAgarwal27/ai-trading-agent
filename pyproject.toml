@@ -66,6 +66,10 @@ extend-exclude = [
     "freqtrade/user_data",
     "strategy_templates/_generated",
     ".venv",
+    # Operator-authored scratch scripts (smoke checks, etc.) live at the
+    # repo root and are not part of the project tree; ruff would
+    # otherwise flag their import ordering / formatting.
+    "smoke_*.py",
 ]
 
 [tool.ruff.lint]
