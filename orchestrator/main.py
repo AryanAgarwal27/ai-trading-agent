@@ -125,11 +125,11 @@ def _build_paper_gate_only_graph_for_smoke(saver: Any) -> Any:
     the 6e e2e test fixtures, so the smoke exercises the real interrupt
     + resume + audit paths through the real FastAPI endpoints.
 
-    Operator workflow (Stage 6f mid-stage smoke):
+    Operator workflow:
 
-    1. Run ``scripts/midstage_seed.py`` — parks a checkpoint at
-       paper_gate against the real ``AsyncPostgresSaver`` + inserts a
-       ``strategy_registry`` row.
+    1. Run ``scripts/seed_dashboard_data.py --shape={clean_pass,marginal}``
+       — parks a checkpoint at paper_gate against the real
+       ``AsyncPostgresSaver`` + inserts a ``strategy_registry`` row.
     2. Restart uvicorn with ``AIT_SMOKE_PAPER_GATE_GRAPH=1`` in the
        env so this branch fires.
     3. Open the dashboard, drive Approve / Reject.
@@ -147,6 +147,107 @@ def _build_paper_gate_only_graph_for_smoke(saver: Any) -> Any:
     builder.add_node("paper_gate", paper_gate)
     builder.add_edge(START, "paper_gate")
     builder.add_edge("paper_gate", END)
+    return builder.compile(checkpointer=saver)
+
+
+def _build_live_pause_review_only_graph_for_smoke(saver: Any) -> Any:
+    """Smoke-only graph: ``START → live_pause_review → END``. NOT for production.
+
+    Stage 8 will land the REAL ``live_pause_review`` node inside the
+    live subgraph; this 6j smoke helper provides a STANDALONE synthetic
+    gate node so the kill-switch dashboard rendering can be exercised
+    before Stage 8 ships. Mirrors
+    :func:`_build_paper_gate_only_graph_for_smoke` in shape: minimal
+    one-node graph against the same saver, gated by an env var.
+
+    The node calls :func:`build_interrupt_payload` with
+    ``kind="live_pause_review"`` — the payload's ``summary.path``
+    discriminator (``"kill_switch"`` vs ``"coordinator"``) is decided
+    entirely by whether the caller pre-populated
+    ``state.artifacts.kill_switch_event``. The seed script
+    (``scripts/seed_dashboard_data.py --shape=kill_switch``) drops a
+    synthetic event in there; with that absent the same helper would
+    produce a coordinator-path payload (no Stage 8 dependency needed).
+
+    Lazy imports + a local ``TypedDict`` so production startup remains
+    free of these symbols when the env var is unset.
+    """
+    from langchain_core.runnables import RunnableConfig
+    from langgraph.graph import END, START, StateGraph
+    from langgraph.types import interrupt
+    from typing_extensions import TypedDict
+
+    from orchestrator.gates.hitl import build_interrupt_payload
+    from orchestrator.observability.events import publish_gate_pending
+
+    class _LivePauseSmokeState(TypedDict, total=False):
+        # Minimal schema — ValidationState lacks the ``artifacts`` key
+        # build_interrupt_payload reads from for the kill-switch path,
+        # so a local TypedDict keeps the smoke helper self-contained
+        # rather than mutating the validation subgraph's contract.
+        strategy_id: str
+        gate_decisions: dict[str, Any]
+        artifacts: dict[str, Any]
+        stage: str
+        failure_reason: str
+
+    async def live_pause_review(
+        state: _LivePauseSmokeState,
+        config: RunnableConfig,
+    ) -> dict[str, Any]:
+        payload = build_interrupt_payload(state, "live_pause_review")  # type: ignore[arg-type]
+        thread_id = (config.get("configurable") or {}).get("thread_id", "")
+        # publish-before-interrupt — same idempotency contract as the
+        # real paper_gate node (BRD §6.2 replay; events.py swallow).
+        await publish_gate_pending(thread_id, payload)
+        decision = interrupt(payload)
+
+        existing_gates = state.get("gate_decisions") or {}
+        if not isinstance(decision, dict) or "approved" not in decision:
+            return {
+                "stage": "archived",
+                "failure_reason": "live_pause_review_invalid_decision_payload",
+                "gate_decisions": {
+                    **existing_gates,
+                    "live_pause": {
+                        "approved": False,
+                        "notes": "",
+                        "by": "human",
+                        "error": "invalid_decision_payload",
+                    },
+                },
+            }
+        notes = str(decision.get("notes", ""))
+        approved = bool(decision.get("approved", False))
+        if approved:
+            # Operator chose resume — Stage 8 will own the actual
+            # respawn / state-transition logic; for the smoke we
+            # stamp ``stage="live"`` and let the test inspect.
+            return {
+                "stage": "live",
+                "gate_decisions": {
+                    **existing_gates,
+                    "live_pause": {"approved": True, "notes": notes, "by": "human"},
+                },
+            }
+        return {
+            "stage": "archived",
+            "failure_reason": f"live_pause_review_archived: {notes}",
+            "gate_decisions": {
+                **existing_gates,
+                "live_pause": {"approved": False, "notes": notes, "by": "human"},
+            },
+        }
+
+    builder: StateGraph[
+        _LivePauseSmokeState,
+        _LivePauseSmokeState,
+        _LivePauseSmokeState,
+        _LivePauseSmokeState,
+    ] = StateGraph(_LivePauseSmokeState)
+    builder.add_node("live_pause_review", live_pause_review)
+    builder.add_edge(START, "live_pause_review")
+    builder.add_edge("live_pause_review", END)
     return builder.compile(checkpointer=saver)
 
 
@@ -237,20 +338,33 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         # > ~50 archived threads in memory.
         app.state.thread_locks = defaultdict(asyncio.Lock)
 
-        # ── Smoke-only graph override (env-gated, off by default). ─────
+        # ── Smoke-only graph overrides (env-gated, off by default). ────
         # When AIT_SMOKE_PAPER_GATE_GRAPH is set, replace the production
         # parent graph with a paper_gate-only minimal graph for the
         # Stage 6f operator smoke — the real parent doesn't include
         # validation_subgraph yet (per 6e note 1), so an endpoint's
         # aget_state() of a paper_gate-parked checkpoint would otherwise
-        # report no pending interrupt. Production behavior is identical
-        # when the env var is unset.
+        # report no pending interrupt. AIT_SMOKE_LIVE_PAUSE_REVIEW_GRAPH
+        # is the equivalent override for the kill-switch dashboard
+        # iteration (Stage 6j). Production behavior is identical when
+        # both env vars are unset.
+        #
+        # If BOTH env vars are set, the second branch wins (last write
+        # to app.state.graph) — the warning makes the live state
+        # observable. Operators should set only one at a time.
         if os.environ.get("AIT_SMOKE_PAPER_GATE_GRAPH"):
             app.state.graph = _build_paper_gate_only_graph_for_smoke(saver)
             logger.warning(
                 "AIT_SMOKE_PAPER_GATE_GRAPH=1 — production parent graph "
                 "replaced with smoke-only paper_gate graph. UNSET this "
                 "env var for any real run."
+            )
+        if os.environ.get("AIT_SMOKE_LIVE_PAUSE_REVIEW_GRAPH"):
+            app.state.graph = _build_live_pause_review_only_graph_for_smoke(saver)
+            logger.warning(
+                "AIT_SMOKE_LIVE_PAUSE_REVIEW_GRAPH=1 — production parent "
+                "graph replaced with smoke-only live_pause_review graph. "
+                "UNSET this env var for any real run."
             )
 
         yield
