@@ -41,7 +41,6 @@ import numpy as np
 import talib.abstract as ta  # type: ignore[import-not-found]
 
 from freqtrade.strategy import IStrategy  # type: ignore[import-not-found]
-from freqtrade.vendor.qtpylib import indicators as qtpylib  # type: ignore[import-not-found]
 
 if TYPE_CHECKING:
     from pandas import DataFrame
@@ -140,10 +139,14 @@ class FreqaiClassifierTemplate(IStrategy):
         dataframe[f"%-rsi-period_{period}"] = ta.RSI(dataframe, timeperiod=period)
         dataframe[f"%-mfi-period_{period}"] = ta.MFI(dataframe, timeperiod=period)
         dataframe[f"%-roc-period_{period}"] = ta.ROC(dataframe, timeperiod=period)
-        bb = qtpylib.bollinger_bands(
-            qtpylib.typical_price(dataframe), window=period, stds=2.2
-        )
-        dataframe[f"%-bb_width_{period}"] = (bb["upper"] - bb["lower"]) / bb["mid"]
+        # Bollinger-band width as a feature. Computed inline to avoid depending
+        # on freqtrade.vendor.qtpylib (a Freqtrade internal that changes between
+        # versions). Typical price = (H+L+C)/3; band width = (upper - lower) / mid
+        # = (2 * nbdev * std) / mid, with ddof=0 to match talib's population-std
+        # convention. min_periods=period rejects partial windows (look-ahead guard).
+        typical_price = (dataframe["high"] + dataframe["low"] + dataframe["close"]) / 3
+        rolling = typical_price.rolling(window=period, min_periods=period)
+        dataframe[f"%-bb_width_{period}"] = (2 * 2.2 * rolling.std(ddof=0)) / rolling.mean()
         return dataframe
 
     def feature_engineering_expand_basic(

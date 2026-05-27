@@ -149,12 +149,49 @@ The critic agent should look for at least these specific weaknesses:
    the same band as round-trip fees on Binance taker (0.2% round-trip).
    The regressor "learns" but the strategy can't profit from what it
    learned.
-5. **Calibration drift between retrains.** The regressor predicts well
+5. **Feature leakage in `feature_engineering_*`.** The label is computed
+   in `set_freqai_targets` as a forward shift of `close`
+   (`dataframe["close"].shift(-self.label_period_candles)`), which is
+   correct *as a label* — FreqAI strips the trailing rows before
+   training so the label can legitimately use future data the row
+   itself can't see. Any switch to using forward-shifted values as
+   *features* (in any of the `feature_engineering_*` hooks) is a
+   silent leak — the model trains on tomorrow's information to
+   "predict" tomorrow and looks brilliant in backtest before
+   collapsing live. **Audit by grepping `shift(-` in the
+   feature-engineering bodies of any rendered strategy file — only
+   `set_freqai_targets` should contain a negative shift.**
+6. **Calibration drift between retrains.** The regressor predicts well
    immediately after retrain and degrades over the 24-hour cycle. Paper
    monitor must log per-hour residual mean/std; if mean drifts far
    from zero before the next retrain, the strategy is overdue.
-6. **Trend filter eats the early entry.** On a clean regime change,
+7. **Trend filter eats the early entry.** On a clean regime change,
    `ema_fast < ema_slow` for the first hours of the new uptrend; the
    strategy misses the early ramp. This is by design — the alternative
    eats more false reversals — but the critic should confirm the trade
    was made consciously and not accidentally.
+8. **Model staleness — `expiration_hours=72` is the hard ceiling.**
+   Models are retrained on `live_retrain_hours=24` cycles (BRD §7.3
+   pins, declared in `freqai_config` on the template) but may still
+   drift mid-cycle — see #6 above for the operational diagnostic. The
+   *contract* point is separate: if `expiration_hours` is ever raised
+   above 72 without re-validating the strategy in the new regime,
+   that is a contract violation against BRD §7.3. The critic must
+   flag any parameter set whose effective retrain cadence (governed
+   by trade volume reaching the model) implies a model lifetime
+   longer than 72h — e.g. a `k_atr_multiplier` so high that almost no
+   trades fire to refresh the calibration.
+9. **Regime shift during paper.** A strategy approved in a low-vol-up
+   regime should NOT be assumed safe in a high-vol-down regime. The
+   regime worker in the live subgraph (BRD §5.6) tracks the current
+   regime and pauses live trading if it diverges materially from the
+   approval-time regime — paper trading does *not* have this
+   protection by default. If the operator approves the strategy
+   mid-regime-shift, paper metrics will look fine but the underlying
+   regressor was trained on one regime and is being scored on another
+   — the residual diagnostic in #6 will show calibration drift but
+   the operator may misread it as routine staleness. Manual check at
+   every paper wake: compare paper-monitor regime telemetry to the
+   approval-time regime; any drift across the BRD §5.4 vol buckets
+   (low / mid / high) is a re-approval trigger, not a "let's see if
+   it stabilises".

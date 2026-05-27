@@ -168,3 +168,27 @@ The critic agent should look for at least these specific weaknesses:
    conditions sees high-vol bars as OOD and rejects them; the operator
    sees "no entries" and assumes the strategy is broken. The regime
    reviewer should flag "OOD rejection rate spiked" as a pause trigger.
+8. **Model staleness — `expiration_hours=72` is the hard ceiling.**
+   Models are retrained on `live_retrain_hours=24` cycles (BRD §7.3
+   pins, declared in `freqai_config` on the template) but may still
+   drift mid-cycle. The paper monitor must flag any 24h window where
+   the per-class probability calibration shifts more than a calibrated
+   threshold from the prior window's baseline. If `expiration_hours`
+   is ever raised above 72 without re-validating the strategy in the
+   new regime, that is a contract violation against BRD §7.3 — the
+   critic should treat any parameter set that *implies* a longer
+   model lifetime (e.g. a `min_class_prob` so high that the model
+   effectively never retrains because no fresh trades flow back) as
+   fundamentally suspect.
+9. **Regime shift during paper.** A strategy approved in a low-vol-up
+   regime should NOT be assumed safe in a high-vol-down regime. The
+   regime worker in the live subgraph (BRD §5.6) tracks the current
+   regime and pauses live trading if it diverges materially from the
+   approval-time regime — paper trading does *not* have this
+   protection by default. If the operator approves the strategy
+   mid-regime-shift, paper metrics will look fine but the underlying
+   classifier was trained on one regime and is being scored on
+   another. Manual check at every paper wake: compare paper-monitor
+   regime telemetry to the approval-time regime; any drift across
+   the BRD §5.4 vol buckets (low / mid / high) is a re-approval
+   trigger, not a "let's see if it stabilises".
