@@ -20,7 +20,6 @@ from orchestrator.security.ast_validator import (
     validate_strategy_source,
 )
 
-
 REPO_ROOT = Path(__file__).resolve().parents[2]
 MEAN_REVERSION_TEMPLATE = (
     REPO_ROOT / "strategy_templates" / "mean_reversion_template.py"

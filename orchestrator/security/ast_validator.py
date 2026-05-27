@@ -42,7 +42,6 @@ from __future__ import annotations
 
 import ast
 
-
 # Top-level module names that may appear in `import X` or
 # `from X import ...`. Submodule access (e.g. `talib.abstract`,
 # `freqtrade.vendor.qtpylib`) is fine — only the top-level name is checked.
