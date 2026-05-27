@@ -1,8 +1,16 @@
-import asyncio
-from dotenv import load_dotenv
+import sys
+from pathlib import Path
+
+# Make the project importable when this script is invoked directly (vs as a module).
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+import asyncio  # noqa: E402
+
+from dotenv import load_dotenv  # noqa: E402
+
 load_dotenv()
 
-from orchestrator.agents.risk_analyst import risk_analyst_node
+from orchestrator.agents.risk_analyst import risk_analyst_node  # noqa: E402
 
 state = {
     "gate_decisions": {

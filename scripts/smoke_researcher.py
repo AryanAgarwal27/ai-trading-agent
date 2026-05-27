@@ -22,12 +22,17 @@ the query_store tool path without standing up Postgres.
 
 from __future__ import annotations
 
-import asyncio
-import time
-import uuid
+import sys
 from pathlib import Path
 
-from dotenv import load_dotenv
+# Make the project importable when this script is invoked directly (vs as a module).
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+import asyncio  # noqa: E402
+import time  # noqa: E402
+import uuid  # noqa: E402
+
+from dotenv import load_dotenv  # noqa: E402
 
 load_dotenv()
 
