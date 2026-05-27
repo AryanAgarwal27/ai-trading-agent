@@ -75,7 +75,12 @@ class StrategyState(TypedDict):
 
     # Execution
     freqtrade_userdir: str | None
-    freqtrade_process_id: int | None
+    # Process identifier — str, not int. See SPEC §6 (2026-05-27 Stage 7c
+    # type-change entry): BRD §5.7 originally typed this `Optional[int]`
+    # assuming subprocess PIDs, but BRD §7.4 selected Docker Compose for
+    # paper + live containers, which makes the host-side identifier the
+    # compose project name (``paper-<strategy_id>``), not an OS PID.
+    freqtrade_process_id: str | None
     freqtrade_api_url: str | None
     artifacts: dict[str, Any]
 

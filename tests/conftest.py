@@ -19,12 +19,22 @@ import asyncio
 import sys
 
 import pytest
+from dotenv import load_dotenv
+
+# Load .env once at collection time so integration tests pick up
+# DATABASE_URL / REDIS_URL / OPERATOR_TOKEN / BINANCE_PAPER_* without
+# requiring the operator to manually export them per shell. The
+# load is a no-op if .env is absent (e.g. CI with secrets injected
+# through the environment directly). Override semantics are NOT
+# enabled — env vars set in the shell win over .env values, matching
+# uvicorn's startup behaviour in orchestrator/main.py.
+load_dotenv()
 
 # Re-export topic-grouped fixtures from tests/fixtures/. The F401 is
 # the standard pytest pattern for fixture re-export from a topic
 # module — pytest discovers fixtures by name in the conftest's
 # namespace, so the import alone wires them up.
-from tests.fixtures.hitl import hitl_autoapprove, hitl_autoreject  # noqa: F401
+from tests.fixtures.hitl import hitl_autoapprove, hitl_autoreject  # noqa: E402, F401
 
 
 @pytest.fixture(scope="session")
