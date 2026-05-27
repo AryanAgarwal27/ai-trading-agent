@@ -40,6 +40,8 @@ import streamlit as st
 from dotenv import load_dotenv
 from streamlit_autorefresh import st_autorefresh
 
+from dashboard.components.kill_switch_card import render_kill_switch_card
+
 load_dotenv()
 
 API_BASE_URL: str = os.environ.get("DASHBOARD_API_BASE_URL", "http://127.0.0.1:8000")
@@ -205,7 +207,25 @@ def render_paper_gate_card(thread: dict[str, Any]) -> None:
             else:
                 st.caption("—  (no robustness summary in payload)")
 
-    # ── Approve / Reject form.
+    _render_approve_reject_form(thread)
+
+
+# ─── Shared approve/reject form (paper_gate, live_gate, coordinator path) ─
+
+
+def _render_approve_reject_form(thread: dict[str, Any]) -> None:
+    """Render the notes textarea + Approve / Reject buttons.
+
+    Shared by every gate card that has an actionable HITL decision —
+    paper_gate, live_gate, and the coordinator path of
+    live_pause_review. The kill-switch path uses an acknowledge-only
+    layout (see :mod:`dashboard.components.kill_switch_card`).
+
+    All three call the same ``POST /threads/{tid}/approve`` endpoint;
+    the FastAPI handler maps the gate-node name to the
+    ``gate_audits.gate`` column value via ``RESUMABLE_GATES`` so the
+    backend disambiguation is handled there, not here.
+    """
     st.divider()
     notes = st.text_area(
         "Notes (recorded in `gate_audits.payload`)",
@@ -237,7 +257,159 @@ def render_paper_gate_card(thread: dict[str, Any]) -> None:
                 st.rerun()
 
 
-# ─── Placeholder for unsupported gate kinds (Stage 7 / 8) ───────────────
+# ─── live_gate card (SPEC §4.1) ────────────────────────────────────────
+
+
+def render_live_gate_card(thread: dict[str, Any]) -> None:
+    """Render the live_gate HITL card per SPEC §4.1.
+
+    Same shape as ``render_paper_gate_card`` — the only differences
+    are the primary rationale source (``paper_monitor`` instead of
+    ``risk_analyst``) and the metrics surface (paper-vs-backtest KS
+    p-value, paper Sharpe deviation, trade count — whatever
+    Stage 7's paper_monitor writes into
+    ``gate_decisions["paper_monitor"]``).
+
+    Stage 6g scaffolds against synthetic payloads; Stage 7 lands the
+    actual paper_monitor agent.
+    """
+    payload = thread.get("pending_interrupt_payload") or {}
+    summary = payload.get("summary") or {}
+    paper_monitor = summary.get("paper_monitor") or {}
+    metrics = summary.get("metrics") or {}
+
+    bar_left, bar_right = st.columns([5, 1])
+    with bar_left:
+        st.subheader(f"live_gate · `{thread['strategy_id']}`")
+        st.caption(f"thread_id: `{thread['thread_id']}` · stage: `{thread.get('stage', '—')}`")
+    with bar_right:
+        if st.button("← Threads", key="back_to_list_live_gate", use_container_width=True):
+            st.session_state.pop("selected_thread_id", None)
+            st.rerun()
+
+    st.divider()
+
+    st.markdown("### Rationale")
+    rationale = (paper_monitor.get("rationale") or "").strip()
+    if rationale:
+        with st.container(border=True):
+            st.markdown(rationale)
+    else:
+        st.warning(
+            "No `paper_monitor.rationale` in the interrupt payload. "
+            "Stage 7 will land the paper_monitor agent — until then the "
+            "rationale block stays empty for live_gate."
+        )
+
+    chip_bits: list[str] = ["**paper_monitor**"]
+    if "decision" in paper_monitor:
+        chip_bits.append(f"verdict `{paper_monitor['decision']}`")
+    confidence = paper_monitor.get("confidence")
+    if isinstance(confidence, int | float):
+        chip_bits.append(f"confidence `{confidence:.2f}`")
+    if paper_monitor.get("primary_concern"):
+        chip_bits.append(f"primary concern: _{paper_monitor['primary_concern']}_")
+    st.markdown(" · ".join(chip_bits))
+
+    with st.expander("Metrics (paper vs backtest)", expanded=False):
+        paper_metrics = metrics.get("paper")
+        if paper_metrics:
+            st.json(paper_metrics)
+        else:
+            st.caption("—  (no paper metrics in payload — Stage 7 dependency)")
+
+    _render_approve_reject_form(thread)
+
+
+# ─── live_pause_review card (path-dispatching, SPEC §4.1) ──────────────
+
+
+def render_live_pause_review_card(thread: dict[str, Any]) -> None:
+    """Path-dispatching renderer for ``live_pause_review``.
+
+    The interrupt payload's ``summary.path`` discriminator (from
+    :func:`orchestrator.gates.hitl.build_interrupt_payload`) selects
+    between:
+
+    - ``"coordinator"`` — multi-agent vote merged by the coordinator
+      (Stage 8 agent). Renders the coordinator rationale + each
+      reviewer's vote chip + actionable approve/reject form.
+    - ``"kill_switch"`` — out-of-band APScheduler trigger (BRD §5.6).
+      No coordinator rationale; delegates to
+      :func:`dashboard.components.kill_switch_card.render_kill_switch_card`
+      for the red-distinct render.
+    """
+    payload = thread.get("pending_interrupt_payload") or {}
+    summary = payload.get("summary") or {}
+    path = summary.get("path") or "unknown"
+
+    if path == "kill_switch":
+        render_kill_switch_card(thread, payload)
+        return
+
+    # Coordinator path.
+    coordinator = summary.get("coordinator") or {}
+    reviewer_votes = summary.get("reviewer_votes") or {}
+    metrics = summary.get("metrics") or {}
+
+    bar_left, bar_right = st.columns([5, 1])
+    with bar_left:
+        st.subheader(f"live_pause_review · `{thread['strategy_id']}` · coordinator path")
+        st.caption(f"thread_id: `{thread['thread_id']}` · stage: `{thread.get('stage', '—')}`")
+    with bar_right:
+        if st.button("← Threads", key="back_to_list_live_pause", use_container_width=True):
+            st.session_state.pop("selected_thread_id", None)
+            st.rerun()
+
+    st.divider()
+
+    # Coordinator rationale (primary surface per SPEC §4.1).
+    st.markdown("### Rationale")
+    rationale = (coordinator.get("rationale") or "").strip()
+    if rationale:
+        with st.container(border=True):
+            st.markdown(rationale)
+    else:
+        st.warning(
+            "No `coordinator.rationale` in the interrupt payload. "
+            "Stage 8 will land the coordinator agent — until then the "
+            "rationale block stays empty for live_pause_review coordinator path."
+        )
+
+    # Coordinator chip row.
+    chip_bits: list[str] = ["**coordinator**"]
+    if "verdict" in coordinator:
+        chip_bits.append(f"verdict `{coordinator['verdict']}`")
+    confidence = coordinator.get("confidence")
+    if isinstance(confidence, int | float):
+        chip_bits.append(f"confidence `{confidence:.2f}`")
+    st.markdown(" · ".join(chip_bits))
+
+    # Reviewer votes — three sub-chips per SPEC §4.1.
+    st.markdown("#### Reviewer votes")
+    rv_cols = st.columns(3)
+    for col, key in zip(
+        rv_cols, ("risk_check", "performance_check", "regime_check"), strict=True
+    ):
+        vote = reviewer_votes.get(key) or {}
+        verdict = vote.get("verdict", "—")
+        conf = vote.get("confidence")
+        with col:
+            text = f"**{key}** · `{verdict}`"
+            if isinstance(conf, int | float):
+                text += f" · `{conf:.2f}`"
+            st.markdown(text)
+
+    with st.expander("Metrics (drawdown, P&L, regime delta)", expanded=False):
+        if metrics:
+            st.json(metrics)
+        else:
+            st.caption("—  (no metrics in payload)")
+
+    _render_approve_reject_form(thread)
+
+
+# ─── Placeholder for truly unknown gate kinds ───────────────────────────
 
 
 def render_unsupported_card(thread: dict[str, Any]) -> None:
@@ -293,6 +465,10 @@ def main() -> None:
     kind = (current.get("pending_interrupt_payload") or {}).get("kind", "")
     if kind == "paper_gate":
         render_paper_gate_card(current)
+    elif kind == "live_gate":
+        render_live_gate_card(current)
+    elif kind == "live_pause_review":
+        render_live_pause_review_card(current)
     else:
         render_unsupported_card(current)
 
