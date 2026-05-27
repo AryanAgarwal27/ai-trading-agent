@@ -307,6 +307,10 @@ async def test_approve_with_valid_token_advances_thread_and_writes_audit_and_pub
             # Raw token must NEVER land in the actor field.
             assert TEST_OPERATOR_TOKEN not in actor
             assert payload["decision"] == {"approved": True, "notes": "ship it"}
+            # Stage 6f fix: notes also hoisted to top-level of the audit
+            # payload so `SELECT payload->>'notes' FROM gate_audits` works
+            # without drilling through ->'decision'. Both paths must hold.
+            assert payload["notes"] == "ship it"
             assert payload["gate_node"] == "paper_gate"
 
             # publish_gate_advanced called with the expected payload shape.

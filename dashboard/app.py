@@ -208,7 +208,7 @@ def render_paper_gate_card(thread: dict[str, Any]) -> None:
     # ── Approve / Reject form.
     st.divider()
     notes = st.text_area(
-        "Notes (recorded in `gate_audits.payload.decision.notes`)",
+        "Notes (recorded in `gate_audits.payload`)",
         key=f"notes_{thread['thread_id']}",
         height=90,
         placeholder="Optional. Why are you approving / rejecting?",

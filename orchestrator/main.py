@@ -401,11 +401,23 @@ async def approve_thread(
 
         actor = _hash_token_for_actor(token)
         decision_label = "human_approve" if body.approved else "human_reject"
+        # ``notes`` is intentionally written at TWO paths:
+        #   - ``payload.decision.notes`` (canonical structured shape;
+        #     mirrors the ApprovalDecision TypedDict the resume Command
+        #     carried — keeps the audit blob symmetric with the input).
+        #   - ``payload.notes`` (convenience path for ad-hoc SQL — e.g.
+        #     ``SELECT payload->>'notes' FROM gate_audits WHERE ...``
+        #     drops the nested ``->'decision'`` dereference).
+        # Do NOT "clean up the redundancy" — Stage 6f smoke surfaced
+        # operators reaching for the top-level path on instinct, and
+        # losing audit visibility because of a JSON-path mismatch is
+        # exactly the failure mode this duplication prevents.
         audit_payload = {
             "thread_id": thread_id,
             "gate_node": gate_node,
             "decision": decision_dict,
             "next_stage": next_stage,
+            "notes": body.notes,
         }
 
         audit_id = await record_gate_audit(
