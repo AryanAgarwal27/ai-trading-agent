@@ -124,6 +124,27 @@ def _make_always_revise_critic(call_count: list[int]) -> Any:
     return stub
 
 
+def _make_pass_lookahead_runner() -> Any:
+    """Lookahead runner stub that always returns passed=True.
+
+    Pass-verdict tests would otherwise invoke the real Docker freqtrade
+    subprocess; the always-revise test archives before reaching the
+    gate so doesn't strictly need the stub, but passing it is harmless
+    and keeps every loop test hermetic."""
+
+    async def stub(strategy_path: Any, *, pairs: Any, timeframe: Any, timerange: Any) -> dict[str, Any]:
+        return {
+            "passed": True,
+            "details": "stub: no look-ahead bias",
+            "returncode": 0,
+            "worker_dir": "/tmp/stub",
+            "stderr_tail": "",
+            "stdout_tail": "",
+        }
+
+    return stub
+
+
 def _make_pass_on_nth_critic(pass_on: int, call_count: list[int]) -> Any:
     """Critic stub that votes revise on calls 1..(pass_on-1) and pass on
     call ``pass_on``."""
@@ -181,6 +202,7 @@ async def test_loop_bounds_at_max_revisions_with_always_revise(tmp_path: Path) -
         researcher_fn=_make_stub_researcher(),
         generator_fn=_make_recording_generator(tmp_path, observed_critic_notes_on_gen_call),
         critic_fn=_make_always_revise_critic(critic_calls),
+        lookahead_runner=_make_pass_lookahead_runner(),
         checkpointer=InMemorySaver(),
     )
     config = {"configurable": {"thread_id": "test_loop_max"}}
@@ -218,6 +240,7 @@ async def test_loop_terminates_cleanly_when_critic_passes(tmp_path: Path) -> Non
         researcher_fn=_make_stub_researcher(),
         generator_fn=_make_recording_generator(tmp_path, observed),
         critic_fn=_make_pass_on_nth_critic(pass_on=2, call_count=critic_calls),
+        lookahead_runner=_make_pass_lookahead_runner(),
         checkpointer=InMemorySaver(),
     )
     config = {"configurable": {"thread_id": "test_loop_pass_2nd"}}
@@ -252,6 +275,7 @@ async def test_loop_terminates_immediately_when_critic_passes_first_call(
         researcher_fn=_make_stub_researcher(),
         generator_fn=_make_recording_generator(tmp_path, observed),
         critic_fn=_make_pass_on_nth_critic(pass_on=1, call_count=critic_calls),
+        lookahead_runner=_make_pass_lookahead_runner(),
         checkpointer=InMemorySaver(),
     )
     config = {"configurable": {"thread_id": "test_loop_pass_1st"}}
@@ -282,6 +306,7 @@ async def test_generator_sees_accumulated_critic_notes(tmp_path: Path) -> None:
         researcher_fn=_make_stub_researcher(),
         generator_fn=_make_recording_generator(tmp_path, observed),
         critic_fn=_make_always_revise_critic(critic_calls),
+        lookahead_runner=_make_pass_lookahead_runner(),
         checkpointer=InMemorySaver(),
     )
     config = {"configurable": {"thread_id": "test_critic_notes_accum"}}
@@ -315,6 +340,7 @@ async def test_critic_verdicts_artifact_accumulates(tmp_path: Path) -> None:
         researcher_fn=_make_stub_researcher(),
         generator_fn=_make_recording_generator(tmp_path, observed),
         critic_fn=_make_always_revise_critic(critic_calls),
+        lookahead_runner=_make_pass_lookahead_runner(),
         checkpointer=InMemorySaver(),
     )
     config = {"configurable": {"thread_id": "test_critic_artifacts"}}

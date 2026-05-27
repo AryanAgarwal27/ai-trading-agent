@@ -161,12 +161,15 @@ def _state_with_critic_vote(verdict: str, *, revision_count: int = 0) -> dict:
     }
 
 
-def test_revise_or_proceed_pass_returns_no_goto() -> None:
-    """verdict=pass → Command with empty update and no goto, letting the
-    builder's explicit add_edge(revise_or_proceed, END) take effect."""
+def test_revise_or_proceed_pass_routes_to_lookahead_gate() -> None:
+    """verdict=pass → Command(goto='lookahead_gate'). The 5d-era
+    no-goto + add_edge pattern was replaced after Pregel scheduled
+    revise_or_proceed and the downstream node in the same superstep,
+    causing an artifacts-channel double-write — see revise_or_proceed
+    docstring."""
     cmd = revise_or_proceed(_state_with_critic_vote("pass"))
-    assert cmd.goto is None or cmd.goto == ()
-    # update is either empty dict or None; either is fine.
+    assert cmd.goto == "lookahead_gate"
+    # No state mutation needed on the pass route — the gate runs next.
     assert not cmd.update or cmd.update == {}
 
 
@@ -235,8 +238,8 @@ def test_revise_or_proceed_uses_latest_critic_vote() -> None:
         "artifacts": {"critic_verdicts": []},
     }
     cmd = revise_or_proceed(state)
-    # Latest is pass — no revise, no archive.
-    assert cmd.goto is None or cmd.goto == ()
+    # Latest is pass — routes to lookahead_gate.
+    assert cmd.goto == "lookahead_gate"
 
 
 def test_max_revisions_constant_is_three() -> None:

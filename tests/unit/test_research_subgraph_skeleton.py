@@ -65,6 +65,27 @@ def _make_pass_critic_stub() -> Any:
     return stub
 
 
+def _make_pass_lookahead_runner() -> Any:
+    """Lookahead runner stub that always returns passed=True.
+
+    The 5e topology adds a lookahead_gate node after the critic-pass
+    route; without a stub it would invoke the real Docker freqtrade
+    subprocess. These tests aren't about lookahead behavior — they're
+    about load_context — so the stub keeps them hermetic."""
+
+    async def stub(strategy_path: Any, *, pairs: Any, timeframe: Any, timerange: Any) -> dict[str, Any]:
+        return {
+            "passed": True,
+            "details": "stub: no look-ahead bias",
+            "returncode": 0,
+            "worker_dir": "/tmp/stub",
+            "stderr_tail": "",
+            "stdout_tail": "",
+        }
+
+    return stub
+
+
 async def test_subgraph_runs_end_to_end_with_stubs(tmp_path: Path) -> None:
     """Topology test: stubbed researcher + generator round-trip through
     START → load_context → researcher → generator → END. Asserts every
@@ -123,6 +144,7 @@ async def test_subgraph_runs_end_to_end_with_stubs(tmp_path: Path) -> None:
         researcher_fn=stub_researcher,
         generator_fn=stub_generator,
         critic_fn=_make_pass_critic_stub(),
+        lookahead_runner=_make_pass_lookahead_runner(),
         checkpointer=InMemorySaver(),
     )
     config = {"configurable": {"thread_id": "test_topology_001"}}
@@ -188,10 +210,18 @@ async def test_load_context_reads_from_store(tmp_path: Path) -> None:
         }
 
     async def stub_generator(state: dict[str, Any]) -> dict[str, Any]:
+        # Must write artifacts.generated_strategy_path AND the file on
+        # disk (5e lookahead_gate checks both).
+        out_path = tmp_path / "x.py"
+        out_path.write_text("# stub strategy\n", encoding="utf-8")
+        existing_artifacts = state.get("artifacts") or {}
         return {
             "params": {},
-            "strategy_path": str(tmp_path / "x.py"),
-            "artifacts": state.get("artifacts") or {},
+            "strategy_path": str(out_path),
+            "artifacts": {
+                **existing_artifacts,
+                "generated_strategy_path": str(out_path),
+            },
             "agent_votes": [],
         }
 
@@ -200,6 +230,7 @@ async def test_load_context_reads_from_store(tmp_path: Path) -> None:
         researcher_fn=stub_researcher,
         generator_fn=stub_generator,
         critic_fn=_make_pass_critic_stub(),
+        lookahead_runner=_make_pass_lookahead_runner(),
         checkpointer=InMemorySaver(),
     )
     config = {"configurable": {"thread_id": "test_load_ctx_001"}}
@@ -235,10 +266,18 @@ async def test_load_context_defaults_regime_when_missing(tmp_path: Path) -> None
         }
 
     async def stub_generator(state: dict[str, Any]) -> dict[str, Any]:
+        # Must write artifacts.generated_strategy_path AND the file on
+        # disk (5e lookahead_gate checks both).
+        out_path = tmp_path / "x.py"
+        out_path.write_text("# stub strategy\n", encoding="utf-8")
+        existing_artifacts = state.get("artifacts") or {}
         return {
             "params": {},
-            "strategy_path": str(tmp_path / "x.py"),
-            "artifacts": state.get("artifacts") or {},
+            "strategy_path": str(out_path),
+            "artifacts": {
+                **existing_artifacts,
+                "generated_strategy_path": str(out_path),
+            },
             "agent_votes": [],
         }
 
@@ -247,6 +286,7 @@ async def test_load_context_defaults_regime_when_missing(tmp_path: Path) -> None
         researcher_fn=stub_researcher,
         generator_fn=stub_generator,
         critic_fn=_make_pass_critic_stub(),
+        lookahead_runner=_make_pass_lookahead_runner(),
         checkpointer=InMemorySaver(),
     )
     config = {"configurable": {"thread_id": "test_no_regime_001"}}

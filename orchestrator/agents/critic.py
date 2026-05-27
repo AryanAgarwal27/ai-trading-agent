@@ -427,7 +427,7 @@ def verdict_to_state_update(
 
 def revise_or_proceed(
     state: dict[str, Any],
-) -> Command[Literal["generator", "archive", "__end__"]]:
+) -> Command[Literal["generator", "archive", "lookahead_gate"]]:
     """Route based on the latest critic verdict and the revision count.
 
     BRD §5.3:
@@ -435,14 +435,17 @@ def revise_or_proceed(
         (revision_count is incremented in the returned Command's update)
       - vote="revise" AND revision_count >= MAX_REVISIONS → goto archive
         with failure_reason="critic_loop_exhausted: <last guidance>"
-      - vote="pass" → goto END (Stage 5d) / lookahead_gate (Stage 5e)
+      - vote="pass" → goto lookahead_gate (Stage 5e)
 
-    The Stage 5d topology routes pass-verdicts directly to END;
-    :func:`orchestrator.subgraphs.research.build_research_subgraph` swaps
-    the pass-target to ``"lookahead_gate"`` in Stage 5e. Both targets
-    are listed in the returned ``Command`` type-hint via the special
-    ``"__end__"`` literal (LangGraph's END sentinel) so the static
-    type-checker accepts both paths.
+    All three targets are explicit ``Command(goto=...)`` returns rather
+    than a mix of Command + falls-through-to-add_edge. This is a
+    deliberate post-5d correction: when a node returns Command without
+    a goto AND the builder has an add_edge to a downstream node, Pregel
+    schedules both nodes in the SAME superstep, which conflicts on
+    state-channel writes that don't have an ``add`` reducer (the
+    ``artifacts`` field is one such — see the InvalidUpdateError that
+    surfaced when 5e's lookahead_gate was wired downstream of a
+    Command(no-goto) pass route).
 
     Reads:
       - ``state["agent_votes"]`` — finds the latest ``"critic"`` vote.
@@ -469,12 +472,11 @@ def revise_or_proceed(
     verdict = critic_vote.get("verdict")
 
     if verdict == "pass":
-        # END / lookahead_gate decision is owned by the subgraph
-        # builder (it edges from revise_or_proceed → END in 5d and →
-        # lookahead_gate in 5e). Returning no goto lets the next edge
-        # win; we use Command with no goto since the routing here is
-        # the deterministic "pass-through" case.
-        return Command(update={})
+        # Explicit goto to lookahead_gate (BRD §5.3). Pregel schedules
+        # the gate in the next superstep, not the same one — avoids
+        # the artifacts-channel double-write that no-goto + add_edge
+        # produced.
+        return Command(goto="lookahead_gate")
 
     if verdict != "revise":
         raise RuntimeError(
