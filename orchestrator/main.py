@@ -207,14 +207,22 @@ async def list_threads(request: Request) -> list[dict[str, Any]]:
     """List every row in ``strategy_registry`` with current interrupt state.
 
     Returns a list of objects:
-    ``{strategy_id, thread_id, stage, last_updated, has_pending_interrupt}``.
+    ``{strategy_id, thread_id, stage, last_updated, has_pending_interrupt,
+    pending_interrupt_payload}``.
 
-    The ``has_pending_interrupt`` flag is computed by calling
-    ``graph.aget_state(config)`` per thread and checking
-    ``any(t.interrupts for t in snapshot.tasks)``. This is O(N) per
+    ``pending_interrupt_payload`` is the dict that was passed to
+    ``interrupt(...)`` inside the paused gate node (i.e. the output of
+    :func:`orchestrator.gates.hitl.build_interrupt_payload`). It is
+    ``None`` when ``has_pending_interrupt`` is False. The Streamlit
+    dashboard (Stage 6f) renders rationale + metrics from this field —
+    embedding it here avoids a per-thread HTTP round-trip and keeps the
+    UI to a single polling endpoint.
+
+    Computed by calling ``graph.aget_state(config)`` per thread and
+    inspecting ``snapshot.tasks[*].interrupts[*].value``. O(N) per
     request — fine for v1 (≤20 threads). **Stage 10 work item**: cache
-    the interrupt state in a Redis hash invalidated by the
-    ``gate_pending`` / ``gate_advanced`` channels once N > ~50.
+    the snapshot in a Redis hash invalidated by the ``gate_pending`` /
+    ``gate_advanced`` channels once N > ~50.
     """
     graph = request.app.state.graph
 
@@ -232,14 +240,26 @@ async def list_threads(request: Request) -> list[dict[str, Any]]:
     threads: list[dict[str, Any]] = []
     for strategy_id, thread_id, stage, last_updated in rows:
         config = {"configurable": {"thread_id": thread_id}}
+        has_pending = False
+        pending_payload: dict[str, Any] | None = None
         try:
             snapshot = await graph.aget_state(config)
-            has_pending = any(getattr(t, "interrupts", ()) for t in snapshot.tasks)
+            for task in snapshot.tasks:
+                interrupts = getattr(task, "interrupts", ())
+                if interrupts:
+                    has_pending = True
+                    # First interrupt's value is the
+                    # build_interrupt_payload(...) dict the gate node
+                    # passed to interrupt(). Multiple interrupts on one
+                    # task are not a pattern this project uses — first
+                    # wins keeps the contract simple.
+                    pending_payload = interrupts[0].value
+                    break
         except Exception:
-            # Threads with no checkpoint history (registry row but
-            # graph never ran) — treat as no pending interrupt rather
-            # than failing the whole list.
-            has_pending = False
+            # Threads with no checkpoint history (registry row but graph
+            # never ran) — treat as no pending interrupt rather than
+            # failing the whole list.
+            pass
         threads.append(
             {
                 "strategy_id": strategy_id,
@@ -247,6 +267,7 @@ async def list_threads(request: Request) -> list[dict[str, Any]]:
                 "stage": stage,
                 "last_updated": last_updated.isoformat() if last_updated else None,
                 "has_pending_interrupt": has_pending,
+                "pending_interrupt_payload": pending_payload,
             }
         )
     return threads

@@ -203,6 +203,13 @@ async def test_get_threads_returns_registry_rows_with_interrupt_state(
             assert by_tid[parked_tid]["stage"] == "paper_gate"
             assert by_tid[idle_tid]["has_pending_interrupt"] is False
             assert by_tid[idle_tid]["last_updated"] is not None
+            # Stage 6f: pending_interrupt_payload carries the
+            # interrupt(...) dict for parked threads, None otherwise.
+            parked_payload = by_tid[parked_tid]["pending_interrupt_payload"]
+            assert parked_payload is not None
+            assert parked_payload["kind"] == "paper_gate"
+            assert parked_payload["strategy_id"] == parked_sid
+            assert by_tid[idle_tid]["pending_interrupt_payload"] is None
     finally:
         await _cleanup_registry_and_audits(cleanup_ids)
 
