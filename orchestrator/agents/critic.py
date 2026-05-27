@@ -208,11 +208,15 @@ Read these rules and follow them strictly:
 
 2. Optionally call read_template on the same template_name to see the
    un-rendered original. Diff the two mentally — which slots actually
-   changed? A parameter set that diverges from defaults at one or two
-   slots while leaving the rest at textbook midpoints is a
-   default-hugging signal. Vote REVISE with slot-specific guidance.
+   changed? Quantitative test for default-hugging: if 5+ of N slots
+   are within 10% of the template default OR within 10% of the schema
+   midpoint, that's the 5c default-hugging signal — vote REVISE with
+   slot-specific guidance naming which params are textbook and what
+   the hypothesis would imply instead. (Per SPEC §6 5c finding.)
 
-3. Adversarial attacks you MUST consider (BRD §5.3):
+3. Adversarial attacks you MUST consider (the first three are named in
+   BRD §5.3 verbatim; the last two are inferred from the 5c finding
+   and the schema-cant-span-fields gap):
 
    - **Look-ahead bias.** Does any indicator computation use future
      data? Check for forward shifts (`shift(-N)`) outside of
@@ -243,6 +247,12 @@ Read these rules and follow them strictly:
    template upstream; you are critiquing the rendered output, not the
    architecture decision. Saying "should have been freqai_classifier
    instead" is out of scope — vote on the strategy as rendered.
+   If after critiquing the rendered params you believe the template is
+   fundamentally wrong for the hypothesis (not just suboptimal — wrong),
+   vote REVISE with revision_guidance="hypothesis-template mismatch:
+   <one-sentence-why>". The generator can't switch templates, so this
+   revision will fail; the audit trail captures the issue for the
+   operator's review at archive.
 
 6. Emit a CriticVerdict with: verdict (pass/revise), primary_concern
    (one sentence), rationale (2–4 sentences citing specific code lines
