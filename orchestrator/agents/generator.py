@@ -37,6 +37,7 @@ without mocking the entire researcher.
 from __future__ import annotations
 
 import importlib.util
+import os
 import re
 from collections.abc import Awaitable, Callable
 from pathlib import Path
@@ -183,13 +184,51 @@ async def _default_params_extractor(
         stop=None,
     )
     structured = model.with_structured_output(schema_cls)
+
+    # The system prompt is deliberately directive about avoiding midpoint
+    # default-hugging. Without this framing Sonnet returns parameter sets
+    # clustered around textbook RSI/BB values regardless of the hypothesis,
+    # which collapses the researcher → generator chain into "render the
+    # template's own defaults with tiny perturbations". The 5d critic loop
+    # is meant for substantive design errors (look-ahead bias, leverage
+    # compounding), not calibration — letting default-hugging through to
+    # the critic burns Opus tokens on a Sonnet-fixable problem.
     system = (
         "You are the parameter extractor for an LLM-orchestrated trading "
-        "agent. The researcher proposed a strategy hypothesis and narrowed "
-        "parameter ranges. Your job: emit ONE concrete parameter set that "
-        "(a) sits inside the narrowed ranges where possible, and "
-        "(b) satisfies the Pydantic schema's hard constraints in all cases. "
-        "If a narrowed range conflicts with the schema, prefer the schema."
+        "agent. The researcher proposed a strategy hypothesis and a set of "
+        "narrowed parameter ranges. Your job: emit ONE concrete parameter "
+        "set that encodes the hypothesis.\n\n"
+        "RULES:\n\n"
+        "1. The hypothesis is load-bearing. Each parameter you pick must "
+        "be defensible as 'I picked this value because the hypothesis "
+        "says X.'\n\n"
+        "2. Midpoint or textbook values are an ANTI-PATTERN. They produce "
+        "a generic strategy that does not encode any particular thesis. "
+        "Examples:\n"
+        "   - If the hypothesis says 'mean-reversion on stretched BB in a "
+        "flat regime', bb_std=2.0 is generic but bb_std=2.6+ encodes "
+        "'stretched'.\n"
+        "   - If the hypothesis says 'aggressive oversold capture', "
+        "rsi_buy_threshold=30 is textbook but 18 encodes 'aggressive'.\n"
+        "   - If the hypothesis says 'fast retrain on regime-change risk', "
+        "label_period_candles=12 is generic but 6 encodes 'fast'.\n\n"
+        "3. Read the hypothesis and regime_thesis carefully before each "
+        "value. Pick toward the EDGE of the range that the hypothesis "
+        "demands. Avoid midpoint values unless you can articulate why "
+        "the midpoint is itself the position the hypothesis requires "
+        "(rare — most hypotheses pull toward one edge).\n\n"
+        "4. The researcher's narrowed ranges are guidance. The Pydantic "
+        "schema's ge/le bounds are the hard constraint. If guidance and "
+        "schema conflict, prefer the schema. If guidance is silent on a "
+        "slot, pick a value with conviction toward the edge of the "
+        "schema range that the hypothesis demands — do NOT default to "
+        "the schema midpoint.\n\n"
+        "5. If the hypothesis is genuinely too vague to ground a "
+        "parameter choice, pick a value with conviction toward one edge "
+        "anyway — a strategy with a bad-but-decisive parameter set is "
+        "diagnostically more useful than one with a midpoint-defaulted "
+        "set, because the backtest will surface where the conviction was "
+        "wrong."
     )
     suggested_ranges = proposal.get("suggested_param_ranges") or {}
     user_msg = (
@@ -198,11 +237,24 @@ async def _default_params_extractor(
         f"Suggested parameter ranges (from researcher): {suggested_ranges}\n\n"
         f"Template source (read the # SLOT: comments for each field):\n\n"
         f"```python\n{template_source}\n```\n\n"
-        f"Emit the parameter set."
+        f"Emit the parameter set. Remember: each value must encode the "
+        f"hypothesis, not the textbook midpoint."
     )
-    return await structured.ainvoke(
+    params_instance = await structured.ainvoke(
         [SystemMessage(content=system), HumanMessage(content=user_msg)]
     )
+
+    # SMOKE_DEBUG=1 in env → print the extracted params for smoke-probe
+    # diagnostics. Guarded so production paths (and unit tests, which
+    # don't reach this function — they inject a stub extractor) don't
+    # get spammed. Set via `$env:SMOKE_DEBUG="1"` (PowerShell) before
+    # running scripts/smoke_researcher.py.
+    if os.environ.get("SMOKE_DEBUG"):
+        print("[generator._default_params_extractor] DEBUG extracted params:")
+        print(f"    schema={schema_cls.__name__}")
+        print(f"    params={params_instance.model_dump()}")
+
+    return params_instance
 
 
 # ─── Node function (used by the research subgraph) ─────────────────────
