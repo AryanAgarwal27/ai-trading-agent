@@ -26,8 +26,10 @@ import json
 import logging
 import shutil
 import subprocess
+import time
 import uuid
 import zipfile
+from collections.abc import Iterable
 from pathlib import Path
 from typing import Any
 
@@ -83,6 +85,7 @@ async def run_backtest(
     param_set_id: str = "default",
     stake_amount: float = 100.0,
     max_open_trades: int = 4,
+    fee: float | None = None,
     timeout_s: int = DEFAULT_TIMEOUT_S,
 ) -> BacktestResult:
     """Run one Freqtrade backtest in an isolated Docker worker.
@@ -109,6 +112,11 @@ async def run_backtest(
         Per-trade stake in quote currency.
     max_open_trades
         Concurrent position cap (BRD §10).
+    fee
+        Optional ``--fee`` override (decimal fraction, e.g. ``0.002`` for
+        20bp). When ``None``, Freqtrade picks the exchange's worst-tier fee.
+        Stage 4d's ``fee_stress_worker`` uses this to run the 2× and 3×
+        stress runs (BRD §5.4).
     timeout_s
         Subprocess timeout in seconds. Raises ``BacktestError`` if exceeded.
 
@@ -154,6 +162,7 @@ async def run_backtest(
         worker_dir=worker_dir,
         timerange=timerange,
         strategy_class=strategy_class,
+        fee=fee,
     )
 
     log.info(
@@ -204,6 +213,66 @@ def cleanup_worker(worker_dir: Path) -> None:
     if worker_dir.parent.resolve() != WORKERS_DIR.resolve():
         raise ValueError(f"refusing to remove {worker_dir} — not a child of {WORKERS_DIR}")
     shutil.rmtree(worker_dir)
+
+
+def cleanup_stale_workers(
+    *,
+    keep: Iterable[Path] = (),
+    min_age_seconds: int = 60 * 60,
+) -> list[str]:
+    """Sweep orphan worker dirs from ``_workers/``.
+
+    **Ownership contract (Stage 4 handoff):** the validation subgraph's
+    aggregators own cleanup of (a) workers they produced this run AND
+    (b) any *stale* orphan workers found at ``_workers/`` on startup.
+    Failed runs leave their userdir behind (BRD §7.1 + ``cleanup_worker``
+    docstring) so the operator can inspect them; but a worker from a
+    prior session that has been on disk for ``min_age_seconds`` is no
+    longer useful and only consumes space. This function removes them.
+
+    Parameters
+    ----------
+    keep
+        Iterable of worker paths to preserve regardless of age. The
+        active fan-out passes the paths of its own current workers here
+        so it does not accidentally prune them while still in flight.
+    min_age_seconds
+        Minimum age (mtime) below which a worker dir is considered
+        "active" and preserved. Defaults to 1 hour, which is wider than
+        any sane backtest worker lifetime and tight enough that orphans
+        from a prior session always meet the threshold.
+
+    Returns
+    -------
+    list[str]
+        Names of the worker dirs that were removed (mainly for logging
+        + operator visibility in integration test output).
+    """
+    if not WORKERS_DIR.exists():
+        return []
+
+    keep_resolved = {p.resolve() for p in keep}
+    now = time.time()
+    removed: list[str] = []
+    for child in WORKERS_DIR.iterdir():
+        if not child.is_dir():
+            continue
+        if child.resolve() in keep_resolved:
+            continue
+        try:
+            age = now - child.stat().st_mtime
+        except FileNotFoundError:
+            # Worker pruned by another process between iterdir and stat.
+            continue
+        if age < min_age_seconds:
+            continue
+        try:
+            shutil.rmtree(child)
+            removed.append(child.name)
+        except OSError as exc:
+            # Worker may be in use, or perms issue — log via stderr-equivalent.
+            log.warning("cleanup_stale_workers: could not remove %s: %s", child, exc)
+    return removed
 
 
 # ────────────────────────────── internals ──────────────────────────────
@@ -284,6 +353,7 @@ def _build_docker_cmd(
     worker_dir: Path,
     timerange: str,
     strategy_class: str,
+    fee: float | None = None,
 ) -> list[str]:
     """Compose the ``docker run`` argv per the bind-mount invariant.
 
@@ -295,10 +365,14 @@ def _build_docker_cmd(
     (``C:\\dev\\...``) which Docker Desktop accepts. The Git Bash MSYS
     ``/c/dev/...`` form would NOT be produced here because this runner is
     invoked from the orchestrator's Python process, not from a shell.
+
+    When ``fee`` is set, Freqtrade's ``--fee <value>`` overrides the
+    exchange's worst-tier fee. Stage 4d uses this for fee-stress runs at
+    2× and 3× the default rate (BRD §5.4 + §10).
     """
     worker_host = str(worker_dir.resolve())
     data_host = str(SHARED_DATA_DIR.resolve())
-    return [
+    cmd = [
         "docker",
         "run",
         "--rm",
@@ -321,6 +395,9 @@ def _build_docker_cmd(
         "--export",
         "trades",
     ]
+    if fee is not None:
+        cmd.extend(["--fee", str(fee)])
+    return cmd
 
 
 async def _run_subprocess(cmd: list[str], timeout_s: int) -> tuple[bytes, bytes, int]:
