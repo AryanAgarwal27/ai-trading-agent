@@ -48,9 +48,13 @@
         "ccxt_config": {},
         "ccxt_async_config": {},
         "pair_whitelist": [],
-        "pair_blacklist": [
-            "BNB/.*"
-        ]
+        // pair_blacklist intentionally empty: SPEC §1 Q2 v1 pair list
+        // includes BNB/USDT (no exchange-side conflict on Binance spot;
+        // the historical BNB-stake fee-discount caveat applies to the
+        // BNB stake currency, not the BNB/USDT pair). Per-strategy
+        // blacklist additions belong in paper_spawn's deep-merge, not
+        // the contract base.
+        "pair_blacklist": []
     },
 
     "entry_pricing": {

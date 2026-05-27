@@ -179,3 +179,36 @@ caller needs to think about it.
 | `user_data/strategies/<Name>.py` | orchestrator (symlink) | points at `strategy_templates/_generated/<id>.py` |
 | `user_data/configs/config-*.json` | orchestrator | base config templates (paper, live, backtest) |
 | `user_data/_workers/<worker_id>/` | `backtest_runner.py` | ephemeral, one per Send fan-out leg; `rm -rf`-ed after parse |
+
+---
+
+## Config files are JSONC, not standard JSON
+
+Files in `user_data/configs/` (e.g. `paper-base.json`, future `live-base.json`)
+may contain `//` line comments and `/* */` block comments. Freqtrade 2026.4
+parses these natively, but **standard tools do not**:
+
+- `jq` will fail on the file.
+- `json.loads(path.read_text())` will raise `JSONDecodeError`.
+- VS Code's default JSON validator will redline the comments unless the file
+  language mode is set to `JSON with Comments` (jsonc).
+
+**Code reading these files MUST strip comments first.** The canonical pattern:
+
+```python
+import json, re, pathlib
+
+raw = pathlib.Path("freqtrade/user_data/configs/paper-base.json").read_text()
+# Strip // line comments. Block comments not used in this project.
+stripped = re.sub(r"//.*", "", raw)
+config = json.loads(stripped)
+```
+
+`paper_spawn` (Stage 7b+) uses this pattern when loading `paper-base.json`
+before deep-merging per-strategy fields. If you write tooling that needs to
+read or validate these configs, do the same.
+
+This choice was deliberate: inline `//` comments document gaps and contract
+boundaries (e.g. the BRD §11 daily-loss-limit gap note in `paper-base.json`)
+that would otherwise need a parallel `_README.md`, which drifts. Freqtrade's
+own example configs use the same JSONC convention.
