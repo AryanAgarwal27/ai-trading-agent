@@ -231,10 +231,23 @@ async def _default_params_extractor(
         "wrong."
     )
     suggested_ranges = proposal.get("suggested_param_ranges") or {}
+    # Critic feedback from prior revision passes (5d). The generator's
+    # node bundles state["critic_notes"] (accumulated across the bounded
+    # loop) into the proposal under "critic_feedback" before invoking
+    # the extractor. Empty on the initial pass; non-empty on revisions.
+    critic_feedback = proposal.get("critic_feedback") or []
+    critic_section = ""
+    if critic_feedback:
+        joined = "\n".join(f"  - {note}" for note in critic_feedback)
+        critic_section = (
+            f"\n\nPRIOR CRITIC FEEDBACK (this is a revision pass — "
+            f"address EVERY item below; the critic will check):\n{joined}\n"
+        )
     user_msg = (
         f"Hypothesis: {proposal.get('hypothesis', '')}\n\n"
         f"Regime thesis: {proposal.get('regime_thesis', '')}\n\n"
-        f"Suggested parameter ranges (from researcher): {suggested_ranges}\n\n"
+        f"Suggested parameter ranges (from researcher): {suggested_ranges}"
+        f"{critic_section}\n\n"
         f"Template source (read the # SLOT: comments for each field):\n\n"
         f"```python\n{template_source}\n```\n\n"
         f"Emit the parameter set. Remember: each value must encode the "
@@ -301,6 +314,11 @@ async def generator_node(
     if not template_name:
         raise ValueError("generator_node requires state['template']")
     proposal = (state.get("artifacts") or {}).get("research_proposal") or {}
+    # Stage 5d: bundle accumulated critic_notes into the proposal so the
+    # extractor sees them on revision passes. Empty on the initial pass.
+    critic_notes = state.get("critic_notes") or []
+    if critic_notes:
+        proposal = {**proposal, "critic_feedback": list(critic_notes)}
 
     template_path = TEMPLATES_DIR / f"{template_name}.py"
     if not template_path.exists():

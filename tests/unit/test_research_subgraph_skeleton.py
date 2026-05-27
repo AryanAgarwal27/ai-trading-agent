@@ -1,10 +1,14 @@
-"""Tests for orchestrator.subgraphs.research (Stage 5c skeleton).
+"""Tests for orchestrator.subgraphs.research load_context wiring.
 
-End-to-end test of the 4-node subgraph topology (START → load_context →
-researcher → generator → END) with stubbed researcher + generator nodes
-so the test never makes an LLM call. The real Sonnet path is exercised
-by ``scripts/smoke_researcher.py`` (operator-run, not CI).
-"""
+Originally Stage 5c skeleton tests; updated for Stage 5d's new topology
+(START → load_context → researcher → generator → critic →
+revise_or_proceed → END). Each test passes a critic stub that
+unconditionally votes pass so the loop terminates in one iteration —
+the bounded-loop behavior is covered by :mod:`tests.unit.test_critic_loop`.
+
+These tests retain value as load_context-specific contract checks
+(regime propagation, default-regime fallback, Store seeding) that are
+narrower than the loop tests."""
 
 from __future__ import annotations
 
@@ -27,6 +31,38 @@ def loaded_store() -> InMemoryStore:
     ``artifacts.loaded_context``."""
     store = InMemoryStore()
     return store
+
+
+def _make_pass_critic_stub() -> Any:
+    """Critic stub that always votes pass — collapses the 5d bounded
+    loop into a single iteration so these tests stay focused on
+    load_context behavior, not loop behavior."""
+
+    async def stub(state: dict[str, Any]) -> dict[str, Any]:
+        existing = state.get("artifacts") or {}
+        verdict_dump = {
+            "verdict": "pass",
+            "primary_concern": "stub",
+            "rationale": "stub",
+            "revision_guidance": "",
+            "confidence": 0.9,
+        }
+        prior = list(existing.get("critic_verdicts") or [])
+        prior.append(verdict_dump)
+        return {
+            "agent_votes": [
+                {
+                    "agent": "critic",
+                    "verdict": "pass",
+                    "rationale": "stub",
+                    "confidence": 0.9,
+                }
+            ],
+            "critic_notes": [],
+            "artifacts": {**existing, "critic_verdicts": prior},
+        }
+
+    return stub
 
 
 async def test_subgraph_runs_end_to_end_with_stubs(tmp_path: Path) -> None:
@@ -86,6 +122,7 @@ async def test_subgraph_runs_end_to_end_with_stubs(tmp_path: Path) -> None:
         store=None,
         researcher_fn=stub_researcher,
         generator_fn=stub_generator,
+        critic_fn=_make_pass_critic_stub(),
         checkpointer=InMemorySaver(),
     )
     config = {"configurable": {"thread_id": "test_topology_001"}}
@@ -162,6 +199,7 @@ async def test_load_context_reads_from_store(tmp_path: Path) -> None:
         store=store,
         researcher_fn=stub_researcher,
         generator_fn=stub_generator,
+        critic_fn=_make_pass_critic_stub(),
         checkpointer=InMemorySaver(),
     )
     config = {"configurable": {"thread_id": "test_load_ctx_001"}}
@@ -208,6 +246,7 @@ async def test_load_context_defaults_regime_when_missing(tmp_path: Path) -> None
         store=None,
         researcher_fn=stub_researcher,
         generator_fn=stub_generator,
+        critic_fn=_make_pass_critic_stub(),
         checkpointer=InMemorySaver(),
     )
     config = {"configurable": {"thread_id": "test_no_regime_001"}}
