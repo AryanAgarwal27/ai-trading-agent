@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import logging
 import os
 from collections import defaultdict
 from collections.abc import AsyncIterator
@@ -57,6 +58,8 @@ from orchestrator.observability.events import (
 )
 
 load_dotenv()
+
+logger = logging.getLogger(__name__)
 
 
 # ─── Gate-node ↔ gate_audits.gate mapping ──────────────────────────────
@@ -99,6 +102,52 @@ def _require_env(name: str) -> str:
 
 
 # ─── Operator-token dependency ─────────────────────────────────────────
+
+
+# ─── Smoke-only graph override (env-gated, throwaway) ────────────────
+# Lives here for locality with the lifespan branch that swaps it in.
+# The validation subgraph (and its langchain-anthropic transitive deps)
+# is imported INSIDE the function so a production startup with
+# AIT_SMOKE_PAPER_GATE_GRAPH unset never pays that import cost.
+#
+# Public-ish (single underscore): scripts/midstage_seed.py imports this
+# so the seed and the lifespan use the IDENTICAL graph topology — no
+# contract drift between "graph the smoke parks at" and "graph the
+# FastAPI endpoint queries".
+
+
+def _build_paper_gate_only_graph_for_smoke(saver: Any) -> Any:
+    """Smoke-only graph: ``START → paper_gate → END``. NOT for production.
+
+    Wired into ``app.state.graph`` ONLY when
+    ``AIT_SMOKE_PAPER_GATE_GRAPH`` is set in the env — see the env-gated
+    branch at the tail of :func:`lifespan`. The minimal topology matches
+    the 6e e2e test fixtures, so the smoke exercises the real interrupt
+    + resume + audit paths through the real FastAPI endpoints.
+
+    Operator workflow (Stage 6f mid-stage smoke):
+
+    1. Run ``scripts/midstage_seed.py`` — parks a checkpoint at
+       paper_gate against the real ``AsyncPostgresSaver`` + inserts a
+       ``strategy_registry`` row.
+    2. Restart uvicorn with ``AIT_SMOKE_PAPER_GATE_GRAPH=1`` in the
+       env so this branch fires.
+    3. Open the dashboard, drive Approve / Reject.
+    4. UNSET the env var for any subsequent real run.
+    """
+    # Lazy imports keep production startup free of the validation
+    # subgraph's langchain-anthropic chain when the env var is unset.
+    from langgraph.graph import END, START, StateGraph
+
+    from orchestrator.subgraphs.validation import ValidationState, paper_gate
+
+    builder: StateGraph[
+        ValidationState, ValidationState, ValidationState, ValidationState
+    ] = StateGraph(ValidationState)
+    builder.add_node("paper_gate", paper_gate)
+    builder.add_edge(START, "paper_gate")
+    builder.add_edge("paper_gate", END)
+    return builder.compile(checkpointer=saver)
 
 
 def _hash_token_for_actor(token: str) -> str:
@@ -187,6 +236,22 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         # Stage 10 work item: LRU eviction once we routinely retain
         # > ~50 archived threads in memory.
         app.state.thread_locks = defaultdict(asyncio.Lock)
+
+        # ── Smoke-only graph override (env-gated, off by default). ─────
+        # When AIT_SMOKE_PAPER_GATE_GRAPH is set, replace the production
+        # parent graph with a paper_gate-only minimal graph for the
+        # Stage 6f operator smoke — the real parent doesn't include
+        # validation_subgraph yet (per 6e note 1), so an endpoint's
+        # aget_state() of a paper_gate-parked checkpoint would otherwise
+        # report no pending interrupt. Production behavior is identical
+        # when the env var is unset.
+        if os.environ.get("AIT_SMOKE_PAPER_GATE_GRAPH"):
+            app.state.graph = _build_paper_gate_only_graph_for_smoke(saver)
+            logger.warning(
+                "AIT_SMOKE_PAPER_GATE_GRAPH=1 — production parent graph "
+                "replaced with smoke-only paper_gate graph. UNSET this "
+                "env var for any real run."
+            )
 
         yield
 
