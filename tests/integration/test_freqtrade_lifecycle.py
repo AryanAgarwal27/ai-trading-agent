@@ -78,6 +78,21 @@ def _skip_if_missing_prereqs() -> None:
     *skip*, not fail. The error string for each branch points the
     operator at the exact setup doc.
     """
+    # Explicit opt-in gate. Even with valid Binance keys in .env (which
+    # conftest.py's load_dotenv makes visible to every test run), a
+    # routine `pytest -m freqtrade` invocation — e.g. to exercise the
+    # Stage 3 backtest subprocess — must NOT boot a real paper container
+    # as a side effect. Booting Freqtrade is slow, places dry-run orders,
+    # and leaves a container running if teardown is interrupted. Require
+    # a deliberate env flag so the spawn only happens when the operator
+    # actually means to smoke the spawn path.
+    if not os.environ.get("AIT_RUN_REAL_SPAWN_TESTS"):
+        pytest.skip(
+            "AIT_RUN_REAL_SPAWN_TESTS not set; real-container spawn test "
+            "requires explicit opt-in to avoid accidental Freqtrade boots "
+            "during routine test runs."
+        )
+
     if not os.environ.get("BINANCE_PAPER_API_KEY"):
         pytest.skip(
             "BINANCE_PAPER_API_KEY not set; spawn-test requires real paper "
