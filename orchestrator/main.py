@@ -56,6 +56,12 @@ from orchestrator.observability.events import (
     publish_gate_advanced,
     record_gate_audit,
 )
+from orchestrator.scheduler import (
+    build_scheduler,
+    make_schedule_wake_fn,
+    register_recurring_jobs,
+    shutdown_scheduler,
+)
 
 load_dotenv()
 
@@ -338,6 +344,20 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         # > ~50 archived threads in memory.
         app.state.thread_locks = defaultdict(asyncio.Lock)
 
+        # ── APScheduler (Stage 7f). ────────────────────────────────────
+        # Wake jobs (6h) + regime job (1h) + kill-switch poll placeholder
+        # (5m). SQLAlchemyJobStore in production so a parked paper
+        # thread's wake survives restart (BRD §4); tests select an
+        # in-memory store via AIT_SCHEDULER_JOBSTORE=memory. The
+        # schedule_wake_fn is stashed on app.state for the paper subgraph
+        # builder to consume when the parent graph composes it (7g+).
+        scheduler = build_scheduler()
+        register_recurring_jobs(scheduler)
+        scheduler.start()
+        stack.push_async_callback(shutdown_scheduler, scheduler)
+        app.state.scheduler = scheduler
+        app.state.schedule_wake_fn = make_schedule_wake_fn(scheduler)
+
         # ── Smoke-only graph overrides (env-gated, off by default). ────
         # When AIT_SMOKE_PAPER_GATE_GRAPH is set, replace the production
         # parent graph with a paper_gate-only minimal graph for the
@@ -553,6 +573,68 @@ async def approve_thread(
         )
 
     return {"resumed": True, "next_stage": next_stage, "audit_id": audit_id}
+
+
+@app.post("/threads/{thread_id}/wake")
+async def wake_thread(
+    thread_id: str,
+    request: Request,
+    token: str = Depends(_require_operator_token),
+) -> dict[str, Any]:
+    """Wake a paper thread parked at ``paper_wait`` (Stage 7f).
+
+    Called by the APScheduler 6h wake job (loopback, X-Operator-Token —
+    SPEC §6 d6736ba) and resumes the thread with
+    ``Command(resume={"wake": True})`` so it proceeds to ``paper_monitor``.
+
+    Distinct from ``/approve``:
+    - It is NOT a HITL decision; the resume payload is a wake signal, not
+      an ApprovalDecision. So it does NOT write a ``gate_audits`` row.
+    - It refuses (409) to wake a thread parked at anything OTHER than
+      ``paper_wait``. Waking a thread parked at a HITL gate
+      (paper_gate / live_gate) would feed ``{"wake": True}`` into the
+      gate's decision validation, which — lacking an ``approved`` key —
+      would archive the strategy. The node-name guard prevents that.
+
+    Same per-thread ``asyncio.Lock`` as /approve so a wake and an
+    operator approve can't race on the same thread.
+    """
+    graph = request.app.state.graph
+    thread_locks: defaultdict[str, asyncio.Lock] = request.app.state.thread_locks
+
+    lock = thread_locks[thread_id]
+    async with lock:
+        config = {"configurable": {"thread_id": thread_id}}
+        snapshot = await graph.aget_state(config)
+        interrupted_tasks = [t for t in snapshot.tasks if getattr(t, "interrupts", ())]
+
+        if not interrupted_tasks:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=(
+                    f"thread {thread_id!r} is not parked at an interrupt "
+                    f"(next={snapshot.next!r}). Nothing to wake."
+                ),
+            )
+
+        parked_node = getattr(interrupted_tasks[0], "name", "")
+        if parked_node != "paper_wait":
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=(
+                    f"thread {thread_id!r} is parked at {parked_node!r}, not "
+                    "'paper_wait'; /wake only resumes the paper wake-cycle. "
+                    "Use /approve for HITL gates."
+                ),
+            )
+
+        async for _ in graph.astream(Command(resume={"wake": True}), config=config):
+            pass
+
+        post_snapshot = await graph.aget_state(config)
+        next_stage = post_snapshot.values.get("stage")
+
+    return {"woke": True, "next_stage": next_stage}
 
 
 # ─── WS /events ────────────────────────────────────────────────────────

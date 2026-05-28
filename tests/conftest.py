@@ -16,6 +16,7 @@ root):
 from __future__ import annotations
 
 import asyncio
+import os
 import sys
 
 import pytest
@@ -29,6 +30,16 @@ from dotenv import load_dotenv
 # enabled — env vars set in the shell win over .env values, matching
 # uvicorn's startup behaviour in orchestrator/main.py.
 load_dotenv()
+
+# Stage 7f: force the APScheduler jobstore to in-memory for ALL tests.
+# Any test that drives the FastAPI lifespan starts the scheduler; with
+# the production SQLAlchemyJobStore that would (a) create/read the
+# apscheduler_jobs table in the app DB and (b) risk loading a leaked
+# per-thread wake job left by a real uvicorn run, which could then fire
+# an httpx POST mid-test. The memory store isolates the suite from the
+# production jobstore entirely. Production (uvicorn) never imports
+# conftest, so it keeps the SQLAlchemyJobStore default.
+os.environ["AIT_SCHEDULER_JOBSTORE"] = "memory"
 
 # Re-export topic-grouped fixtures from tests/fixtures/. The F401 is
 # the standard pytest pattern for fixture re-export from a topic
