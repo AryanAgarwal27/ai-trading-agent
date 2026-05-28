@@ -35,6 +35,7 @@ load_dotenv()
 # module — pytest discovers fixtures by name in the conftest's
 # namespace, so the import alone wires them up.
 from tests.fixtures.hitl import hitl_autoapprove, hitl_autoreject  # noqa: E402, F401
+from tests.fixtures.monitors import paper_monitor_stub  # noqa: E402, F401
 
 
 @pytest.fixture(scope="session")
