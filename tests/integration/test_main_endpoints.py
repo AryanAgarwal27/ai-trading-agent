@@ -311,7 +311,10 @@ async def test_approve_with_valid_token_advances_thread_and_writes_audit_and_pub
             # payload so `SELECT payload->>'notes' FROM gate_audits` works
             # without drilling through ->'decision'. Both paths must hold.
             assert payload["notes"] == "ship it"
-            assert payload["gate_node"] == "paper_gate"
+            # Stage 7g: the audit payload identifies the gate by interrupt
+            # "kind" (nesting-invariant), not the task node name — renamed
+            # gate_node -> gate_kind. The value is the gate kind.
+            assert payload["gate_kind"] == "paper_gate"
 
             # publish_gate_advanced called with the expected payload shape.
             publish_mock.assert_awaited_once()

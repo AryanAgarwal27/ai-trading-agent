@@ -81,6 +81,28 @@ RESUMABLE_GATES: dict[str, str] = {
 }
 
 
+def _interrupt_kind(task: Any) -> str | None:
+    """Return the ``kind`` of a parked task's first interrupt payload.
+
+    The gate identity lives in the interrupt payload's ``"kind"`` field
+    (set by ``build_interrupt_payload`` / the wake-park), NOT in the
+    task's node name. When a gate runs inside a nested compiled subgraph
+    (the Stage 7g parent graph: paper_gate inside ``validation_subgraph``,
+    paper_wait + live_gate inside ``paper_subgraph``), the parent task
+    name is the SUBGRAPH node name — so a node-name check would reject a
+    legitimate gate. Keying off the payload ``kind`` is nesting-invariant
+    and matches the build_interrupt_payload contract.
+    """
+    interrupts = getattr(task, "interrupts", ())
+    if not interrupts:
+        return None
+    value = interrupts[0].value
+    if isinstance(value, dict):
+        kind = value.get("kind")
+        return kind if isinstance(kind, str) else None
+    return None
+
+
 # ─── Request body shape ────────────────────────────────────────────────
 
 
@@ -336,7 +358,6 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 
         app.state.saver = saver
         app.state.store = store
-        app.state.graph = build_per_strategy_graph(saver, store)
         app.state.redis = redis_client
         # Per-thread asyncio.Lock — created on first access. v1 has ≤20
         # active threads so unbounded growth is not a concern.
@@ -348,15 +369,23 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         # Wake jobs (6h) + regime job (1h) + kill-switch poll placeholder
         # (5m). SQLAlchemyJobStore in production so a parked paper
         # thread's wake survives restart (BRD §4); tests select an
-        # in-memory store via AIT_SCHEDULER_JOBSTORE=memory. The
-        # schedule_wake_fn is stashed on app.state for the paper subgraph
-        # builder to consume when the parent graph composes it (7g+).
+        # in-memory store via AIT_SCHEDULER_JOBSTORE=memory. Built BEFORE
+        # the graph so the real schedule_wake_fn can be threaded into the
+        # paper subgraph (Stage 7g composition).
         scheduler = build_scheduler()
         register_recurring_jobs(scheduler)
         scheduler.start()
         stack.push_async_callback(shutdown_scheduler, scheduler)
         app.state.scheduler = scheduler
         app.state.schedule_wake_fn = make_schedule_wake_fn(scheduler)
+
+        # The production parent graph composes research → validation →
+        # paper (Stage 7g), with the APScheduler-backed schedule_wake_fn
+        # wired into the paper subgraph. All other leaf seams default to
+        # their real implementations inside build_per_strategy_graph.
+        app.state.graph = build_per_strategy_graph(
+            saver, store, schedule_wake_fn=app.state.schedule_wake_fn
+        )
 
         # ── Smoke-only graph overrides (env-gated, off by default). ────
         # When AIT_SMOKE_PAPER_GATE_GRAPH is set, replace the production
@@ -515,13 +544,16 @@ async def approve_thread(
                 ),
             )
 
-        gate_node = getattr(interrupted_tasks[0], "name", "")
-        if gate_node not in RESUMABLE_GATES:
+        # Identify the gate by the interrupt payload's "kind" (nesting-
+        # invariant — see _interrupt_kind), not the task node name.
+        gate_kind = _interrupt_kind(interrupted_tasks[0])
+        if gate_kind is None or gate_kind not in RESUMABLE_GATES:
             raise HTTPException(
                 status_code=status.HTTP_409_CONFLICT,
                 detail=(
-                    f"thread {thread_id!r} interrupted at unexpected node "
-                    f"{gate_node!r}; expected one of {tuple(RESUMABLE_GATES)}."
+                    f"thread {thread_id!r} interrupted at unexpected gate "
+                    f"kind={gate_kind!r}; expected one of {tuple(RESUMABLE_GATES)}. "
+                    "(A paper_wait park is resumed via /wake, not /approve.)"
                 ),
             )
 
@@ -548,7 +580,7 @@ async def approve_thread(
         # exactly the failure mode this duplication prevents.
         audit_payload = {
             "thread_id": thread_id,
-            "gate_node": gate_node,
+            "gate_kind": gate_kind,
             "decision": decision_dict,
             "next_stage": next_stage,
             "notes": body.notes,
@@ -556,7 +588,7 @@ async def approve_thread(
 
         audit_id = await record_gate_audit(
             strategy_id=strategy_id,
-            gate=RESUMABLE_GATES[gate_node],
+            gate=RESUMABLE_GATES[gate_kind],
             decision=decision_label,
             actor=actor,
             payload=audit_payload,
@@ -617,13 +649,18 @@ async def wake_thread(
                 ),
             )
 
-        parked_node = getattr(interrupted_tasks[0], "name", "")
-        if parked_node != "paper_wait":
+        # Identify the parked gate by the interrupt payload "kind" — the
+        # paper_wait interrupt carries kind="paper_wait". Under the
+        # composed parent graph the parked task is the ``paper_subgraph``
+        # node, so a task-name check would never match; the payload kind
+        # is nesting-invariant (same reasoning as /approve's _interrupt_kind).
+        parked_kind = _interrupt_kind(interrupted_tasks[0])
+        if parked_kind != "paper_wait":
             raise HTTPException(
                 status_code=status.HTTP_409_CONFLICT,
                 detail=(
-                    f"thread {thread_id!r} is parked at {parked_node!r}, not "
-                    "'paper_wait'; /wake only resumes the paper wake-cycle. "
+                    f"thread {thread_id!r} is parked at gate kind={parked_kind!r}, "
+                    "not 'paper_wait'; /wake only resumes the paper wake-cycle. "
                     "Use /approve for HITL gates."
                 ),
             )

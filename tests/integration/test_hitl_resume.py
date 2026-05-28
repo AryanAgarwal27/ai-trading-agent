@@ -240,7 +240,9 @@ async def test_paper_gate_full_resume_cycle_happy_path(
                 f"nested payload.decision.notes mismatch: {payload!r}"
             )
             assert payload["decision"]["approved"] is True
-            assert payload["gate_node"] == "paper_gate"
+            # Stage 7g: gate identified by interrupt "kind" (nesting-
+            # invariant), audit key renamed gate_node -> gate_kind.
+            assert payload["gate_kind"] == "paper_gate"
 
             # ── Redis publish (gate_advanced channel only — gate_pending
             # also fires during park, filter to the resume side).
