@@ -109,7 +109,19 @@ class ValidationState(TypedDict, total=False):
     pairs: list[str]
     timeframe: str
 
-    # ─── Plan inputs — supplied by the caller before invoke ────────
+    # ─── Research handoff inputs (Stage 7h) ────────────────────────
+    # The parent graph hands research's output in via these channels.
+    # ``prepare_validation_inputs`` reads ``params`` (research emits ONE
+    # filled param dict) + ``artifacts.generated_strategy_path`` and
+    # derives ``param_sets`` / ``folds`` / ``strategy_path`` below. These
+    # MUST be declared on ValidationState or the nested-subgraph boundary
+    # drops them (a subgraph only receives parent keys it has channels
+    # for — verified Stage 7g).
+    params: dict[str, Any]
+    artifacts: dict[str, Any]
+
+    # ─── Plan inputs — derived by prepare_validation_inputs, or
+    #     supplied directly by a caller/test before invoke ───────────
     param_sets: list[dict[str, Any]]
     folds: list[dict[str, Any]]
 
@@ -228,6 +240,63 @@ def _days_in_month(year: int, month: int) -> int:
 # ════════════════════════════════════════════════════════════════════════
 # Backtest fan-out (BRD §6.3)
 # ════════════════════════════════════════════════════════════════════════
+
+
+def _default_walk_forward_start(today: date | None = None) -> date:
+    """Anchored 6-fold walk-forward start date (Stage 7h v1 heuristic).
+
+    The anchored 6-fold (4mo train / 1mo test) window spans ~10 months.
+    We anchor it to start ~365 days before today so the whole window
+    sits inside the 730-day OHLCV cache (BRD §3) and the last OOS fold
+    ends ~2 months before today — clear of the freshest, possibly
+    incomplete candles. Stage 8+ could read the actual cached feather's
+    date range instead of this date heuristic; for v1 a fixed lookback
+    inside the known cache window is sufficient and deterministic enough
+    (folds shift by at most a day between runs, which is harmless for
+    historical backtests).
+    """
+    base = today or date.today()
+    return date.fromordinal(base.toordinal() - 365)
+
+
+def prepare_validation_inputs(state: ValidationState) -> dict[str, Any]:
+    """Bridge research output → validation input contract (Stage 7h).
+
+    Research (BRD §5.3) emits a SINGLE filled ``params`` dict + a
+    ``strategy_path`` (and ``artifacts.generated_strategy_path``).
+    Validation (BRD §5.4) backtests ``param_set × fold`` over an anchored
+    6-fold walk-forward. This entry node bridges the two:
+
+    - ``param_sets``: wrap the single ``params`` into a one-element list
+      with an ``id`` (v1 has no hyperopt sweep — one strategy, one param
+      set, BRD §8 defers hyperopt). The worker reads ``ps["id"]``.
+    - ``folds``: compute via :func:`plan_walk_forward` over the default
+      walk-forward window (folds are intrinsically a validation/data
+      concern — research has no knowledge of the OHLCV range).
+    - ``strategy_path``: fall back to ``artifacts.generated_strategy_path``
+      if the ``strategy_path`` channel isn't already set (resilience to
+      the parent-graph field-name handoff).
+
+    Each derivation is GUARDED on absence, so a caller/test that seeds
+    ``param_sets`` / ``folds`` directly (the standalone
+    test_validation_subgraph fixtures) is unaffected.
+    """
+    updates: dict[str, Any] = {}
+
+    if not state.get("strategy_path"):
+        gen_path = (state.get("artifacts") or {}).get("generated_strategy_path")
+        if gen_path:
+            updates["strategy_path"] = gen_path
+
+    if not state.get("param_sets"):
+        params = state.get("params") or {}
+        ps_id = state.get("strategy_id") or "research_proposal"
+        updates["param_sets"] = [{"id": ps_id, **params}]
+
+    if not state.get("folds"):
+        updates["folds"] = plan_walk_forward(data_start=_default_walk_forward_start())
+
+    return updates
 
 
 def plan_backtests(state: ValidationState) -> list[Send]:
@@ -1015,6 +1084,7 @@ def build_validation_subgraph(
     builder: StateGraph[ValidationState, ValidationState, ValidationState, ValidationState] = (
         StateGraph(ValidationState)
     )
+    builder.add_node("prepare_validation_inputs", prepare_validation_inputs)
     builder.add_node("plan_backtests", _planner_passthrough)
     # See 4b comment: closure-async + LangGraph generic produces a false
     # positive on add_node arg-type strict check.
@@ -1036,7 +1106,8 @@ def build_validation_subgraph(
     builder.add_node("paper_gate", paper_gate)
     builder.add_node("archive", archive)
 
-    builder.add_edge(START, "plan_backtests")
+    builder.add_edge(START, "prepare_validation_inputs")
+    builder.add_edge("prepare_validation_inputs", "plan_backtests")
     builder.add_conditional_edges("plan_backtests", plan_backtests, ["backtest_worker"])
     builder.add_edge("backtest_worker", "aggregate_results")
     builder.add_edge("aggregate_results", "gate_backtest")

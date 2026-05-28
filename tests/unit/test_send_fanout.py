@@ -38,6 +38,7 @@ from orchestrator.subgraphs.validation import (
     ValidationState,
     build_validation_subgraph,
     plan_backtests,
+    prepare_validation_inputs,
 )
 
 
@@ -143,26 +144,70 @@ async def test_reducer_concatenates_five_parallel_worker_writes() -> None:
     assert seen == {f"ps_{i}" for i in range(5)}
 
 
-@pytest.mark.asyncio
-async def test_subgraph_with_zero_param_sets_terminates_with_empty_results() -> None:
-    """Edge case: empty fan-out should not hang the graph.
+def test_plan_backtests_empty_inputs_yields_no_sends() -> None:
+    """Empty-fan-out safety at the router level (BRD §6.3).
 
-    LangGraph 1.x routes the conditional edge to its declared destinations
-    regardless of the Send list contents — if plan_backtests returns [],
-    no worker is launched and the graph should terminate cleanly.
+    plan_backtests with empty param_sets (or empty folds) returns [] —
+    LangGraph routes the conditional edge regardless of Send-list
+    contents, so an empty list cleanly launches no worker. (As of Stage
+    7h the validation SUBGRAPH can't reach plan_backtests with empty
+    inputs — prepare_validation_inputs derives them — so this empty-fan-
+    out property is asserted at the router level where it stays
+    reachable.)
     """
+    assert plan_backtests({"param_sets": [], "folds": _single_fold()}) == []
+    assert plan_backtests({"param_sets": _make_param_sets(3), "folds": []}) == []
+    assert plan_backtests({}) == []
 
-    async def fake_worker(payload: dict[str, Any]) -> BacktestResult:
-        raise AssertionError("worker must not be called when fan-out is empty")
 
-    graph = build_validation_subgraph(fake_worker, checkpointer=InMemorySaver())
+def test_prepare_validation_inputs_derives_param_sets_and_folds() -> None:
+    """Stage 7h adapter: research's single `params` → param_sets + folds.
 
-    config: RunnableConfig = {"configurable": {"thread_id": f"test_{uuid.uuid4().hex[:8]}"}}
-    final = await graph.ainvoke(
-        {"param_sets": [], "folds": _single_fold()},
-        config=config,
+    Mirrors what the parent graph hands in from a research run: a single
+    `params` dict + strategy_path, no param_sets/folds. The adapter wraps
+    params into a one-element param_sets (id from strategy_id) and
+    computes the anchored 6-fold walk-forward.
+    """
+    updates = prepare_validation_inputs(
+        {
+            "strategy_id": "strat-123",
+            "params": {"rsi_buy_threshold": 30, "ema_fast": 12},
+            "strategy_path": "/tmp/strat.py",
+        }
     )
-    # backtest_results may be absent or [] depending on reducer init; both
-    # are acceptable. The test really asserts "graph terminated, worker
-    # never ran, no exception".
-    assert final.get("backtest_results", []) == []
+    # One derived param set, id = strategy_id, params spread in.
+    assert updates["param_sets"] == [
+        {"id": "strat-123", "rsi_buy_threshold": 30, "ema_fast": 12}
+    ]
+    # Anchored 6-fold walk-forward (BRD §5.4).
+    assert len(updates["folds"]) == 6
+    assert all({"fold_id", "timerange"} <= set(f) for f in updates["folds"])
+    # strategy_path already set → not overridden.
+    assert "strategy_path" not in updates
+
+
+def test_prepare_validation_inputs_respects_seeded_values() -> None:
+    """A caller that seeds param_sets/folds (standalone validation tests)
+    is unaffected — the adapter only derives when absent."""
+    seeded = {
+        "param_sets": _make_param_sets(2),
+        "folds": _single_fold(),
+        "strategy_path": "/tmp/x.py",
+    }
+    updates = prepare_validation_inputs(seeded)
+    assert "param_sets" not in updates
+    assert "folds" not in updates
+    assert "strategy_path" not in updates
+
+
+def test_prepare_validation_inputs_falls_back_to_generated_strategy_path() -> None:
+    """strategy_path derives from artifacts.generated_strategy_path when
+    the channel isn't directly set (parent-graph handoff resilience)."""
+    updates = prepare_validation_inputs(
+        {
+            "strategy_id": "s1",
+            "params": {},
+            "artifacts": {"generated_strategy_path": "/tmp/gen.py"},
+        }
+    )
+    assert updates["strategy_path"] == "/tmp/gen.py"
