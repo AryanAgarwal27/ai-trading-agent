@@ -701,12 +701,18 @@ async def spawn_live_container(
     stake_amount: float,
     strategy_module_path: Path,
     port: int,
+    *,
+    provider: SecretProvider | None = None,
 ) -> str:
     """Boot one LIVE-trading Freqtrade container; return its API URL.
 
     Mirrors :func:`spawn_paper_container`'s contract — idempotent boot, waits
     for ``/api/v1/ping`` 200, returns ``http://127.0.0.1:<port>`` — but for the
     live path: distinct userdir, live keys, dry_run:false config.
+
+    ``provider`` (Stage 8c seam) is threaded to ``prepare_live_worker`` →
+    ``render_live_config`` → ``load_live_credentials`` so the live_spawn node
+    can inject a non-env secrets backend; defaults to the env provider.
 
     The compose service ``freqtrade-live`` is profile-gated (``profiles:
     ["live"]``) so paper's bare ``docker compose up -d`` never starts it; here
@@ -720,7 +726,8 @@ async def spawn_live_container(
     """
     # 1. Render + write the resolved live config (fail-fast on cred problems).
     config_path = prepare_live_worker(
-        strategy_id, pair_whitelist, stake_amount, strategy_module_path, port
+        strategy_id, pair_whitelist, stake_amount, strategy_module_path, port,
+        provider=provider,
     )
 
     # 2. compose up — target the profiled live service explicitly so only it
