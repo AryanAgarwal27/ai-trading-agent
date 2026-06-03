@@ -269,3 +269,32 @@ async def record_kill_switch_event(
         return int(row[0])
     finally:
         await conn.close()
+
+
+async def record_telemetry(
+    conn: psycopg.AsyncConnection,
+    *,
+    strategy_id: str | None = None,
+    stage: str | None = None,
+    metrics: dict[str, Any],
+    source: str,
+) -> None:
+    """Insert a ``telemetry`` row (BRD §5.8) on a CALLER-OWNED connection.
+
+    Unlike :func:`record_gate_audit` / :func:`record_kill_switch_event` — each
+    of which opens its OWN connection and commits — this takes the caller's
+    ``conn`` and does **NOT** commit, the same convention as
+    :func:`orchestrator.tools.regime.insert_regime_log`. That lets a caller
+    batch a telemetry write into a larger transaction: the Stage 9 supervisor
+    runner commits its registry reconciliation + spawn/retire writes + this
+    decision row together, atomically.
+
+    ``strategy_id`` is nullable — the FK exempts NULLs, and a supervisor
+    decision is portfolio-level (no single strategy), so it passes ``None``.
+    ``metrics`` is the JSONB payload column (NOT NULL); ``source`` tags the
+    producer (e.g. ``"supervisor_decision"``). ``stage`` is optional context.
+    """
+    sql = "INSERT INTO telemetry (strategy_id, stage, metrics, source) VALUES (%s, %s, %s, %s)"
+    params = (strategy_id, stage, json.dumps(metrics, default=str), source)
+    async with conn.cursor() as cur:
+        await cur.execute(sql, params)

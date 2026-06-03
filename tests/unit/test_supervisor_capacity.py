@@ -20,7 +20,6 @@ from unittest.mock import AsyncMock
 
 from orchestrator.gates.thresholds import MAX_CONCURRENT_STRATEGIES
 from orchestrator.supervisor import (
-    WRITE_TOOLS,
     aretire_strategy,
     aspawn_strategy,
 )
@@ -272,7 +271,8 @@ async def test_retire_does_not_commit() -> None:
     conn.commit.assert_not_called()
 
 
-def test_write_tools_surface() -> None:
-    """WRITE_TOOLS exposes exactly the two 9b write tools by name."""
-    names = {t.name for t in WRITE_TOOLS}
-    assert names == {"spawn_strategy", "retire_strategy"}
+# NOTE: the 9b write @tool shells (spawn_strategy / retire_strategy) + their
+# WRITE_TOOLS export were removed in 9c (Arch 2 — the runner calls the plain
+# aspawn_strategy / aretire_strategy impls from the structured decision, so the
+# agent-facing shells had no caller). The plain impls — exercised by every test
+# above — remain. The old test_write_tools_surface was removed with the shells.

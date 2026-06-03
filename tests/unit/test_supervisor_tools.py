@@ -27,14 +27,18 @@ from langgraph.store.memory import InMemoryStore
 from orchestrator import supervisor
 from orchestrator.supervisor import (
     READ_TOOLS,
+    SUPERVISOR_TOOLS,
     _current_portfolio,
     _current_regime,
     _current_store,
+    _current_strategies,
     _get_market_regime_impl,
+    _list_strategies_impl,
     _query_store_impl,
     _view_portfolio_impl,
     aget_current_regime,
     aget_portfolio_snapshot,
+    alist_strategies,
 )
 
 
@@ -190,6 +194,63 @@ async def test_query_store_wins_empty_for_unseen_regime() -> None:
 
 
 def test_read_tools_surface() -> None:
-    """READ_TOOLS exposes exactly the three 9a read tools by name."""
+    """READ_TOOLS exposes exactly the three 9a read tools by name (frozen surface)."""
     names = {t.name for t in READ_TOOLS}
     assert names == {"view_portfolio", "query_store", "get_market_regime"}
+
+
+# ─── alist_strategies (DB read) + list_strategies tool (9c) ────────────
+
+
+async def test_alist_strategies_maps_rows() -> None:
+    """Maps registry rows → per-thread dicts; last_updated → ISO string."""
+    from datetime import UTC, datetime
+
+    ts = datetime(2026, 6, 1, 12, 0, tzinfo=UTC)
+    conn = _conn_with(
+        fetchall=[
+            ("s1", "paper", "strat-1", 12.34, ts),
+            ("s2", "research", "strat-2", 0.5, ts),
+        ]
+    )
+
+    out = await alist_strategies(conn)
+
+    assert out == [
+        {
+            "strategy_id": "s1",
+            "stage": "paper",
+            "name": "strat-1",
+            "age_days": 12.3,  # rounded to 1 dp
+            "last_transition_at": ts.isoformat(),
+        },
+        {
+            "strategy_id": "s2",
+            "stage": "research",
+            "name": "strat-2",
+            "age_days": 0.5,
+            "last_transition_at": ts.isoformat(),
+        },
+    ]
+
+
+async def test_alist_strategies_empty() -> None:
+    conn = _conn_with(fetchall=[])
+    assert await alist_strategies(conn) == []
+
+
+def test_list_strategies_impl_reads_contextvar() -> None:
+    rows = [{"strategy_id": "s1", "stage": "live", "name": "x", "age_days": 3.0}]
+    _current_strategies.set(rows)
+    assert _list_strategies_impl() == rows
+
+
+def test_list_strategies_impl_unset_returns_empty() -> None:
+    _current_strategies.set(None)
+    assert _list_strategies_impl() == []
+
+
+def test_supervisor_tools_surface() -> None:
+    """SUPERVISOR_TOOLS = the 3 read tools + list_strategies (Arch 2: no write tools)."""
+    names = {t.name for t in SUPERVISOR_TOOLS}
+    assert names == {"view_portfolio", "query_store", "get_market_regime", "list_strategies"}
