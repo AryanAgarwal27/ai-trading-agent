@@ -243,20 +243,133 @@ def _days_in_month(year: int, month: int) -> int:
 
 
 def _default_walk_forward_start(today: date | None = None) -> date:
-    """Anchored 6-fold walk-forward start date (Stage 7h v1 heuristic).
+    """Anchored 6-fold walk-forward start date (heuristic FALLBACK only).
 
     The anchored 6-fold (4mo train / 1mo test) window spans ~10 months.
-    We anchor it to start ~365 days before today so the whole window
+    This anchors it to start ~365 days before today so the whole window
     sits inside the 730-day OHLCV cache (BRD §3) and the last OOS fold
     ends ~2 months before today — clear of the freshest, possibly
-    incomplete candles. Stage 8+ could read the actual cached feather's
-    date range instead of this date heuristic; for v1 a fixed lookback
-    inside the known cache window is sufficient and deterministic enough
-    (folds shift by at most a day between runs, which is harmless for
-    historical backtests).
+    incomplete candles.
+
+    As of Stage 8i this is the FALLBACK, not the default: when an anchor
+    feather is resolvable, :func:`walk_forward_from_cache` reads the cache's
+    real date range so the window provably sits inside the data on disk.
+    This heuristic is used only when no feather can be resolved (e.g. an
+    offline unit test with no pairs/timeframe, or before any download). The
+    failure mode it leaves open — ``today`` drifting ahead of a stale cache,
+    pushing OOS folds past the freshest candle into zero-trade territory —
+    is exactly what the cache reader removes; keeping it as a fallback only
+    avoids crashing a data-less caller.
     """
     base = today or date.today()
     return date.fromordinal(base.toordinal() - 365)
+
+
+def read_feather_date_range(feather_path: Path) -> tuple[date, date]:
+    """Return ``(min_date, max_date)`` of a Freqtrade feather's ``date`` column.
+
+    Freqtrade OHLCV feathers carry a ``date`` column typed
+    ``timestamp[ms, tz=UTC]``. We compute min/max via ``pyarrow.compute``
+    (rather than trusting ascending sort order) and return calendar dates.
+
+    Raises ``FileNotFoundError`` if the file is absent and ``ValueError`` if
+    it has no ``date`` column or is empty — callers degrade or surface these
+    explicitly rather than fabricate a range.
+    """
+    if not feather_path.exists():
+        raise FileNotFoundError(f"feather not found: {feather_path}")
+
+    # Local imports: keep pyarrow off the module-level surface for callers
+    # (e.g. pure walk-forward arithmetic) that don't touch the cache.
+    import pyarrow.compute as pc
+    import pyarrow.feather as feather
+
+    table = feather.read_table(feather_path)  # type: ignore[no-untyped-call]
+    if "date" not in table.column_names:
+        raise ValueError(f"feather has no 'date' column: {feather_path}")
+    if table.num_rows == 0:
+        raise ValueError(f"feather is empty: {feather_path}")
+
+    # pyarrow.compute functions are generated at import time, so the stubs
+    # don't expose min_max — same partial-stub situation as read_table above.
+    bounds = pc.min_max(table.column("date")).as_py()  # type: ignore[attr-defined]
+    return bounds["min"].date(), bounds["max"].date()
+
+
+def _anchor_walk_forward(
+    min_date: date,
+    max_date: date,
+    *,
+    train_months: int,
+    test_months: int,
+    n_folds: int,
+) -> tuple[date, int]:
+    """Largest ``n ≤ n_folds`` whose anchored window fits in ``[min, max]``.
+
+    The anchored window for ``n`` folds spans
+    ``train_months + (n - 1) + test_months`` months (the test window slides
+    by 1 month per fold per BRD §5.4, independent of ``test_months``). We
+    anchor the LAST OOS fold's ``test_end`` to ``max_date`` and walk back, so
+    ``data_start = max_date - span_months``. Returns ``(data_start, n)`` for
+    the largest feasible ``n``. Raises ``ValueError`` if even one fold can't
+    fit inside the cache.
+    """
+    for n in range(n_folds, 0, -1):
+        span_months = train_months + (n - 1) + test_months
+        data_start = _add_months(max_date, -span_months)
+        if data_start >= min_date:
+            return data_start, n
+    raise ValueError(
+        f"cache span {min_date.isoformat()}..{max_date.isoformat()} is too "
+        f"short for even one {train_months}mo-train/{test_months}mo-test fold"
+    )
+
+
+def walk_forward_from_cache(
+    feather_path: Path,
+    *,
+    train_months: int = 4,
+    test_months: int = 1,
+    n_folds: int = 6,
+    anchored: bool = True,
+) -> list[dict[str, Any]]:
+    """Anchored walk-forward folds bounded by a cached feather's real range.
+
+    Reads ``feather_path``'s actual ``date`` span and anchors the window so
+    every fold's timerange sits inside the data on disk (BRD §5.4). When the
+    cache is shorter than the requested window it degrades to fewer folds;
+    when it can't fit even one fold it raises ``ValueError`` — it never emits
+    a timerange that runs past the cached candles (the zero-trade-fold
+    hazard the Stage 7h heuristic left open).
+    """
+    min_date, max_date = read_feather_date_range(feather_path)
+    data_start, n_eff = _anchor_walk_forward(
+        min_date,
+        max_date,
+        train_months=train_months,
+        test_months=test_months,
+        n_folds=n_folds,
+    )
+    return plan_walk_forward(
+        data_start=data_start,
+        train_months=train_months,
+        test_months=test_months,
+        n_folds=n_eff,
+        anchored=anchored,
+    )
+
+
+def _anchor_feather_path(pairs: list[str] | None, timeframe: str | None) -> Path | None:
+    """Resolve the anchor pair's cached feather, or None if unresolvable.
+
+    Uses the strategy's first pair at its timeframe under the Binance data
+    dir (SPEC §1 Q1/Q2). Returns None when pairs/timeframe are missing or the
+    feather isn't on disk — the caller then falls back to the heuristic.
+    """
+    if not pairs or not timeframe:
+        return None
+    path = SHARED_DATA_DIR / "binance" / f"{pairs[0].replace('/', '_')}-{timeframe}.feather"
+    return path if path.exists() else None
 
 
 def prepare_validation_inputs(state: ValidationState) -> dict[str, Any]:
@@ -302,7 +415,15 @@ def prepare_validation_inputs(state: ValidationState) -> dict[str, Any]:
         updates["param_sets"] = [{"id": ps_id, **params}]
 
     if "folds" not in state:
-        updates["folds"] = plan_walk_forward(data_start=_default_walk_forward_start())
+        feather_path = _anchor_feather_path(state.get("pairs"), state.get("timeframe"))
+        if feather_path is not None:
+            # Real cache range (Stage 8i) — window provably inside the data.
+            updates["folds"] = walk_forward_from_cache(feather_path)
+        else:
+            # No resolvable feather (offline test / pre-download): fall back
+            # to the today-365 heuristic so a data-less caller still gets a
+            # plan rather than crashing.
+            updates["folds"] = plan_walk_forward(data_start=_default_walk_forward_start())
 
     return updates
 

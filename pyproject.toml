@@ -45,6 +45,10 @@ dependencies = [
     "sqlalchemy==2.0.*",
     "redis==5.0.*",
     "python-dotenv==1.0.*",
+    # Stage 8i: validation.py hard-imports pyarrow.compute / pyarrow.feather
+    # to read cached feather date ranges (walk_forward_from_cache). Previously
+    # transitive via Freqtrade; pinned explicitly to remove the hidden dep.
+    "pyarrow==24.*",
 ]
 
 [dependency-groups]
