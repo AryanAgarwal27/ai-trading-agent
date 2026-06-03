@@ -130,9 +130,7 @@ async def test_paper_gate_approve_flow_advances_to_paper(
 
         # Resume via the 6b helper (intentionally bypasses the 6d
         # endpoint — see file docstring).
-        await autoresume_for_test(
-            graph, thread_id, {"approved": True, "notes": "looks good"}
-        )
+        await autoresume_for_test(graph, thread_id, {"approved": True, "notes": "looks good"})
 
         post = await graph.aget_state(config)
         assert post.values.get("stage") == "paper"
@@ -162,9 +160,7 @@ async def test_paper_gate_reject_flow_archives_with_notes(
         async for _ in graph.astream(_seeded_state(strategy_id), config=config):
             pass
 
-        await autoresume_for_test(
-            graph, thread_id, {"approved": False, "notes": "regime concerns"}
-        )
+        await autoresume_for_test(graph, thread_id, {"approved": False, "notes": "regime concerns"})
 
         post = await graph.aget_state(config)
         assert post.values.get("stage") == "archived"
@@ -211,9 +207,10 @@ async def test_paper_gate_publishes_before_interrupt(
         async for _ in graph.astream(_seeded_state(strategy_id), config=config):
             pass
 
-    assert call_order[:2] == ["publish", "interrupt"], (
-        f"publish must precede interrupt; got order={call_order!r}"
-    )
+    assert call_order[:2] == [
+        "publish",
+        "interrupt",
+    ], f"publish must precede interrupt; got order={call_order!r}"
 
 
 # ─── 4. Idempotency: publish replays on resume ─────────────────────────
@@ -244,9 +241,7 @@ async def test_paper_gate_replays_publish_on_resume_idempotent(
         # Resume → node replays from its start → call #2 → node
         # completes past interrupt() (which now returns the resume
         # value) → graph advances to END.
-        await autoresume_for_test(
-            graph, thread_id, {"approved": True, "notes": "replay-check"}
-        )
+        await autoresume_for_test(graph, thread_id, {"approved": True, "notes": "replay-check"})
         assert publish_mock.await_count == 2, (
             "expected publish_gate_pending to fire on the resume replay; "
             f"got await_count={publish_mock.await_count}"

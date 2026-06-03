@@ -388,9 +388,7 @@ def render_live_pause_review_card(thread: dict[str, Any]) -> None:
     # Reviewer votes — three sub-chips per SPEC §4.1.
     st.markdown("#### Reviewer votes")
     rv_cols = st.columns(3)
-    for col, key in zip(
-        rv_cols, ("risk_check", "performance_check", "regime_check"), strict=True
-    ):
+    for col, key in zip(rv_cols, ("risk_check", "performance_check", "regime_check"), strict=True):
         vote = reviewer_votes.get(key) or {}
         verdict = vote.get("verdict", "—")
         conf = vote.get("confidence")

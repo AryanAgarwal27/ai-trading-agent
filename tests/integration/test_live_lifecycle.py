@@ -197,7 +197,9 @@ def _skip_if_missing_live_prereqs() -> None:
         )
     for var in ("BINANCE_LIVE_API_KEY", "BINANCE_LIVE_API_SECRET", "BINANCE_LIVE_API_PASSWORD"):
         if not os.environ.get(var):
-            pytest.skip(f"{var} not set; live spawn-test requires real live creds (see .env.example)")
+            pytest.skip(
+                f"{var} not set; live spawn-test requires real live creds (see .env.example)"
+            )
     if shutil.which("docker") is None:
         pytest.skip("docker not on PATH; spawn-test requires Docker")
     inspect = subprocess.run(
@@ -249,9 +251,9 @@ async def test_spawn_and_stop_live_against_real_container() -> None:
         assert api_url == f"http://127.0.0.1:{port}"
         assert (worker_dir / "config-live.json").exists()
         assert (worker_dir / ".live-port").read_text().strip() == str(port)
-        assert _docker_container_exists(container_name), (
-            f"container {container_name} not found after spawn returned success"
-        )
+        assert _docker_container_exists(
+            container_name
+        ), f"container {container_name} not found after spawn returned success"
     finally:
         try:
             await stop_live_container(strategy_id)
@@ -264,9 +266,9 @@ async def test_spawn_and_stop_live_against_real_container() -> None:
                 check=False,
             )
             pytest.fail(f"stop_live_container failed: {exc}")
-        assert not _docker_container_exists(container_name), (
-            f"container {container_name} still present after stop"
-        )
+        assert not _docker_container_exists(
+            container_name
+        ), f"container {container_name} still present after stop"
         if worker_dir.exists():
             shutil.rmtree(worker_dir, ignore_errors=True)
 

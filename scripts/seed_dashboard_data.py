@@ -262,9 +262,7 @@ _SHAPE_CONFIG: dict[str, dict[str, Any]] = {
 # ─── Graph + DB operations ─────────────────────────────────────────────
 
 
-async def _park_at_interrupt(
-    shape: str, strategy_id: str, thread_id: str
-) -> bool:
+async def _park_at_interrupt(shape: str, strategy_id: str, thread_id: str) -> bool:
     """Drive the shape's graph to its interrupt against a fresh saver
     context. Returns True iff the checkpoint actually parked."""
     cfg = _SHAPE_CONFIG[shape]
@@ -350,25 +348,23 @@ def _print_cleanup_commands(strategy_id: str, thread_id: str) -> None:
     print()
     print("  # App DB:")
     print(
-        f"  psql $env:DATABASE_URL -c \""
+        f'  psql $env:DATABASE_URL -c "'
         f"DELETE FROM gate_audits WHERE strategy_id = '{strategy_id}';\""
     )
     print(
-        f"  psql $env:DATABASE_URL -c \""
+        f'  psql $env:DATABASE_URL -c "'
         f"DELETE FROM strategy_registry WHERE strategy_id = '{strategy_id}';\""
     )
     print()
     print("  # LangGraph checkpoint DB (thread is identified by thread_id):")
     print(
-        f"  psql $env:LANGGRAPH_CHECKPOINT_URI -c \""
+        f'  psql $env:LANGGRAPH_CHECKPOINT_URI -c "'
         f"DELETE FROM checkpoint_writes WHERE thread_id = '{thread_id}'; "
         f"DELETE FROM checkpoint_blobs WHERE thread_id = '{thread_id}'; "
         f"DELETE FROM checkpoints WHERE thread_id = '{thread_id}';\""
     )
     print()
-    print(
-        "  # And UNSET the smoke env var in your uvicorn shell when done."
-    )
+    print("  # And UNSET the smoke env var in your uvicorn shell when done.")
 
 
 async def _main(args: argparse.Namespace) -> int:
@@ -418,13 +414,9 @@ async def _main(args: argparse.Namespace) -> int:
     print()
     print("2. In another shell, launch Streamlit:")
     print()
-    print(
-        "   .venv\\Scripts\\streamlit run dashboard/app.py "
-        "--server.address 127.0.0.1"
-    )
+    print("   .venv\\Scripts\\streamlit run dashboard/app.py " "--server.address 127.0.0.1")
     print()
-    print("3. Open http://127.0.0.1:8501 — the seeded thread appears with a "
-          "Review button.")
+    print("3. Open http://127.0.0.1:8501 — the seeded thread appears with a " "Review button.")
 
     if not args.keep_on_exit:
         _print_cleanup_commands(strategy_id, thread_id)

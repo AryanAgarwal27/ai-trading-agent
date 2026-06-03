@@ -67,9 +67,7 @@ async def cleanup_strategy_ids() -> Any:
             # delete children first (live_pause / coordinator-escalation write
             # gate_audits; the 8g kill-guard test writes kill_switch_events).
             await cur.execute("DELETE FROM gate_audits WHERE strategy_id = ANY(%s)", (ids,))
-            await cur.execute(
-                "DELETE FROM kill_switch_events WHERE strategy_id = ANY(%s)", (ids,)
-            )
+            await cur.execute("DELETE FROM kill_switch_events WHERE strategy_id = ANY(%s)", (ids,))
             await cur.execute("DELETE FROM strategy_registry WHERE strategy_id = ANY(%s)", (ids,))
         await conn.commit()
 
@@ -590,9 +588,7 @@ _KILL_EVENT = {
 }
 
 
-async def _inject_kill_event(
-    graph: Any, cfg: dict[str, Any], event: dict[str, Any]
-) -> None:
+async def _inject_kill_event(graph: Any, cfg: dict[str, Any], event: dict[str, Any]) -> None:
     """Simulate the 8g Redis subscription writing the kill event into state.
 
     Merges into the existing artifacts (channel has no reducer) so live_spawn's
@@ -734,9 +730,9 @@ async def test_kill_path_approve_clears_event_and_next_wake_evaluates(
     await _drain(graph, Command(resume={"approved": True, "notes": "ok"}), cfg)  # → live_wait
 
     snap = await graph.aget_state(cfg)
-    assert snap.values["artifacts"].get("kill_switch_event") is None, (
-        "approve on the kill path must clear kill_switch_event"
-    )
+    assert (
+        snap.values["artifacts"].get("kill_switch_event") is None
+    ), "approve on the kill path must clear kill_switch_event"
 
     await _drain(graph, Command(resume={"wake": True}), cfg)  # next wake → live_evaluate
     snap2 = await graph.aget_state(cfg)

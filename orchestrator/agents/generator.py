@@ -117,9 +117,7 @@ def load_schema(template_name: str) -> type[BaseModel]:
             f"{sorted(_SCHEMA_CLASS_NAMES.keys())}"
         )
     schema_path = TEMPLATES_DIR / f"{template_name}_schema.py"
-    spec = importlib.util.spec_from_file_location(
-        f"_generator_schema_{template_name}", schema_path
-    )
+    spec = importlib.util.spec_from_file_location(f"_generator_schema_{template_name}", schema_path)
     if spec is None or spec.loader is None:
         raise RuntimeError(f"Could not build module spec for {schema_path}")
     module = importlib.util.module_from_spec(spec)

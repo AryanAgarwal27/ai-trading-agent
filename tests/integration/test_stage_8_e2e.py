@@ -209,8 +209,8 @@ def _build_e2e_graph(saver: Any, rec: dict[str, Any]) -> Any:
     rb.add_edge("research_pass", END)
     research = rb.compile()
 
-    vb: StateGraph[ValidationState, ValidationState, ValidationState, ValidationState] = (
-        StateGraph(ValidationState)
+    vb: StateGraph[ValidationState, ValidationState, ValidationState, ValidationState] = StateGraph(
+        ValidationState
     )
     vb.add_node("paper_gate", paper_gate)
     vb.add_edge(START, "paper_gate")
@@ -429,9 +429,7 @@ async def test_stage_8_e2e_paper_to_live_to_killswitch_pause(
         assert stop_calls.get("stop") == 1, "/api/v1/stop must be called once on the breach"
 
         # The real subscription receives the real publish and writes state.
-        wrote = await _wait_until(
-            lambda: _event_in_state(graph, config), timeout_s=5.0
-        )
+        wrote = await _wait_until(lambda: _event_in_state(graph, config), timeout_s=5.0)
         elapsed = time.monotonic() - t0
         assert wrote, "kill event did not propagate to thread state via the subscription"
     finally:
@@ -466,9 +464,9 @@ async def test_stage_8_e2e_paper_to_live_to_killswitch_pause(
     # below lock that in: if a future LangGraph release changes how aupdate_state
     # affects nested-subgraph interrupt visibility, this fails loudly.
     pre_wake = await graph.aget_state(config)
-    assert (pre_wake.values.get("artifacts") or {}).get("kill_switch_event") is not None, (
-        "kill event must be present in parent state after the subscription write"
-    )
+    assert (pre_wake.values.get("artifacts") or {}).get(
+        "kill_switch_event"
+    ) is not None, "kill event must be present in parent state after the subscription write"
     assert sum(len(getattr(t, "interrupts", ())) for t in pre_wake.tasks) == 0, (
         "parent-level aupdate_state on a nested-interrupt thread clears the "
         "parent-visible interrupt surface (8h finding — see DEFERRED.md D-6)"

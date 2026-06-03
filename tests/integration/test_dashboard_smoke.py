@@ -47,7 +47,9 @@ class _FakeResponse:
             import httpx
 
             raise httpx.HTTPStatusError(
-                f"{self.status_code}", request=None, response=None  # type: ignore[arg-type]
+                f"{self.status_code}",
+                request=None,
+                response=None,  # type: ignore[arg-type]
             )
 
 
@@ -109,9 +111,9 @@ def test_dashboard_threads_list_renders_empty_state() -> None:
 
     assert not at.exception, f"app raised: {at.exception}"
     info_texts = [el.value for el in at.info]
-    assert any("No strategies in the registry yet" in t for t in info_texts), (
-        f"empty-state info message missing; saw info elements: {info_texts!r}"
-    )
+    assert any(
+        "No strategies in the registry yet" in t for t in info_texts
+    ), f"empty-state info message missing; saw info elements: {info_texts!r}"
 
 
 # ─── 3. AppTest — paper_gate card layout ────────────────────────────────
@@ -169,15 +171,15 @@ def test_dashboard_paper_gate_card_renders_spec_4_1_layout() -> None:
         # ── SPEC §4.1 elements:
         # 1. Rationale heading.
         markdowns = [el.value for el in at.markdown]
-        assert any(m.startswith("### Rationale") for m in markdowns), (
-            f"missing '### Rationale' header; saw markdown: {markdowns!r}"
-        )
+        assert any(
+            m.startswith("### Rationale") for m in markdowns
+        ), f"missing '### Rationale' header; saw markdown: {markdowns!r}"
         # 2. The rationale text is rendered somewhere on the page.
         rationale_text = "fee-stress 3x degradation 52%"
         page_text = "\n".join(markdowns)
-        assert rationale_text in page_text, (
-            f"rationale text not found in markdown blocks: {markdowns!r}"
-        )
+        assert (
+            rationale_text in page_text
+        ), f"rationale text not found in markdown blocks: {markdowns!r}"
         # 3. Chip row — verdict + confidence both surfaced.
         assert any(
             "verdict `approve`" in m and "confidence `0.78`" in m for m in markdowns
@@ -190,12 +192,12 @@ def test_dashboard_paper_gate_card_renders_spec_4_1_layout() -> None:
 
     # ── Approve + Reject buttons present.
     button_labels = [b.label for b in at.button]
-    assert any("Approve" in lbl for lbl in button_labels), (
-        f"Approve button missing; buttons: {button_labels!r}"
-    )
-    assert any("Reject" in lbl for lbl in button_labels), (
-        f"Reject button missing; buttons: {button_labels!r}"
-    )
+    assert any(
+        "Approve" in lbl for lbl in button_labels
+    ), f"Approve button missing; buttons: {button_labels!r}"
+    assert any(
+        "Reject" in lbl for lbl in button_labels
+    ), f"Reject button missing; buttons: {button_labels!r}"
 
 
 # ─── 4. AppTest — live_gate card (Stage 6g scaffold) ───────────────────
@@ -255,13 +257,13 @@ def test_live_gate_card_renders() -> None:
         markdowns = [el.value for el in at.markdown]
 
         # Rationale heading + content present.
-        assert any(m.startswith("### Rationale") for m in markdowns), (
-            f"missing '### Rationale' header; markdown: {markdowns!r}"
-        )
+        assert any(
+            m.startswith("### Rationale") for m in markdowns
+        ), f"missing '### Rationale' header; markdown: {markdowns!r}"
         page_text = "\n".join(markdowns)
-        assert "KS p-value 0.21" in page_text, (
-            f"paper_monitor rationale text missing; markdown: {markdowns!r}"
-        )
+        assert (
+            "KS p-value 0.21" in page_text
+        ), f"paper_monitor rationale text missing; markdown: {markdowns!r}"
         # Chip row identifies the source as paper_monitor (NOT
         # risk_analyst) — that's the live_gate-vs-paper_gate distinction.
         assert any(
@@ -347,9 +349,9 @@ def test_live_pause_review_coordinator_path_renders() -> None:
         ), f"coordinator chip missing; markdown: {markdowns!r}"
 
         # Reviewer-vote sub-heading + each reviewer's chip.
-        assert any("#### Reviewer votes" in m for m in markdowns), (
-            f"reviewer votes subheading missing; markdown: {markdowns!r}"
-        )
+        assert any(
+            "#### Reviewer votes" in m for m in markdowns
+        ), f"reviewer votes subheading missing; markdown: {markdowns!r}"
         assert any("risk_check" in m and "continue" in m for m in markdowns)
         assert any("performance_check" in m and "pause" in m for m in markdowns)
         assert any("regime_check" in m and "continue" in m for m in markdowns)
@@ -427,15 +429,15 @@ def test_live_pause_review_kill_switch_path_renders() -> None:
         # ── Event fields surface in the bordered details container.
         markdowns = [el.value for el in at.markdown]
         page_text = "\n".join(markdowns)
-        assert "drawdown_12pct_exceeded" in page_text, (
-            f"kill_switch_event.reason missing from rendered markdown: {markdowns!r}"
-        )
-        assert "POST /api/v1/stop" in page_text, (
-            f"kill_switch_event.action_taken missing: {markdowns!r}"
-        )
-        assert "2026-05-27T14:32:11Z" in page_text, (
-            f"kill_switch_event.fired_at missing: {markdowns!r}"
-        )
+        assert (
+            "drawdown_12pct_exceeded" in page_text
+        ), f"kill_switch_event.reason missing from rendered markdown: {markdowns!r}"
+        assert (
+            "POST /api/v1/stop" in page_text
+        ), f"kill_switch_event.action_taken missing: {markdowns!r}"
+        assert (
+            "2026-05-27T14:32:11Z" in page_text
+        ), f"kill_switch_event.fired_at missing: {markdowns!r}"
 
         # ── No coordinator chip / reviewer-votes block (path
         # discriminator correctly routed past the coordinator branch).

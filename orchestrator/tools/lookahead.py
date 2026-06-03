@@ -177,10 +177,7 @@ async def run_lookahead_analysis(
     if any(marker in stdout_lower for marker in leakage_markers):
         return LookaheadResult(
             passed=False,
-            details=(
-                "lookahead-analysis flagged a problem. stdout tail: "
-                f"{stdout_tail}"
-            ),
+            details=("lookahead-analysis flagged a problem. stdout tail: " f"{stdout_tail}"),
             returncode=0,
             worker_dir=str(worker_dir),
             stderr_tail=stderr_tail,
@@ -300,9 +297,7 @@ def _extract_strategy_class_name(strategy_path: Path) -> str:
                     return node.name
                 if isinstance(base, ast.Attribute) and base.attr == "IStrategy":
                     return node.name
-    raise ValueError(
-        f"Could not find an IStrategy subclass in {strategy_path}"
-    )
+    raise ValueError(f"Could not find an IStrategy subclass in {strategy_path}")
 
 
 def cleanup_worker(worker_dir_str: str) -> None:
@@ -341,5 +336,5 @@ async def _default_lookahead_runner(
 
 # Type alias for the gate's injection seam.
 LookaheadRunner = Any  # Callable[..., Awaitable[LookaheadResult]] — kept loose
-                       # to avoid the same closure-async generic noise as the
-                       # validation subgraph's BacktestWorkerFn.
+# to avoid the same closure-async generic noise as the
+# validation subgraph's BacktestWorkerFn.

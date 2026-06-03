@@ -184,8 +184,8 @@ def _build_stub_composed_graph(
     rb.add_edge("research_pass", END)
     research = rb.compile()
 
-    vb: StateGraph[ValidationState, ValidationState, ValidationState, ValidationState] = (
-        StateGraph(ValidationState)
+    vb: StateGraph[ValidationState, ValidationState, ValidationState, ValidationState] = StateGraph(
+        ValidationState
     )
     vb.add_node("paper_gate", paper_gate)
     vb.add_edge(START, "paper_gate")
@@ -244,12 +244,8 @@ async def cleanup_strategy_ids() -> Any:
             # Children first (FK to strategy_registry): live_pause / coordinator
             # may write gate_audits; the 8g live path may write kill_switch_events.
             await cur.execute("DELETE FROM gate_audits WHERE strategy_id = ANY(%s)", (ids,))
-            await cur.execute(
-                "DELETE FROM kill_switch_events WHERE strategy_id = ANY(%s)", (ids,)
-            )
-            await cur.execute(
-                "DELETE FROM strategy_registry WHERE strategy_id = ANY(%s)", (ids,)
-            )
+            await cur.execute("DELETE FROM kill_switch_events WHERE strategy_id = ANY(%s)", (ids,))
+            await cur.execute("DELETE FROM strategy_registry WHERE strategy_id = ANY(%s)", (ids,))
         await conn.commit()
 
 
@@ -281,9 +277,9 @@ async def test_full_pipeline_research_to_live(
     # research (passthrough) → validation → paper_gate interrupt.
     async for _ in graph.astream(_initial_state(strategy_id), config=config):
         pass
-    assert await _parked_kind(graph, config) == "paper_gate", (
-        "parent graph should park at the nested validation paper_gate"
-    )
+    assert (
+        await _parked_kind(graph, config) == "paper_gate"
+    ), "parent graph should park at the nested validation paper_gate"
 
     # Approve paper_gate → validation completes (stage=paper) → parent
     # routes to paper_subgraph → paper_spawn → schedule_wake → paper_wait.
@@ -339,16 +335,16 @@ async def test_live_interrupts_propagate_to_parent(
     await hitl_autoapprove(graph, thread_id)  # live_gate → live_subgraph
 
     # 1. live_wait interrupt surfaces through the parent composition.
-    assert await _parked_kind(graph, config) == "live_wait", (
-        "live_wait interrupt did not surface to the parent"
-    )
+    assert (
+        await _parked_kind(graph, config) == "live_wait"
+    ), "live_wait interrupt did not surface to the parent"
 
     # 2. Wake → live_evaluate → coordinator(pause) → live_pause interrupt
     # surfaces through the parent composition.
     await autoresume_for_test(graph, thread_id, {"wake": True})
-    assert await _parked_kind(graph, config) == "live_pause_review", (
-        "live_pause interrupt did not surface to the parent"
-    )
+    assert (
+        await _parked_kind(graph, config) == "live_pause_review"
+    ), "live_pause interrupt did not surface to the parent"
 
 
 # ───────────────────────── test 2: /threads visibility (6f loop) ─────────
@@ -402,7 +398,7 @@ async def test_paper_gate_visible_via_threads_endpoint(
         rows = {r["thread_id"]: r for r in resp.json()}
         assert thread_id in rows
         row = rows[thread_id]
-        assert row["has_pending_interrupt"] is True, (
-            "6f regression: parent graph's nested paper_gate not visible to /threads"
-        )
+        assert (
+            row["has_pending_interrupt"] is True
+        ), "6f regression: parent graph's nested paper_gate not visible to /threads"
         assert row["pending_interrupt_payload"]["kind"] == "paper_gate"

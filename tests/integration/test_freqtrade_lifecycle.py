@@ -103,7 +103,7 @@ def _skip_if_missing_prereqs() -> None:
     if not os.environ.get("PAPER_API_PASSWORD"):
         pytest.skip(
             "PAPER_API_PASSWORD not set; generate via "
-            "`python -c \"import secrets; print(secrets.token_urlsafe(24))\"` "
+            '`python -c "import secrets; print(secrets.token_urlsafe(24))"` '
             "and add to .env (see stage 7a .env.example)"
         )
 
@@ -184,9 +184,9 @@ async def test_spawn_and_stop_against_real_container() -> None:
         assert copied_strategy.exists()
 
         # Container present.
-        assert _docker_container_exists(container_name), (
-            f"container {container_name} not found after spawn returned success"
-        )
+        assert _docker_container_exists(
+            container_name
+        ), f"container {container_name} not found after spawn returned success"
 
     finally:
         # Cleanup — always run, even if the spawn asserts failed.
@@ -205,9 +205,9 @@ async def test_spawn_and_stop_against_real_container() -> None:
             pytest.fail(f"stop_paper_container failed: {exc}")
 
         # Container gone.
-        assert not _docker_container_exists(container_name), (
-            f"container {container_name} still present after stop"
-        )
+        assert not _docker_container_exists(
+            container_name
+        ), f"container {container_name} still present after stop"
 
         # Worker dir cleanup — not strictly required by the helper contract
         # (the resolved config + sqlite trades DB might be useful for

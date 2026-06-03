@@ -132,7 +132,9 @@ def _make_pass_lookahead_runner() -> Any:
     gate so doesn't strictly need the stub, but passing it is harmless
     and keeps every loop test hermetic."""
 
-    async def stub(strategy_path: Any, *, pairs: Any, timeframe: Any, timerange: Any) -> dict[str, Any]:
+    async def stub(
+        strategy_path: Any, *, pairs: Any, timeframe: Any, timerange: Any
+    ) -> dict[str, Any]:
         return {
             "passed": True,
             "details": "stub: no look-ahead bias",
@@ -172,9 +174,7 @@ def _make_pass_on_nth_critic(pass_on: int, call_count: list[int]) -> Any:
                     "confidence": 0.8,
                 }
             ],
-            "critic_notes": (
-                [] if verdict_str == "pass" else [f"call_{n}_guidance"]
-            ),
+            "critic_notes": ([] if verdict_str == "pass" else [f"call_{n}_guidance"]),
             "artifacts": {**existing, "critic_verdicts": prior},
         }
 

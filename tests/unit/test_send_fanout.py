@@ -201,9 +201,7 @@ def test_prepare_validation_inputs_derives_param_sets_and_folds() -> None:
         }
     )
     # One derived param set, id = strategy_id, params spread in.
-    assert updates["param_sets"] == [
-        {"id": "strat-123", "rsi_buy_threshold": 30, "ema_fast": 12}
-    ]
+    assert updates["param_sets"] == [{"id": "strat-123", "rsi_buy_threshold": 30, "ema_fast": 12}]
     # Anchored 6-fold walk-forward (BRD §5.4).
     assert len(updates["folds"]) == 6
     assert all({"fold_id", "timerange"} <= set(f) for f in updates["folds"])
@@ -268,8 +266,12 @@ def test_aggregate_results_persists_trades_per_fold_ordered_by_fold() -> None:
     """
     # Build results in NON-fold order to exercise the sort.
     pairs: list[tuple[str, int]] = [
-        ("fold_3", 60), ("fold_1", 0), ("fold_6", 50),
-        ("fold_4", 70), ("fold_2", 55), ("fold_5", 65),
+        ("fold_3", 60),
+        ("fold_1", 0),
+        ("fold_6", 50),
+        ("fold_4", 70),
+        ("fold_2", 55),
+        ("fold_5", 65),
     ]
     results = [_bt_result(param_set_id="ps_1", fold_id=fid, trades=t) for fid, t in pairs]
 
@@ -309,9 +311,9 @@ def test_gate_backtest_fails_on_zero_trade_fold() -> None:
     assert cmd.update["stage"] == "archived"
     failure_reason = cmd.update["failure_reason"]
     assert failure_reason.startswith("backtest_gate:")
-    assert "insufficient_trades_per_fold" in failure_reason, (
-        f"failure_reason must carry the recognizable token; got {failure_reason!r}"
-    )
+    assert (
+        "insufficient_trades_per_fold" in failure_reason
+    ), f"failure_reason must carry the recognizable token; got {failure_reason!r}"
     assert "min=0" in failure_reason
     assert f"MIN_TRADES_PER_FOLD={thresholds.MIN_TRADES_PER_FOLD}" in failure_reason
     # The per-fold list is in the failure for operator diagnostics.

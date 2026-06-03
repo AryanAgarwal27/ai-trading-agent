@@ -174,9 +174,9 @@ def _build_paper_gate_only_graph_for_smoke(saver: Any) -> Any:
 
     from orchestrator.subgraphs.validation import ValidationState, paper_gate
 
-    builder: StateGraph[
-        ValidationState, ValidationState, ValidationState, ValidationState
-    ] = StateGraph(ValidationState)
+    builder: StateGraph[ValidationState, ValidationState, ValidationState, ValidationState] = (
+        StateGraph(ValidationState)
+    )
     builder.add_node("paper_gate", paper_gate)
     builder.add_edge(START, "paper_gate")
     builder.add_edge("paper_gate", END)
@@ -345,12 +345,8 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     redis_url = os.environ.get("REDIS_URL", "redis://127.0.0.1:6379/0")
 
     async with AsyncExitStack() as stack:
-        saver = await stack.enter_async_context(
-            AsyncPostgresSaver.from_conn_string(checkpoint_uri)
-        )
-        store = await stack.enter_async_context(
-            AsyncPostgresStore.from_conn_string(store_uri)
-        )
+        saver = await stack.enter_async_context(AsyncPostgresSaver.from_conn_string(checkpoint_uri))
+        store = await stack.enter_async_context(AsyncPostgresStore.from_conn_string(store_uri))
         await saver.setup()
         await store.setup()
 
@@ -435,9 +431,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         # wakes via Command(resume=...) directly. See DEFERRED.md D-6.
         app.state.kill_event_writer_fn = make_kill_event_writer(app.state.graph)
         kill_task: asyncio.Task[None] = asyncio.create_task(
-            run_kill_subscription(
-                redis_client, kill_event_writer_fn=app.state.kill_event_writer_fn
-            )
+            run_kill_subscription(redis_client, kill_event_writer_fn=app.state.kill_event_writer_fn)
         )
         app.state.kill_subscription_task = kill_task
         stack.push_async_callback(cancel_kill_subscription, kill_task)
@@ -722,9 +716,7 @@ async def ws_events(ws: WebSocket, thread_id: str | None = None) -> None:
     await ws.accept()
     redis_client = ws.app.state.redis
     pubsub = redis_client.pubsub()
-    pattern = (
-        f"ai-trading-agent:*:{thread_id}" if thread_id else "ai-trading-agent:*"
-    )
+    pattern = f"ai-trading-agent:*:{thread_id}" if thread_id else "ai-trading-agent:*"
 
     try:
         await pubsub.psubscribe(pattern)

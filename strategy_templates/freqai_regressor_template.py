@@ -151,8 +151,7 @@ class FreqaiRegressorTemplate(IStrategy):
         is a legitimate label rather than a leak.
         """
         dataframe["&-future_return"] = (
-            dataframe["close"].shift(-self.label_period_candles) / dataframe["close"]
-            - 1.0
+            dataframe["close"].shift(-self.label_period_candles) / dataframe["close"] - 1.0
         )
         return dataframe
 
@@ -190,10 +189,7 @@ class FreqaiRegressorTemplate(IStrategy):
     def populate_exit_trend(self, dataframe: DataFrame, metadata: dict) -> DataFrame:
         """Long exit: predicted return turns negative OR trend filter inverts."""
         dataframe.loc[
-            (
-                (dataframe["&-future_return"] < 0)
-                | (dataframe["ema_fast"] < dataframe["ema_slow"])
-            ),
+            ((dataframe["&-future_return"] < 0) | (dataframe["ema_fast"] < dataframe["ema_slow"])),
             "exit_long",
         ] = 1
         return dataframe

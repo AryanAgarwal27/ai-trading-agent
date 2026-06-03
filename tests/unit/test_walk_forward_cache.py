@@ -51,14 +51,8 @@ def _make_feather(path: Path, start: date, end: date) -> None:
 
 def _bounds(folds: list[dict[str, str]]) -> tuple[date, date]:
     """Earliest train_start and latest test_end across the folds (as dates)."""
-    starts = [
-        datetime.strptime(f["train_timerange"].split("-")[0], "%Y%m%d").date()
-        for f in folds
-    ]
-    ends = [
-        datetime.strptime(f["timerange"].split("-")[1], "%Y%m%d").date()
-        for f in folds
-    ]
+    starts = [datetime.strptime(f["train_timerange"].split("-")[0], "%Y%m%d").date() for f in folds]
+    ends = [datetime.strptime(f["timerange"].split("-")[1], "%Y%m%d").date() for f in folds]
     return min(starts), max(ends)
 
 

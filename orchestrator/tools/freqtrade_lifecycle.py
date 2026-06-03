@@ -208,11 +208,7 @@ def _deep_merge(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any
     """
     out = deepcopy(base)
     for key, val in override.items():
-        if (
-            key in out
-            and isinstance(out[key], dict)
-            and isinstance(val, dict)
-        ):
+        if key in out and isinstance(out[key], dict) and isinstance(val, dict):
             out[key] = _deep_merge(out[key], val)
         else:
             out[key] = val
@@ -260,8 +256,10 @@ def _strategy_class_name(strategy_module_path: Path) -> str:
         for base in node.bases:
             # Match `class X(IStrategy)` or `class X(freqtrade.IStrategy)`.
             base_name = (
-                base.id if isinstance(base, ast.Name)
-                else base.attr if isinstance(base, ast.Attribute)
+                base.id
+                if isinstance(base, ast.Name)
+                else base.attr
+                if isinstance(base, ast.Attribute)
                 else None
             )
             if base_name == "IStrategy":
@@ -468,9 +466,7 @@ async def spawn_paper_container(
 
     # Timeout — dump logs for the operator.
     logs_cmd = ["docker", "logs", "--tail", "100", container_name]
-    log_stdout, log_stderr, _rc = await _run_subprocess(
-        logs_cmd, 10, env=os.environ
-    )
+    log_stdout, log_stderr, _rc = await _run_subprocess(logs_cmd, 10, env=os.environ)
     logger.error(
         "paper container failed to ping within %.0fs strategy_id=%s "
         "last_error=%s container_logs_tail=%r",
@@ -515,9 +511,7 @@ async def stop_paper_container(strategy_id: str) -> None:
             port = int(port_sidecar.read_text(encoding="utf-8").strip())
             api_password = os.environ.get("PAPER_API_PASSWORD", "")
             if api_password:
-                creds = FreqtradeCredentials(
-                    username="freqtrader", password=api_password
-                )
+                creds = FreqtradeCredentials(username="freqtrader", password=api_password)
                 async with FreqtradeAPI(
                     base_url=f"http://127.0.0.1:{port}",
                     credentials=creds,
@@ -537,8 +531,7 @@ async def stop_paper_container(strategy_id: str) -> None:
                 )
         except (FreqtradeAPIError, ValueError, OSError) as exc:
             logger.warning(
-                "rest stop failed strategy_id=%s exc=%s; "
-                "falling through to compose down",
+                "rest stop failed strategy_id=%s exc=%s; " "falling through to compose down",
                 strategy_id,
                 exc,
             )
@@ -726,7 +719,11 @@ async def spawn_live_container(
     """
     # 1. Render + write the resolved live config (fail-fast on cred problems).
     config_path = prepare_live_worker(
-        strategy_id, pair_whitelist, stake_amount, strategy_module_path, port,
+        strategy_id,
+        pair_whitelist,
+        stake_amount,
+        strategy_module_path,
+        port,
         provider=provider,
     )
 
@@ -804,8 +801,7 @@ async def stop_live_container(strategy_id: str) -> None:
                 )
         except (FreqtradeAPIError, ValueError, OSError) as exc:
             logger.warning(
-                "rest stop (live) failed strategy_id=%s exc=%s; "
-                "falling through to compose down",
+                "rest stop (live) failed strategy_id=%s exc=%s; " "falling through to compose down",
                 strategy_id,
                 exc,
             )

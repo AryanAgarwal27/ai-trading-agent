@@ -101,8 +101,7 @@ def make_kill_event_writer(graph: Any) -> KillEventWriterFn:
             return
         if values.get("stage") != "live":
             logger.warning(
-                "kill event for thread %s not in 'live' stage (stage=%s); "
-                "skipping state write",
+                "kill event for thread %s not in 'live' stage (stage=%s); " "skipping state write",
                 thread_id,
                 values.get("stage"),
             )

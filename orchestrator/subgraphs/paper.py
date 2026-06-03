@@ -647,9 +647,7 @@ def divergence_check(
         "consecutive_losses": consecutive_losses,
         "overrides": overrides,
     }
-    update: dict[str, Any] = {
-        "gate_decisions": {**gates, "divergence_check": dc_record}
-    }
+    update: dict[str, Any] = {"gate_decisions": {**gates, "divergence_check": dc_record}}
 
     if effective == "rearm":
         return Command(goto="paper_wait", update=update)
@@ -667,9 +665,7 @@ def divergence_check(
 # ════════════════════════════════════════════════════════════════════════
 
 
-async def live_gate(
-    state: PaperState, config: RunnableConfig
-) -> Command[Any]:
+async def live_gate(state: PaperState, config: RunnableConfig) -> Command[Any]:
     """Second HITL gate: approve graduates to live, reject tears down.
 
     Identical publish-then-interrupt / decision-on-resume structure as
@@ -868,9 +864,7 @@ def build_paper_subgraph(
     async def _paper_teardown(state: PaperState, config: RunnableConfig) -> dict[str, Any]:
         return await paper_teardown(state, stop_container_fn=stop_container_fn)
 
-    builder: StateGraph[PaperState, PaperState, PaperState, PaperState] = StateGraph(
-        PaperState
-    )
+    builder: StateGraph[PaperState, PaperState, PaperState, PaperState] = StateGraph(PaperState)
     builder.add_node("paper_spawn", _paper_spawn)
     builder.add_node("schedule_wake", _schedule_wake)
     builder.add_node("paper_wait", paper_wait)
@@ -881,9 +875,7 @@ def build_paper_subgraph(
     builder.add_node("archive", archive)
 
     builder.add_edge(START, "paper_spawn")
-    builder.add_conditional_edges(
-        "paper_spawn", _route_after_spawn, ["schedule_wake", "archive"]
-    )
+    builder.add_conditional_edges("paper_spawn", _route_after_spawn, ["schedule_wake", "archive"])
     builder.add_edge("schedule_wake", "paper_wait")
     builder.add_edge("paper_wait", "paper_monitor")
     builder.add_edge("paper_monitor", "divergence_check")

@@ -167,9 +167,9 @@ async def test_paper_spawn_returns_paper_stage_on_success(
 
     # paper_started_at: parseable ISO timestamp within the test window.
     started_at = datetime.fromisoformat(result["artifacts"]["paper_started_at"])
-    assert before <= started_at <= after, (
-        f"paper_started_at={started_at!r} outside test window [{before}, {after}]"
-    )
+    assert (
+        before <= started_at <= after
+    ), f"paper_started_at={started_at!r} outside test window [{before}, {after}]"
 
     # And the registry row should now carry the URL.
     async with await psycopg.AsyncConnection.connect(_dsn()) as conn:

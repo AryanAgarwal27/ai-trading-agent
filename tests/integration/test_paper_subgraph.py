@@ -52,9 +52,7 @@ async def cleanup_strategy_ids() -> Any:
         return
     async with await psycopg.AsyncConnection.connect(_dsn()) as conn:
         async with conn.cursor() as cur:
-            await cur.execute(
-                "DELETE FROM strategy_registry WHERE strategy_id = ANY(%s)", (ids,)
-            )
+            await cur.execute("DELETE FROM strategy_registry WHERE strategy_id = ANY(%s)", (ids,))
         await conn.commit()
 
 
@@ -62,7 +60,9 @@ async def cleanup_strategy_ids() -> Any:
 
 
 def _minimal_paper_state(strategy_id: str, paper_started_at: str | None) -> dict[str, Any]:
-    artifacts: dict[str, Any] = {"generated_strategy_path": "strategy_templates/mean_reversion_template.py"}
+    artifacts: dict[str, Any] = {
+        "generated_strategy_path": "strategy_templates/mean_reversion_template.py"
+    }
     if paper_started_at is not None:
         artifacts["paper_started_at"] = paper_started_at
     return {

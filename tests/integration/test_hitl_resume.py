@@ -165,10 +165,7 @@ async def _park_at_paper_gate(strategy_id: str, thread_id: str) -> None:
 def _filter_advanced(publish_calls: list) -> list:
     """gate_pending fires during the initial park; gate_advanced fires
     on resume. Filter to the resume-side publishes only."""
-    return [
-        c for c in publish_calls
-        if c.args[0].startswith("ai-trading-agent:gate_advanced:")
-    ]
+    return [c for c in publish_calls if c.args[0].startswith("ai-trading-agent:gate_advanced:")]
 
 
 # ─── 1. Happy path ─────────────────────────────────────────────────────
@@ -203,9 +200,7 @@ async def test_paper_gate_full_resume_cycle_happy_path(
             assert isinstance(body["audit_id"], int)
 
             # ── Graph state advanced past the interrupt.
-            post_snap = await app.state.graph.aget_state(
-                {"configurable": {"thread_id": tid}}
-            )
+            post_snap = await app.state.graph.aget_state({"configurable": {"thread_id": tid}})
             assert not any(t.interrupts for t in post_snap.tasks)
             assert post_snap.values.get("stage") == "paper"
             paper_block = post_snap.values["gate_decisions"]["paper"]
@@ -233,12 +228,10 @@ async def test_paper_gate_full_resume_cycle_happy_path(
             assert TEST_OPERATOR_TOKEN not in actor, "raw token must NEVER appear in actor"
             # BOTH notes paths (per the 6f fix — top-level convenience
             # AND nested canonical) must resolve to the same value.
-            assert payload["notes"] == notes_text, (
-                f"top-level payload.notes mismatch: {payload!r}"
-            )
-            assert payload["decision"]["notes"] == notes_text, (
-                f"nested payload.decision.notes mismatch: {payload!r}"
-            )
+            assert payload["notes"] == notes_text, f"top-level payload.notes mismatch: {payload!r}"
+            assert (
+                payload["decision"]["notes"] == notes_text
+            ), f"nested payload.decision.notes mismatch: {payload!r}"
             assert payload["decision"]["approved"] is True
             # Stage 7g: gate identified by interrupt "kind" (nesting-
             # invariant), audit key renamed gate_node -> gate_kind.
@@ -295,25 +288,22 @@ async def test_paper_gate_full_resume_cycle_reject_path(
 
             # ── Graph state archived with the operator's notes in
             # failure_reason (paper_gate's reject path encodes this).
-            post_snap = await app.state.graph.aget_state(
-                {"configurable": {"thread_id": tid}}
-            )
+            post_snap = await app.state.graph.aget_state({"configurable": {"thread_id": tid}})
             assert post_snap.values.get("stage") == "archived"
             failure = post_snap.values.get("failure_reason", "")
-            assert "paper_gate_rejected" in failure, (
-                f"failure_reason must carry the canonical prefix; got {failure!r}"
-            )
-            assert notes_text in failure, (
-                f"failure_reason must include operator notes; got {failure!r}"
-            )
+            assert (
+                "paper_gate_rejected" in failure
+            ), f"failure_reason must carry the canonical prefix; got {failure!r}"
+            assert (
+                notes_text in failure
+            ), f"failure_reason must include operator notes; got {failure!r}"
 
             # ── gate_audits row reflects the reject.
             conn = await _open_app_conn()
             try:
                 async with conn.cursor() as cur:
                     await cur.execute(
-                        "SELECT decision, payload FROM gate_audits "
-                        "WHERE strategy_id = %s",
+                        "SELECT decision, payload FROM gate_audits " "WHERE strategy_id = %s",
                         (sid,),
                     )
                     rows = await cur.fetchall()
@@ -367,17 +357,15 @@ async def test_paper_gate_resume_without_token_returns_401(
                     count_row = await cur.fetchone()
             finally:
                 await conn.close()
-            assert count_row is not None and count_row[0] == 0, (
-                "401 path must NOT write a gate_audits row"
-            )
+            assert (
+                count_row is not None and count_row[0] == 0
+            ), "401 path must NOT write a gate_audits row"
 
-            assert not _filter_advanced(mock_redis.publish.call_args_list), (
-                "401 path must NOT fire a gate_advanced publish"
-            )
+            assert not _filter_advanced(
+                mock_redis.publish.call_args_list
+            ), "401 path must NOT fire a gate_advanced publish"
 
-            post_snap = await app.state.graph.aget_state(
-                {"configurable": {"thread_id": tid}}
-            )
+            post_snap = await app.state.graph.aget_state({"configurable": {"thread_id": tid}})
             assert any(
                 t.interrupts for t in post_snap.tasks
             ), "thread must remain parked after a 401 — endpoint must not advance state"

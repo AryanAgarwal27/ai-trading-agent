@@ -177,8 +177,7 @@ class FreqaiClassifierTemplate(IStrategy):
         """
         threshold = self.label_threshold_pct / 100.0
         future_return = (
-            dataframe["close"].shift(-self.label_period_candles) / dataframe["close"]
-            - 1.0
+            dataframe["close"].shift(-self.label_period_candles) / dataframe["close"] - 1.0
         )
         conditions = [future_return > threshold, future_return < -threshold]
         choices = ["up", "down"]
@@ -219,10 +218,7 @@ class FreqaiClassifierTemplate(IStrategy):
     def populate_exit_trend(self, dataframe: DataFrame, metadata: dict) -> DataFrame:
         """Long exit: predicted class falls off 'up' OR trend filter inverts."""
         dataframe.loc[
-            (
-                (dataframe["&-action"] != "up")
-                | (dataframe["ema_fast"] < dataframe["ema_slow"])
-            ),
+            ((dataframe["&-action"] != "up") | (dataframe["ema_fast"] < dataframe["ema_slow"])),
             "exit_long",
         ] = 1
         return dataframe

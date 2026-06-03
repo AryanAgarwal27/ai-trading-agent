@@ -89,9 +89,7 @@ async def test_wake_without_token_returns_401(monkeypatch: pytest.MonkeyPatch) -
 
 async def test_wake_with_wrong_token_returns_403(monkeypatch: pytest.MonkeyPatch) -> None:
     async with _app_with_graph(monkeypatch, _build_paper_wait_test_graph) as client:
-        resp = await client.post(
-            "/threads/any_tid/wake", headers={"X-Operator-Token": "wrong"}
-        )
+        resp = await client.post("/threads/any_tid/wake", headers={"X-Operator-Token": "wrong"})
     assert resp.status_code == 403
 
 

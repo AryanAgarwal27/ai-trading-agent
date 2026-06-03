@@ -21,9 +21,7 @@ from orchestrator.security.ast_validator import (
 )
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
-MEAN_REVERSION_TEMPLATE = (
-    REPO_ROOT / "strategy_templates" / "mean_reversion_template.py"
-)
+MEAN_REVERSION_TEMPLATE = REPO_ROOT / "strategy_templates" / "mean_reversion_template.py"
 
 
 # ─── Positive cases ─────────────────────────────────────────────────────────
@@ -134,10 +132,7 @@ def test_rejects_forbidden_attribute_on_allowlisted_module() -> None:
     """`functools.eval` — contrived but exercises the attribute visitor.
     Even when the receiver is allowlisted, a forbidden attribute name on
     the chain is flagged."""
-    source = (
-        "import functools\n"
-        "x = functools.eval\n"
-    )
+    source = "import functools\n" "x = functools.eval\n"
     with pytest.raises(ASTValidationError) as exc_info:
         validate_strategy_source(source)
     assert "eval" in str(exc_info.value)
@@ -147,10 +142,7 @@ def test_rejects_os_system_after_aliased_import() -> None:
     """`import os as o; o.system(...)` — the aliased import is caught at
     import time so the attribute chain never gets to run. We assert the
     rejection mentions ``os`` (the import-level violation)."""
-    source = (
-        "import os as o\n"
-        "o.system('rm -rf /')\n"
-    )
+    source = "import os as o\n" "o.system('rm -rf /')\n"
     with pytest.raises(ASTValidationError) as exc_info:
         validate_strategy_source(source)
     assert "os" in str(exc_info.value)
@@ -175,18 +167,11 @@ def test_rejects_dotted_relative_import_with_module() -> None:
 
 
 def test_collects_all_violations_not_just_first() -> None:
-    source = (
-        "import os\n"
-        "import subprocess\n"
-        "x = eval('1+1')\n"
-        "f = open\n"
-    )
+    source = "import os\n" "import subprocess\n" "x = eval('1+1')\n" "f = open\n"
     with pytest.raises(ASTValidationError) as exc_info:
         validate_strategy_source(source)
     violations = exc_info.value.violations
-    assert len(violations) >= 4, (
-        f"expected ≥4 violations, got {len(violations)}: {violations}"
-    )
+    assert len(violations) >= 4, f"expected ≥4 violations, got {len(violations)}: {violations}"
 
 
 def test_syntax_error_is_wrapped_as_validation_error() -> None:

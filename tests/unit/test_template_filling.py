@@ -56,9 +56,7 @@ def _load_schema(stem: str, class_name: str) -> type[BaseModel]:
     freqtrade`` which isn't installed in the test venv)."""
     path = TEMPLATES_DIR / f"{stem}_schema.py"
     spec = importlib.util.spec_from_file_location(f"_test_schema_{stem}", path)
-    assert spec is not None and spec.loader is not None, (
-        f"Could not build module spec for {path}"
-    )
+    assert spec is not None and spec.loader is not None, f"Could not build module spec for {path}"
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return getattr(module, class_name)
@@ -154,12 +152,12 @@ def test_slot_names_match_schema_fields(
     schema_names = set(schema_cls.model_fields.keys())
     extra_slots = slot_names - schema_names
     extra_fields = schema_names - slot_names
-    assert not extra_slots, (
-        f"{template_path.name}: SLOTs without matching schema field: {extra_slots}"
-    )
-    assert not extra_fields, (
-        f"{template_path.name}: schema fields without matching SLOT: {extra_fields}"
-    )
+    assert (
+        not extra_slots
+    ), f"{template_path.name}: SLOTs without matching schema field: {extra_slots}"
+    assert (
+        not extra_fields
+    ), f"{template_path.name}: schema fields without matching SLOT: {extra_fields}"
 
 
 def test_template_defaults_satisfy_schema(
@@ -171,10 +169,7 @@ def test_template_defaults_satisfy_schema(
     3 / Stage 5 smoke tests backtest the un-rendered file directly)."""
     template_path, schema_cls = template_pair
     source = template_path.read_text(encoding="utf-8")
-    defaults = {
-        name: ast.literal_eval(value)
-        for name, value in _extract_slots(source).items()
-    }
+    defaults = {name: ast.literal_eval(value) for name, value in _extract_slots(source).items()}
     schema_cls(**defaults)  # raises ValidationError on drift
 
 
@@ -210,15 +205,11 @@ def test_rendered_template_actually_substituted(
     Verify at least one slot's rendered literal differs from the default."""
     template_path, schema_cls = template_pair
     source = template_path.read_text(encoding="utf-8")
-    defaults = {
-        name: ast.literal_eval(value)
-        for name, value in _extract_slots(source).items()
-    }
+    defaults = {name: ast.literal_eval(value) for name, value in _extract_slots(source).items()}
     params = _synthetic_params(schema_cls)
     rendered = _render(source, params)
     rendered_defaults = {
-        name: ast.literal_eval(value)
-        for name, value in _extract_slots(rendered).items()
+        name: ast.literal_eval(value) for name, value in _extract_slots(rendered).items()
     }
     assert rendered_defaults == params, (
         f"{template_path.name}: rendered SLOT values "

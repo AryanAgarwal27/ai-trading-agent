@@ -88,9 +88,7 @@ MAX_REVISIONS = 3
 
 # ─── Context-local tool inputs ─────────────────────────────────────────
 
-_current_generated_source: ContextVar[str] = ContextVar(
-    "critic.generated_source", default=""
-)
+_current_generated_source: ContextVar[str] = ContextVar("critic.generated_source", default="")
 
 
 # ─── Tools ─────────────────────────────────────────────────────────────
@@ -181,7 +179,7 @@ class CriticVerdict(BaseModel):
             "will see on the next pass. For verdict=revise: name each "
             "slot that needs changing AND which edge of its range the "
             "hypothesis demands (e.g. 'bb_std should be ≥ 2.6 to encode "
-            "\\\"stretched\\\"; current value 2.2 is generic'). For "
+            '\\"stretched\\"; current value 2.2 is generic\'). For '
             "verdict=pass: may be empty string. Do NOT re-propose the "
             "template choice — that decision is upstream and final."
         ),
@@ -338,14 +336,10 @@ async def critic_node(
     """
     strategy_path_str = (state.get("artifacts") or {}).get("generated_strategy_path")
     if not strategy_path_str:
-        raise ValueError(
-            "critic_node requires state['artifacts']['generated_strategy_path']"
-        )
+        raise ValueError("critic_node requires state['artifacts']['generated_strategy_path']")
     strategy_path = Path(strategy_path_str)
     if not strategy_path.exists():
-        raise FileNotFoundError(
-            f"critic_node: generated strategy file missing: {strategy_path}"
-        )
+        raise FileNotFoundError(f"critic_node: generated strategy file missing: {strategy_path}")
     rendered_source = strategy_path.read_text(encoding="utf-8")
 
     proposal = (state.get("artifacts") or {}).get("research_proposal") or {}
@@ -412,9 +406,7 @@ def verdict_to_state_update(
                 "confidence": verdict.confidence,
             },
         ],
-        "critic_notes": (
-            [verdict.revision_guidance] if verdict.revision_guidance else []
-        ),
+        "critic_notes": ([verdict.revision_guidance] if verdict.revision_guidance else []),
         "artifacts": {
             **base_artifacts,
             "critic_verdicts": prior_verdicts,
@@ -464,8 +456,7 @@ def revise_or_proceed(
     )
     if critic_vote is None:
         raise RuntimeError(
-            "revise_or_proceed needs at least one 'critic' entry in "
-            "agent_votes; got none"
+            "revise_or_proceed needs at least one 'critic' entry in " "agent_votes; got none"
         )
 
     revision_count = int(state.get("revision_count") or 0)

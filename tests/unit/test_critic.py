@@ -182,18 +182,14 @@ def test_revise_or_proceed_revise_under_cap_routes_to_generator() -> None:
 
 def test_revise_or_proceed_revise_at_boundary_increments_to_max() -> None:
     """Edge case: count = MAX_REVISIONS - 1 → still allowed; count becomes MAX_REVISIONS."""
-    cmd = revise_or_proceed(
-        _state_with_critic_vote("revise", revision_count=MAX_REVISIONS - 1)
-    )
+    cmd = revise_or_proceed(_state_with_critic_vote("revise", revision_count=MAX_REVISIONS - 1))
     assert cmd.goto == "generator"
     assert cmd.update == {"revision_count": MAX_REVISIONS}
 
 
 def test_revise_or_proceed_revise_at_cap_routes_to_archive() -> None:
     """verdict=revise + count >= MAX_REVISIONS → archive with failure_reason."""
-    cmd = revise_or_proceed(
-        _state_with_critic_vote("revise", revision_count=MAX_REVISIONS)
-    )
+    cmd = revise_or_proceed(_state_with_critic_vote("revise", revision_count=MAX_REVISIONS))
     assert cmd.goto == "archive"
     assert cmd.update is not None
     assert cmd.update["stage"] == "archived"

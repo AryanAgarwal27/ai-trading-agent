@@ -109,9 +109,7 @@ async def test_lookahead_gate_fail_routes_to_archive_with_canonical_prefix(
 ) -> None:
     """passed=False → goto='archive' with failure_reason starting
     'lookahead_bias:' (BRD §8 rule 5 canonical prefix)."""
-    runner = _make_runner_returning(
-        passed=False, details="forward shift in feature column"
-    )
+    runner = _make_runner_returning(passed=False, details="forward shift in feature column")
     gate = make_lookahead_gate(lookahead_runner=runner)
     state = _state_with_strategy(tmp_path)
     cmd = await gate(state)

@@ -193,9 +193,9 @@ async def test_research_output_satisfies_validation_input_contract() -> None:
 
     payload = captured[0]
     assert "strategy_path" in payload, "worker payload missing strategy_path"
-    assert "_param_set" in payload and "id" in payload["_param_set"], (
-        f"worker payload _param_set lacks 'id': {payload.get('_param_set')!r}"
-    )
-    assert "_fold" in payload and {"timerange", "fold_id"} <= set(payload["_fold"]), (
-        f"worker payload _fold lacks timerange/fold_id: {payload.get('_fold')!r}"
-    )
+    assert (
+        "_param_set" in payload and "id" in payload["_param_set"]
+    ), f"worker payload _param_set lacks 'id': {payload.get('_param_set')!r}"
+    assert "_fold" in payload and {"timerange", "fold_id"} <= set(
+        payload["_fold"]
+    ), f"worker payload _fold lacks timerange/fold_id: {payload.get('_fold')!r}"

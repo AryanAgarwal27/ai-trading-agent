@@ -95,9 +95,7 @@ def _pmessage(channel: str, data: Any) -> dict[str, Any]:
 
 
 def test_strategy_id_from_channel_handles_prefix_colons() -> None:
-    assert (
-        _strategy_id_from_channel("ai-trading-agent:kill_switch:live-abc123") == "live-abc123"
-    )
+    assert _strategy_id_from_channel("ai-trading-agent:kill_switch:live-abc123") == "live-abc123"
 
 
 def test_normalize_aliases_metrics_and_does_not_inject_action() -> None:
@@ -134,9 +132,7 @@ async def test_kill_event_dispatched_to_writer() -> None:
         "fired_at": "2026-06-03T14:32:11Z",
         "metrics_summary": {"max_drawdown": 0.131, "consecutive_losses": 4},
     }
-    pubsub = _FakePubSub(
-        [_pmessage("ai-trading-agent:kill_switch:live-abc", json.dumps(payload))]
-    )
+    pubsub = _FakePubSub([_pmessage("ai-trading-agent:kill_switch:live-abc", json.dumps(payload))])
     captured: dict[str, Any] = {}
 
     async def _writer(strategy_id: str, event: dict[str, Any]) -> None:
@@ -156,9 +152,7 @@ async def test_kill_event_dispatched_to_writer() -> None:
 async def test_bytes_channel_and_data_are_decoded() -> None:
     """Real redis-py yields bytes; the loop decodes both channel and data."""
     payload = json.dumps({"reason": "consecutive_losses_10_exceeded", "fired_at": "t"})
-    pubsub = _FakePubSub(
-        [_pmessage(b"ai-trading-agent:kill_switch:s9", payload.encode("utf-8"))]
-    )
+    pubsub = _FakePubSub([_pmessage(b"ai-trading-agent:kill_switch:s9", payload.encode("utf-8"))])
     captured: dict[str, Any] = {}
 
     async def _writer(strategy_id: str, event: dict[str, Any]) -> None:
@@ -214,9 +208,7 @@ async def test_writer_failure_does_not_abort_loop() -> None:
 async def test_writer_writes_normalized_event_for_live_thread() -> None:
     """The default writer merges a normalized kill event into a live thread's
     artifacts (preserving existing keys)."""
-    graph = _FakeGraph(
-        {"stage": "live", "artifacts": {"live_started_at": "2026-06-03T00:00:00Z"}}
-    )
+    graph = _FakeGraph({"stage": "live", "artifacts": {"live_started_at": "2026-06-03T00:00:00Z"}})
     writer = make_kill_event_writer(graph)
     await writer(
         "live-abc",

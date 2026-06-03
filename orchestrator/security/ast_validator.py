@@ -129,9 +129,7 @@ class _StrategyASTVisitor(ast.NodeVisitor):
         if node.module is None:
             # Defensive: an absolute `from None import ...` is a syntax error
             # so we shouldn't reach this branch, but if we do, fail closed.
-            self.violations.append(
-                f"line {node.lineno}: import with no module name is not allowed"
-            )
+            self.violations.append(f"line {node.lineno}: import with no module name is not allowed")
             return
 
         top = node.module.split(".", 1)[0]
@@ -146,24 +144,18 @@ class _StrategyASTVisitor(ast.NodeVisitor):
         # Catches direct call (`eval(...)`), reference (`f = open`), and
         # any other context that resolves a forbidden builtin by name.
         if node.id in FORBIDDEN_NAMES:
-            self.violations.append(
-                f"line {node.lineno}: forbidden name '{node.id}'"
-            )
+            self.violations.append(f"line {node.lineno}: forbidden name '{node.id}'")
         self.generic_visit(node)
 
     def visit_Attribute(self, node: ast.Attribute) -> None:
         # Catches attribute-chain escapes like `builtins.eval(...)` or
         # `some_alias.exec(...)` even when the receiver is allowlisted.
         if node.attr in FORBIDDEN_NAMES:
-            self.violations.append(
-                f"line {node.lineno}: forbidden attribute access '.{node.attr}'"
-            )
+            self.violations.append(f"line {node.lineno}: forbidden attribute access '.{node.attr}'")
         self.generic_visit(node)
 
 
-def validate_strategy_source(
-    source: str, *, filename: str = "<generated>"
-) -> None:
+def validate_strategy_source(source: str, *, filename: str = "<generated>") -> None:
     """Validate ``source`` against the strategy allowlist.
 
     Parses with ``ast.parse`` and walks the tree once, collecting every

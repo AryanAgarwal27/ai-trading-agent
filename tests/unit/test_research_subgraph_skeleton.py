@@ -73,7 +73,9 @@ def _make_pass_lookahead_runner() -> Any:
     subprocess. These tests aren't about lookahead behavior — they're
     about load_context — so the stub keeps them hermetic."""
 
-    async def stub(strategy_path: Any, *, pairs: Any, timeframe: Any, timerange: Any) -> dict[str, Any]:
+    async def stub(
+        strategy_path: Any, *, pairs: Any, timeframe: Any, timerange: Any
+    ) -> dict[str, Any]:
         return {
             "passed": True,
             "details": "stub: no look-ahead bias",

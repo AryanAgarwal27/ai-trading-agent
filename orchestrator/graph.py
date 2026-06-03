@@ -243,8 +243,8 @@ def build_per_strategy_graph(
         checkpointer=None,  # nested under the parent's saver
     )
 
-    builder: StateGraph[StrategyState, StrategyState, StrategyState, StrategyState] = (
-        StateGraph(StrategyState)
+    builder: StateGraph[StrategyState, StrategyState, StrategyState, StrategyState] = StateGraph(
+        StrategyState
     )
     builder.add_node("research_subgraph", research)
     builder.add_node("validation_subgraph", validation)

@@ -200,9 +200,7 @@ def make_lookahead_gate(
     runner = lookahead_runner or _default_lookahead_runner
 
     async def lookahead_gate(state: dict[str, Any]) -> Command[Any]:
-        strategy_path_str = (state.get("artifacts") or {}).get(
-            "generated_strategy_path"
-        )
+        strategy_path_str = (state.get("artifacts") or {}).get("generated_strategy_path")
         if not strategy_path_str:
             raise ValueError(
                 "lookahead_gate requires state['artifacts']['generated_strategy_path']"
@@ -221,10 +219,9 @@ def make_lookahead_gate(
         # about catching forward shifts, not about regime coverage.
         # State can override via artifacts.lookahead_timerange if a
         # future caller wants pair-specific cached data.
-        timerange = (
-            (state.get("artifacts") or {}).get("lookahead_timerange")
-            or DEFAULT_LOOKAHEAD_TIMERANGE
-        )
+        timerange = (state.get("artifacts") or {}).get(
+            "lookahead_timerange"
+        ) or DEFAULT_LOOKAHEAD_TIMERANGE
 
         result: LookaheadResult = await runner(
             strategy_path,
@@ -282,9 +279,7 @@ def archive(state: ResearchState) -> dict[str, Any]:
     """
     return {
         "stage": "archived",
-        "failure_reason": (
-            state.get("failure_reason") or "research_archived_without_reason"
-        ),
+        "failure_reason": (state.get("failure_reason") or "research_archived_without_reason"),
     }
 
 
@@ -360,8 +355,8 @@ def build_research_subgraph(
     load_context = make_load_context(store=store)
     lookahead_gate = make_lookahead_gate(lookahead_runner=lookahead_runner)
 
-    builder: StateGraph[ResearchState, ResearchState, ResearchState, ResearchState] = (
-        StateGraph(ResearchState)
+    builder: StateGraph[ResearchState, ResearchState, ResearchState, ResearchState] = StateGraph(
+        ResearchState
     )
     # Closure-async nodes hit the same false-positive LangGraph generic
     # mismatch as validation.py's backtest_worker / risk_analyst.

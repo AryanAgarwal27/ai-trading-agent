@@ -76,9 +76,7 @@ def _build_paper_gate_test_graph(saver: Any) -> Any:
     """
 
     def paper_gate(state: _GateState) -> dict[str, Any]:
-        decision = interrupt(
-            {"kind": "paper_gate", "strategy_id": state.get("strategy_id")}
-        )
+        decision = interrupt({"kind": "paper_gate", "strategy_id": state.get("strategy_id")})
         return {
             "approved": decision["approved"],
             "notes": decision.get("notes", ""),
@@ -279,9 +277,7 @@ async def test_approve_with_valid_token_advances_thread_and_writes_audit_and_pub
             assert isinstance(body["audit_id"], int)
 
             # Thread is no longer interrupted.
-            post_snap = await app.state.graph.aget_state(
-                {"configurable": {"thread_id": tid}}
-            )
+            post_snap = await app.state.graph.aget_state({"configurable": {"thread_id": tid}})
             assert not any(t.interrupts for t in post_snap.tasks)
             assert post_snap.values.get("stage") == "paper"
 

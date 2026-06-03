@@ -115,9 +115,7 @@ def test_render_template_substitutes_slot_lines() -> None:
         "freqai_regressor_template",
     ],
 )
-async def test_generator_node_writes_ast_clean_file(
-    tmp_path: Path, template_name: str
-) -> None:
+async def test_generator_node_writes_ast_clean_file(tmp_path: Path, template_name: str) -> None:
     """End-to-end happy path: stub extractor → render → write → AST validates.
 
     Parameterized over all three v1 templates so a regression in any one

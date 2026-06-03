@@ -72,15 +72,9 @@ TemplateName = Literal[
 # from clobbering each other once the supervisor (Stage 9) starts
 # spawning parallel threads.
 
-_current_store: ContextVar[BaseStore | None] = ContextVar(
-    "researcher.store", default=None
-)
-_current_regime: ContextVar[str] = ContextVar(
-    "researcher.regime", default="unknown"
-)
-_current_pairs: ContextVar[tuple[str, ...]] = ContextVar(
-    "researcher.pairs", default=()
-)
+_current_store: ContextVar[BaseStore | None] = ContextVar("researcher.store", default=None)
+_current_regime: ContextVar[str] = ContextVar("researcher.regime", default="unknown")
+_current_pairs: ContextVar[tuple[str, ...]] = ContextVar("researcher.pairs", default=())
 
 
 # ─── Tools ─────────────────────────────────────────────────────────────
@@ -178,9 +172,7 @@ def get_pair_stats(pair: str) -> dict[str, Any]:
     from orchestrator.tools.backtest_runner import SHARED_DATA_DIR
 
     timeframe = "5m"
-    feather_path = (
-        SHARED_DATA_DIR / "binance" / f"{pair.replace('/', '_')}-{timeframe}.feather"
-    )
+    feather_path = SHARED_DATA_DIR / "binance" / f"{pair.replace('/', '_')}-{timeframe}.feather"
     if not feather_path.exists():
         return {"error": f"no_cached_feather_for_{pair}_{timeframe}"}
 
@@ -202,9 +194,7 @@ def get_pair_stats(pair: str) -> dict[str, Any]:
         return {"error": f"insufficient_closes: {len(closes)}"}
 
     log_returns = [
-        math.log(closes[i] / closes[i - 1])
-        for i in range(1, len(closes))
-        if closes[i - 1] > 0
+        math.log(closes[i] / closes[i - 1]) for i in range(1, len(closes)) if closes[i - 1] > 0
     ]
     per_candle_std = statistics.stdev(log_returns) if len(log_returns) >= 2 else 0.0
     candles_per_year = 365 * 24 * 12  # 5m candles
@@ -213,9 +203,7 @@ def get_pair_stats(pair: str) -> dict[str, Any]:
     # Mean daily quote volume = mean(volume * close) over the window * candles/day.
     candles_per_day = 24 * 12
     quote_per_candle = [v * c for v, c in zip(volumes, closes, strict=True)]
-    mean_quote_per_candle = (
-        statistics.fmean(quote_per_candle) if quote_per_candle else 0.0
-    )
+    mean_quote_per_candle = statistics.fmean(quote_per_candle) if quote_per_candle else 0.0
 
     return {
         "pair": pair,
