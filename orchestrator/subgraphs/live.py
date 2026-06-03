@@ -41,23 +41,35 @@ from __future__ import annotations
 import json
 import logging
 import os
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Mapping
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 from urllib.parse import urlparse
 
 import psycopg
 from langchain_core.runnables import RunnableConfig
 
-from orchestrator.gates.thresholds import LIVE_CAPITAL_CAP_USD, MAX_OPEN_TRADES
+from orchestrator.agents.coordinator import LiveVerdict
+from orchestrator.gates.thresholds import (
+    DAILY_LOSS_LIMIT_PCT,
+    KILL_SWITCH_CONSECUTIVE_LOSSES,
+    KILL_SWITCH_DRAWDOWN,
+    LIVE_CAPITAL_CAP_USD,
+    MAX_OPEN_TRADES,
+)
 from orchestrator.security.secrets import EnvSecretProvider, SecretProvider
 from orchestrator.subgraphs.paper import PaperState
+from orchestrator.tools.compare import compare_paper_to_backtest
 from orchestrator.tools.freqtrade_lifecycle import (
     LIVE_WORKERS_ROOT,
     next_free_live_port,
     spawn_live_container,
 )
+
+# Reviewer LLM seams (8e wires the real agents; tests + 8d pass stubs).
+RationaleFn = Callable[[dict[str, Any]], Awaitable[str]]
+PerformanceReviewFn = Callable[[dict[str, Any]], Awaitable[LiveVerdict]]
 
 logger = logging.getLogger(__name__)
 
@@ -92,6 +104,11 @@ class LiveState(PaperState, total=False):
     strategy_path: str
     # Operator stake intent (pre-cap); capped to LIVE_CAPITAL_CAP_USD at spawn.
     stake_amount: float
+    # Per-cycle live metrics snapshot the 8e live_evaluate node fetches and the
+    # three reviewer nodes read (drawdown / daily P&L / consecutive losses,
+    # live-vs-paper return samples, current + approval-time regime). Transient
+    # (re-fetched each wake), not a durable channel.
+    live_snapshot: dict[str, Any]
 
 
 # ───────────────────────── db helpers (mirror paper.py) ─────────────────────────
@@ -301,9 +318,7 @@ async def live_spawn(
             type(exc).__name__,
             exc,
         )
-        await write_registry(
-            **identity, stage="archived", userdir=userdir, failure_reason=reason
-        )
+        await write_registry(**identity, stage="archived", userdir=userdir, failure_reason=reason)
         return {"stage": "archived", "failure_reason": reason}
 
     # Normalize: helper may return just the api_url, or (api_url, container_id).
@@ -328,3 +343,187 @@ async def live_spawn(
         "freqtrade_process_id": container_id or f"live-{strategy_id}",
         "artifacts": new_artifacts,
     }
+
+
+# ════════════════════════════════════════════════════════════════════════
+# Reviewer nodes (Stage 8d) — BRD §5.6 live_evaluate Send fan-out targets
+# ════════════════════════════════════════════════════════════════════════
+#
+# Each reviewer reads the per-cycle ``live_snapshot`` and appends ONE AgentVote
+# (verdict ∈ {continue, pause, fail}). They write ONLY ``agent_votes`` (the
+# Annotated[list, add] reducer field) — never ``gate_decisions`` — because they
+# run in parallel under a Send fan-out, and ``gate_decisions`` has no reducer so
+# concurrent writes would clobber. The coordinator (runs after the barrier)
+# reads the votes and owns the gate_decisions["coordinator"] write.
+
+
+def _reviewer_vote(agent: str, verdict: str, rationale: str, confidence: float) -> dict[str, Any]:
+    """A reviewer's state-update: one appended vote, reducer-safe."""
+    return {
+        "agent_votes": [
+            {
+                "agent": agent,
+                "verdict": verdict,
+                "rationale": rationale,
+                "confidence": confidence,
+            }
+        ]
+    }
+
+
+# ─── risk_check: plain verdict + small LLM rationale (BRD §5.6) ──────────
+
+
+async def _default_risk_rationale(facts: dict[str, Any]) -> str:
+    """Default ``rationale_fn`` — a small Haiku call summarizing the facts."""
+    from langchain_anthropic import ChatAnthropic
+    from langchain_core.messages import HumanMessage, SystemMessage
+
+    model = ChatAnthropic(model="claude-haiku-4-5-20251001", timeout=30.0, stop=None)
+    msg = await model.ainvoke(
+        [
+            SystemMessage(
+                content=(
+                    "You write a single terse sentence explaining a live-trade "
+                    "risk verdict from the given facts. Cite the numbers."
+                )
+            ),
+            HumanMessage(content=json.dumps(facts)),
+        ]
+    )
+    return str(msg.content)
+
+
+async def risk_check(
+    state: Mapping[str, Any],
+    config: RunnableConfig | None = None,
+    *,
+    rationale_fn: RationaleFn | None = None,
+) -> dict[str, Any]:
+    """Reviewer: drawdown / daily P&L / consecutive losses → continue|pause.
+
+    Verdict is DETERMINISTIC against the BRD §10 live thresholds; a small LLM
+    (``rationale_fn``) only writes the human rationale. risk_check never votes
+    "fail" (archive) — a threshold breach routes to pause/HITL; the hard stop
+    is the out-of-band kill switch (Stage 8f), not this advisory vote.
+    """
+    snap = state.get("live_snapshot") or {}
+    max_dd = float(snap.get("max_drawdown", 0.0) or 0.0)
+    daily = float(snap.get("daily_pnl_pct", 0.0) or 0.0)
+    losses = int(snap.get("consecutive_losses", 0) or 0)
+
+    breaches: list[str] = []
+    if max_dd >= KILL_SWITCH_DRAWDOWN:
+        breaches.append(f"max_drawdown={max_dd:.3f}>={KILL_SWITCH_DRAWDOWN}")
+    if daily <= -DAILY_LOSS_LIMIT_PCT:
+        breaches.append(f"daily_pnl_pct={daily:.3f}<=-{DAILY_LOSS_LIMIT_PCT}")
+    if losses >= KILL_SWITCH_CONSECUTIVE_LOSSES:
+        breaches.append(f"consecutive_losses={losses}>={KILL_SWITCH_CONSECUTIVE_LOSSES}")
+
+    verdict = "pause" if breaches else "continue"
+    confidence = 0.9 if breaches else 0.7
+    facts = {
+        "max_drawdown": max_dd,
+        "daily_pnl_pct": daily,
+        "consecutive_losses": losses,
+        "breaches": breaches,
+        "verdict": verdict,
+    }
+    rat_fn = rationale_fn or _default_risk_rationale
+    rationale = await rat_fn(facts)
+    return _reviewer_vote("risk_check", verdict, rationale, confidence)
+
+
+# ─── regime_check: plain lookup + compare (no LLM, BRD §5.6) ────────────
+
+
+def regime_check(
+    state: Mapping[str, Any],
+    config: RunnableConfig | None = None,
+) -> dict[str, Any]:
+    """Reviewer: current regime vs approval-time regime → continue|pause.
+
+    Pure (no LLM, BRD §5.6). A regime shift from the conditions under which the
+    strategy was approved is a pause signal (the edge that justified going live
+    may no longer hold). A missing approval regime can't be compared → continue
+    at low confidence.
+    """
+    snap = state.get("live_snapshot") or {}
+    current = snap.get("current_regime")
+    approval = snap.get("approval_regime")
+
+    if not approval:
+        return _reviewer_vote(
+            "regime_check",
+            "continue",
+            "no approval-time regime recorded; cannot compare regimes",
+            0.3,
+        )
+    if current == approval:
+        return _reviewer_vote(
+            "regime_check",
+            "continue",
+            f"regime unchanged since approval ({approval})",
+            0.8,
+        )
+    return _reviewer_vote(
+        "regime_check",
+        "pause",
+        f"regime shifted {approval} -> {current} since approval",
+        0.8,
+    )
+
+
+# ─── performance_check: Sonnet agent over live-vs-paper drift (BRD §5.6) ─
+
+
+async def _default_performance_review(comparison: dict[str, Any]) -> LiveVerdict:
+    """Default ``review_fn`` — a Sonnet 4.6 agent judging the drift comparison."""
+    from langchain.agents import create_agent
+    from langchain_anthropic import ChatAnthropic
+    from langchain_core.messages import HumanMessage
+
+    model = ChatAnthropic(model="claude-sonnet-4-6", timeout=60.0, stop=None)
+    agent = create_agent(
+        model=model,
+        tools=[],
+        system_prompt=_PERFORMANCE_PROMPT,
+        response_format=LiveVerdict,
+    )
+    result = await agent.ainvoke({"messages": [HumanMessage(content=json.dumps(comparison))]})
+    return cast(LiveVerdict, result["structured_response"])
+
+
+_PERFORMANCE_PROMPT = """\
+You are the live-trade Performance reviewer. You are given a KS-test + Sharpe
+comparison of LIVE per-trade returns vs the PAPER returns that justified going
+live. If diverged is true on a meaningful sample (n_paper and n_live both
+reasonable), the live behaviour no longer matches paper — vote pause (or fail
+if the divergence is severe and the sample is large). If not diverged, vote
+continue. With a tiny sample, prefer continue and wait for more data. Emit a
+LiveVerdict.
+"""
+
+
+async def performance_check(
+    state: Mapping[str, Any],
+    config: RunnableConfig | None = None,
+    *,
+    review_fn: PerformanceReviewFn | None = None,
+) -> dict[str, Any]:
+    """Reviewer: live-vs-paper return-distribution drift → continue|pause|fail.
+
+    Computes the KS + relative-Sharpe comparison deterministically (reusing the
+    Stage 7 two-sample machinery), then hands it to a Sonnet agent for the
+    verdict. The agent call is injectable (``review_fn``).
+    """
+    snap = state.get("live_snapshot") or {}
+    live_returns = [float(x) for x in (snap.get("live_returns") or [])]
+    paper_returns = [float(x) for x in (snap.get("paper_returns") or [])]
+    comparison = dict(compare_paper_to_backtest(live_returns, paper_returns))
+
+    review = review_fn or _default_performance_review
+    verdict = await review(comparison)
+    return _reviewer_vote(
+        "performance_check", verdict.verdict, verdict.rationale, verdict.confidence
+    )
