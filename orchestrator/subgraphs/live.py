@@ -44,13 +44,25 @@ import os
 from collections.abc import Awaitable, Callable, Mapping
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, cast
+from typing import Any, Literal, cast
 from urllib.parse import urlparse
 
 import psycopg
 from langchain_core.runnables import RunnableConfig
+from langgraph.checkpoint.base import BaseCheckpointSaver
+from langgraph.graph import END, START, StateGraph
+from langgraph.graph.state import CompiledStateGraph
+from langgraph.types import Command, Send, interrupt
 
-from orchestrator.agents.coordinator import LiveVerdict
+from orchestrator.agents.coordinator import (
+    ArbitrateFn,
+    GateAuditWriterFn,
+    LiveVerdict,
+    MergeFn,
+    coordinator,
+    latest_reviewer_votes,
+)
+from orchestrator.gates.hitl import build_interrupt_payload
 from orchestrator.gates.thresholds import (
     DAILY_LOSS_LIMIT_PCT,
     KILL_SWITCH_CONSECUTIVE_LOSSES,
@@ -58,13 +70,16 @@ from orchestrator.gates.thresholds import (
     LIVE_CAPITAL_CAP_USD,
     MAX_OPEN_TRADES,
 )
+from orchestrator.observability.events import publish_gate_pending, record_gate_audit
 from orchestrator.security.secrets import EnvSecretProvider, SecretProvider
 from orchestrator.subgraphs.paper import PaperState
 from orchestrator.tools.compare import compare_paper_to_backtest
+from orchestrator.tools.freqtrade_api import FreqtradeAPI, FreqtradeCredentials
 from orchestrator.tools.freqtrade_lifecycle import (
     LIVE_WORKERS_ROOT,
     next_free_live_port,
     spawn_live_container,
+    stop_live_container,
 )
 
 # Reviewer LLM seams (8e wires the real agents; tests + 8d pass stubs).
@@ -77,6 +92,19 @@ logger = logging.getLogger(__name__)
 # tuple when the helper surfaces a container id.
 SpawnLiveContainerFn = Callable[..., Awaitable[str | tuple[str, str]]]
 RegistryWriterFn = Callable[..., Awaitable[None]]
+
+# 8e assembly seams.
+# build_snapshot_fn is the live analog of paper's build_context_fn — fetches the
+# per-cycle metrics from the live container before the reviewer fan-out.
+BuildSnapshotFn = Callable[[Mapping[str, Any]], Awaitable[dict[str, Any]]]
+# stop_trading_fn POSTs /api/v1/stop only (halt) — NOT a teardown. live_pause
+# must leave the container queryable/resumable for the next wake (BRD §5.6).
+StopTradingFn = Callable[[Mapping[str, Any]], Awaitable[None]]
+StopContainerFn = Callable[[str], Awaitable[None]]
+
+# BaseCheckpointSaver is generic on its serializer; accept any concrete saver
+# (InMemorySaver for tests, AsyncPostgresSaver for production) — mirror paper.py.
+CheckpointSaver = BaseCheckpointSaver[Any]
 
 
 # ════════════════════════════════════════════════════════════════════════
@@ -527,3 +555,423 @@ async def performance_check(
     return _reviewer_vote(
         "performance_check", verdict.verdict, verdict.rationale, verdict.confidence
     )
+
+
+# ════════════════════════════════════════════════════════════════════════
+# Subgraph assembly (Stage 8e) — BRD §5.6 topology
+# ════════════════════════════════════════════════════════════════════════
+
+
+def _trailing_losses(trades: list[dict[str, Any]]) -> int:
+    """Count the trailing run of losing closed trades (mirror paper.py)."""
+    count = 0
+    for t in reversed(trades):
+        if not isinstance(t, dict):
+            break
+        pr = t.get("profit_ratio")
+        if pr is None:
+            break
+        if float(pr) < 0:
+            count += 1
+        else:
+            break
+    return count
+
+
+# ─── live_evaluate: fetch the snapshot, then fan out to the reviewers ───
+
+
+async def _build_live_snapshot_from_container(state: Mapping[str, Any]) -> dict[str, Any]:
+    """Default ``build_snapshot_fn`` — live analog of paper's build_context_fn.
+
+    Fetches profit/trades/performance from the live container and derives the
+    fields the reviewers read. ``paper_returns`` + the regimes come from
+    ``artifacts`` (populated by the paper→live handoff / 8g). The
+    ``daily_pnl_pct`` here is a cumulative-percent approximation; the real
+    rolling-24h figure is the daily_loss_job's job (Stage 8f).
+    """
+    api_url = state.get("freqtrade_api_url")
+    artifacts = state.get("artifacts") or {}
+    base: dict[str, Any] = {
+        "max_drawdown": 0.0,
+        "daily_pnl_pct": 0.0,
+        "consecutive_losses": 0,
+        "live_returns": [],
+        "paper_returns": artifacts.get("paper_returns", []),
+        "current_regime": artifacts.get("current_regime"),
+        "approval_regime": artifacts.get("approval_regime"),
+    }
+    if not api_url:
+        return base
+
+    creds = FreqtradeCredentials(
+        username="freqtrader",
+        password=os.environ.get("BINANCE_LIVE_API_PASSWORD", ""),
+    )
+    async with FreqtradeAPI(base_url=api_url, credentials=creds) as client:
+        profit = await client.profit()
+        trades_resp = await client.trades(limit=500)
+        await client.performance()
+
+    profit = profit if isinstance(profit, dict) else {}
+    trades = trades_resp.get("trades", []) if isinstance(trades_resp, dict) else []
+    base["max_drawdown"] = float(profit.get("max_drawdown", 0.0) or 0.0)
+    # Approximation (cumulative, not rolling-24h) — see docstring.
+    base["daily_pnl_pct"] = float(profit.get("profit_closed_percent", 0.0) or 0.0) / 100.0
+    base["consecutive_losses"] = _trailing_losses(trades)
+    base["live_returns"] = [
+        float(t["profit_ratio"])
+        for t in trades
+        if isinstance(t, dict) and t.get("profit_ratio") is not None
+    ]
+    return base
+
+
+async def live_evaluate(
+    state: LiveState,
+    config: RunnableConfig | None = None,
+    *,
+    build_snapshot_fn: BuildSnapshotFn | None = None,
+) -> dict[str, Any]:
+    """Fetch the per-cycle live snapshot into state, then the conditional edge
+    (:func:`_fan_out_reviewers`) Send-fans-out to the three reviewers.
+
+    Splitting fetch (here) from fan-out (the edge) means the snapshot is fetched
+    ONCE per wake — the three reviewers read a consistent snapshot rather than
+    each re-fetching (metrics would shift mid-cycle, and it'd be 3× the REST
+    round-trips).
+    """
+    fn = build_snapshot_fn or _build_live_snapshot_from_container
+    snap = await fn(state)
+    return {"live_snapshot": snap}
+
+
+def _fan_out_reviewers(state: LiveState) -> list[Send]:
+    """Router: one Send per reviewer with the snapshot slice (BRD §5.6).
+
+    The reviewers append to the ``agent_votes`` reducer (inherited from
+    PaperState — ``Annotated[list[AgentVote], add]``), so the three parallel
+    writes concatenate rather than clobber.
+    """
+    snap = state.get("live_snapshot") or {}
+    payload = {"strategy_id": state.get("strategy_id"), "live_snapshot": snap}
+    return [
+        Send("risk_check", payload),
+        Send("performance_check", payload),
+        Send("regime_check", payload),
+    ]
+
+
+# ─── live_wait: interrupt() park between wake-cycles ────────────────────
+
+
+def live_wait(state: LiveState) -> dict[str, Any]:
+    """Park the live thread until a wake (BRD §5.6); resume → live_evaluate.
+
+    Wakes via (a) the APScheduler wake job calling the FastAPI /wake endpoint,
+    or (b) a kill-switch publish. KILL-SWITCH WAKE PATH: SEE 8f — Stage 8f wires
+    the out-of-band kill switch, which publishes a kill event and (8f's change)
+    makes this resume route conditionally to live_pause when
+    ``artifacts.kill_switch_event`` is set. For 8e there is no kill-switch
+    wiring: resume always proceeds to live_evaluate (plain edge below). Bare
+    interrupt → no side effects on replay.
+    """
+    interrupt({"kind": "live_wait", "strategy_id": state.get("strategy_id")})
+    return {}
+
+
+# ─── live_pause: POST /stop (halt), HITL review, resume routing ─────────
+
+
+async def _default_live_stop_trading(state: Mapping[str, Any]) -> None:
+    """Default ``stop_trading_fn`` — POST /api/v1/stop only (halt, not teardown).
+
+    A pause must leave the container queryable/resumable for the next wake
+    (BRD §5.6), so this halts trading via the REST API and does NOT compose-down
+    the container (that is the archive path's job via stop_live_container).
+    """
+    api_url = state.get("freqtrade_api_url")
+    if not api_url:
+        return
+    password = os.environ.get("BINANCE_LIVE_API_PASSWORD", "")
+    if not password:
+        logger.warning("BINANCE_LIVE_API_PASSWORD unset; skipping live /stop")
+        return
+    creds = FreqtradeCredentials(username="freqtrader", password=password)
+    async with FreqtradeAPI(base_url=api_url, credentials=creds, timeout_s=5.0) as client:
+        await client.stop()
+
+
+def _project_reviewer_gate_decisions(state: Mapping[str, Any]) -> dict[str, Any]:
+    """Project the latest reviewer votes into ``gate_decisions`` for the payload.
+
+    The reviewers write only ``agent_votes`` (reducer-safe under the fan-out);
+    ``build_interrupt_payload``'s live_pause_review shape reads
+    ``gate_decisions[<reviewer>]``. Coordinator already wrote
+    ``gate_decisions["coordinator"]``; here we add the per-reviewer entries so
+    the dashboard payload is complete. Does not mutate state.
+    """
+    gates = dict(state.get("gate_decisions") or {})
+    for v in latest_reviewer_votes(list(state.get("agent_votes") or [])):
+        gates[v["agent"]] = {
+            "verdict": v["verdict"],
+            "rationale": v["rationale"],
+            "confidence": v["confidence"],
+        }
+    return gates
+
+
+async def live_pause(
+    state: LiveState,
+    config: RunnableConfig | None = None,
+    *,
+    stop_trading_fn: StopTradingFn | None = None,
+    gate_audit_writer_fn: GateAuditWriterFn | None = None,
+) -> Command[Any]:
+    """Halt the live bot, surface live_pause_review HITL, route on resume.
+
+    POST /api/v1/stop (best-effort halt; container survives), then
+    interrupt() with the SPEC §4.1 live_pause_review payload (coordinator
+    branch; the kill-switch branch is taken automatically by
+    build_interrupt_payload when 8f sets artifacts.kill_switch_event). On
+    resume: approve → live_wait (re-arm), reject → archive. A gate_audits row
+    (gate='live_pause', human_approve/human_reject) is written on resume.
+
+    NOTE (diverges from paper's gate pattern): paper_gate/live_gate do NOT write
+    gate_audits in-node — the FastAPI /approve endpoint does. live_pause writes
+    it in-node so the subgraph's HITL decision is durably recorded without a
+    web layer (a dedicated live_pause-resume endpoint is 8g/dashboard territory).
+    """
+    stop_fn = stop_trading_fn or _default_live_stop_trading
+    write_audit = gate_audit_writer_fn or record_gate_audit
+    sid = state["strategy_id"]
+    thread_id = _thread_id_for(config, sid) if config is not None else f"strategy_{sid}"
+
+    # Best-effort halt — mirror paper_teardown's swallow-and-log; a re-stop on
+    # interrupt replay is harmless (the container is already halted).
+    try:
+        await stop_fn(state)
+    except Exception as exc:  # noqa: BLE001 — a stop failure must not strand HITL
+        logger.error("live_pause stop failed strategy_id=%s exc=%s", sid, exc)
+
+    gates = _project_reviewer_gate_decisions(state)
+    payload = build_interrupt_payload({**state, "gate_decisions": gates}, "live_pause_review")
+    await publish_gate_pending(thread_id, payload)
+
+    decision = interrupt(payload)
+    existing = state.get("gate_decisions") or {}
+
+    if not isinstance(decision, dict) or "approved" not in decision:
+        await write_audit(
+            strategy_id=sid,
+            gate="live_pause",
+            decision="human_reject",
+            actor="human",
+            payload={"error": "invalid_decision_payload"},
+        )
+        return Command(
+            goto="archive",
+            update={
+                "stage": "archived",
+                "failure_reason": "live_pause_invalid_decision_payload",
+                "gate_decisions": {
+                    **existing,
+                    "live_pause": {
+                        "approved": False,
+                        "by": "human",
+                        "error": "invalid_decision_payload",
+                    },
+                },
+            },
+        )
+
+    approved = bool(decision.get("approved", False))
+    notes = str(decision.get("notes", ""))
+    # Stage 8g may move this to a /live_pause/resume endpoint; until then
+    # in-node write is the durable HITL audit record. If 8g adds an endpoint
+    # write, drop the in-node call to avoid duplicate gate_audits rows.
+    await write_audit(
+        strategy_id=sid,
+        gate="live_pause",
+        decision="human_approve" if approved else "human_reject",
+        actor="human",
+        payload={"approved": approved, "notes": notes},
+    )
+
+    if approved:
+        return Command(
+            goto="live_wait",
+            update={
+                "gate_decisions": {
+                    **existing,
+                    "live_pause": {"approved": True, "notes": notes, "by": "human"},
+                }
+            },
+        )
+    return Command(
+        goto="archive",
+        update={
+            "stage": "archived",
+            "failure_reason": f"live_pause_rejected: {notes}",
+            "gate_decisions": {
+                **existing,
+                "live_pause": {"approved": False, "notes": notes, "by": "human"},
+            },
+        },
+    )
+
+
+# ─── archive: terminal teardown sink ────────────────────────────────────
+
+
+async def live_archive(
+    state: LiveState,
+    config: RunnableConfig | None = None,
+    *,
+    stop_container_fn: StopContainerFn | None = None,
+) -> dict[str, Any]:
+    """Terminal sink: tear the live container down, stamp stage + failure_reason.
+
+    Reached from coordinator (fail) and live_pause (reject). Unlike live_pause's
+    halt, archive is terminal → full teardown (stop + compose-down) via
+    stop_live_container. Best-effort: a teardown failure is logged, not raised
+    (a leaked container is an ops concern surfaced via logs, not a reason to
+    strand the graph). Mirrors paper_teardown folded into the terminal node.
+    """
+    stop_fn = stop_container_fn or stop_live_container
+    sid = str(state.get("strategy_id", ""))
+    try:
+        await stop_fn(sid)
+    except Exception as exc:  # noqa: BLE001 — teardown must not strand the thread
+        logger.error(
+            "live_archive teardown failed strategy_id=%s exc=%s "
+            "(possible leaked container — check docker ps)",
+            sid,
+            exc,
+        )
+    return {
+        "stage": "archived",
+        "failure_reason": state.get("failure_reason") or "live_archived_without_reason",
+    }
+
+
+# ─── builder ─────────────────────────────────────────────────────────────
+
+
+def _route_after_live_spawn(state: LiveState) -> Literal["live_wait", "archive"]:
+    """Route live_spawn's dict output: archived → archive, else → live_wait."""
+    return "archive" if state.get("stage") == "archived" else "live_wait"
+
+
+def build_live_subgraph(
+    *,
+    spawn_live_container_fn: SpawnLiveContainerFn | None = None,
+    stop_live_container_fn: StopContainerFn | None = None,
+    secrets_provider: SecretProvider | None = None,
+    registry_writer_fn: RegistryWriterFn | None = None,
+    build_snapshot_fn: BuildSnapshotFn | None = None,
+    rationale_fn: RationaleFn | None = None,
+    review_fn: PerformanceReviewFn | None = None,
+    merge_fn: MergeFn | None = None,
+    arbitrate_fn: ArbitrateFn | None = None,
+    gate_audit_writer_fn: GateAuditWriterFn | None = None,
+    stop_trading_fn: StopTradingFn | None = None,
+    checkpointer: CheckpointSaver | None = None,
+) -> CompiledStateGraph[LiveState, LiveState, LiveState, LiveState]:
+    """Compile the Stage 8e live subgraph (BRD §5.6).
+
+    Topology::
+
+        START → live_spawn ──fail──> archive ──> END
+                    │ stage="live"
+                    ▼
+                live_wait ──(wake / resume)──> live_evaluate
+                    ▲                               │ Send×3
+                    │                ┌──────────────┼──────────────┐
+                    │                ▼              ▼              ▼
+                    │           risk_check  performance_check  regime_check
+                    │                └──────────────┼──────────────┘
+                    │                               ▼ (join)
+                    │                          coordinator
+                    ├──── continue ─────────────────┤
+                    │                               ├── pause ──> live_pause
+                    │                               │               ├─approve─> live_wait
+                    │                               │               └─reject──> archive
+                    │                               └── fail ───> archive ──> END
+                    └───────────────────────────────┘   (continue re-arms live_wait)
+
+    All external-effect seams are injectable so the integration test runs fully
+    stubbed (no Docker, no real LLM, no live keys): spawn / stop-teardown /
+    stop-trading / secrets / registry / snapshot-fetch / risk-rationale /
+    performance-review / coordinator-merge / coordinator-arbitrate /
+    gate-audit-writer. KILL-SWITCH wake path: SEE 8f (live_wait note).
+    """
+
+    async def _live_spawn(state: LiveState, config: RunnableConfig) -> dict[str, Any]:
+        return await live_spawn(
+            state,
+            config,
+            spawn_live_container_fn=spawn_live_container_fn,
+            secrets_provider=secrets_provider,
+            registry_writer_fn=registry_writer_fn,
+        )
+
+    async def _live_evaluate(state: LiveState, config: RunnableConfig) -> dict[str, Any]:
+        return await live_evaluate(state, config, build_snapshot_fn=build_snapshot_fn)
+
+    async def _risk_check(state: LiveState, config: RunnableConfig) -> dict[str, Any]:
+        return await risk_check(state, config, rationale_fn=rationale_fn)
+
+    async def _performance_check(state: LiveState, config: RunnableConfig) -> dict[str, Any]:
+        return await performance_check(state, config, review_fn=review_fn)
+
+    def _regime_check(state: LiveState, config: RunnableConfig) -> dict[str, Any]:
+        return regime_check(state, config)
+
+    async def _coordinator(state: LiveState, config: RunnableConfig) -> Command[Any]:
+        return await coordinator(
+            dict(state),
+            config,
+            merge_fn=merge_fn,
+            arbitrate_fn=arbitrate_fn,
+            gate_audit_writer_fn=gate_audit_writer_fn,
+        )
+
+    async def _live_pause(state: LiveState, config: RunnableConfig) -> Command[Any]:
+        return await live_pause(
+            state,
+            config,
+            stop_trading_fn=stop_trading_fn,
+            gate_audit_writer_fn=gate_audit_writer_fn,
+        )
+
+    async def _archive(state: LiveState, config: RunnableConfig) -> dict[str, Any]:
+        return await live_archive(state, config, stop_container_fn=stop_live_container_fn)
+
+    builder: StateGraph[LiveState, LiveState, LiveState, LiveState] = StateGraph(LiveState)
+    builder.add_node("live_spawn", _live_spawn)
+    builder.add_node("live_wait", live_wait)
+    builder.add_node("live_evaluate", _live_evaluate)
+    builder.add_node("risk_check", _risk_check)
+    builder.add_node("performance_check", _performance_check)
+    builder.add_node("regime_check", _regime_check)
+    builder.add_node("coordinator", _coordinator)
+    builder.add_node("live_pause", _live_pause)
+    builder.add_node("archive", _archive)
+
+    builder.add_edge(START, "live_spawn")
+    builder.add_conditional_edges("live_spawn", _route_after_live_spawn, ["live_wait", "archive"])
+    builder.add_edge("live_wait", "live_evaluate")
+    builder.add_conditional_edges(
+        "live_evaluate",
+        _fan_out_reviewers,
+        ["risk_check", "performance_check", "regime_check"],
+    )
+    builder.add_edge("risk_check", "coordinator")
+    builder.add_edge("performance_check", "coordinator")
+    builder.add_edge("regime_check", "coordinator")
+    # coordinator returns Command(goto=live_wait|live_pause|archive)
+    # live_pause returns Command(goto=live_wait|archive)
+    builder.add_edge("archive", END)
+
+    return builder.compile(checkpointer=checkpointer)
