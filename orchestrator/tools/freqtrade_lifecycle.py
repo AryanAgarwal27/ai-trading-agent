@@ -58,6 +58,11 @@ PAPER_BASE_CONFIG = REPO_ROOT / "freqtrade" / "user_data" / "configs" / "paper-b
 LIVE_BASE_CONFIG = REPO_ROOT / "freqtrade" / "user_data" / "configs" / "live-base.json"
 COMPOSE_FILE = REPO_ROOT / "docker-compose.freqtrade.yml"
 WORKERS_ROOT = REPO_ROOT / "freqtrade" / "user_data" / "_workers"
+# Live containers get a DISTINCT userdir root from paper (BRD §7.1 + §1.1
+# rule 5): never reuse paper's _workers/ for a live thread. The resolved
+# live config — which carries real live secrets after Python-side
+# substitution — lands here and is .gitignore'd (freqtrade/user_data/_live_workers/).
+LIVE_WORKERS_ROOT = REPO_ROOT / "freqtrade" / "user_data" / "_live_workers"
 
 # Port range for paper containers. 100 slots is comfortably above v1's
 # ~5-active-strategies cap (BRD §12 cost-budget implication) and far
@@ -65,6 +70,12 @@ WORKERS_ROOT = REPO_ROOT / "freqtrade" / "user_data" / "_workers"
 # orchestrator, 8501 Streamlit, 8080-8090 typical app range).
 PAPER_PORT_RANGE_START = 8100
 PAPER_PORT_RANGE_END = 8200  # exclusive — yields 100 ports [8100, 8199]
+
+# Live container ports occupy the window immediately ABOVE paper's, with no
+# overlap — a paper and a live container must never contend for the same host
+# port. Adjacent-but-disjoint: [8200, 8299].
+LIVE_PORT_RANGE_START = 8200
+LIVE_PORT_RANGE_END = 8300  # exclusive — yields 100 ports [8200, 8299]
 
 # Ping budget. The freqtrade image's import + Postgres-trades-DB init +
 # pair-cache warmup runs ~25-40s on a warm laptop; 120s is generous
@@ -111,6 +122,27 @@ class PaperStopError(PaperLifecycleError):
     we cannot guarantee the container is gone, which is an operational
     concern (orphaned process holding a port, leaking dry-run state).
     """
+
+
+# Live lifecycle exceptions mirror the paper hierarchy (Stage 8b). Distinct
+# types so the Stage 8c live_spawn node can route fail-fast spawn errors to
+# archive immediately while a timeout may warrant a retry on the next wake.
+
+
+class LiveLifecycleError(RuntimeError):
+    """Base class for live spawn/stop failures."""
+
+
+class LiveSpawnError(LiveLifecycleError):
+    """Raised when a live spawn cannot proceed (bad strategy, compose, IO)."""
+
+
+class LiveSpawnTimeout(LiveLifecycleError):
+    """Raised when /api/v1/ping doesn't return 200 within the budget."""
+
+
+class LiveStopError(LiveLifecycleError):
+    """Raised when ``docker compose down`` fails for a live container."""
 
 
 # ───────────────────────── pure helpers ─────────────────────────
@@ -537,6 +569,265 @@ async def stop_paper_container(strategy_id: str) -> None:
             f"(exit {returncode}): stderr_tail={_tail(stderr)!r}"
         )
     logger.info("paper container removed strategy_id=%s", strategy_id)
+
+
+# ═══════════════════════ live lifecycle (Stage 8b) ═══════════════════════
+#
+# Mirrors the paper helpers above (spawn_paper_container / stop_paper_container
+# / next_free_paper_port) but for the LIVE path. Differences are the
+# non-negotiables: a distinct userdir (LIVE_WORKERS_ROOT), a non-overlapping
+# port range, live keys via secrets.load_live_credentials (BRD §1.1 rule 5,
+# enforced inside render_live_config), and a dry_run:false config.
+
+
+def next_free_live_port(used_ports: list[int]) -> int:
+    """Return the lowest port in [8200, 8300) not present in ``used_ports``.
+
+    Pure mirror of :func:`next_free_paper_port` over the live range. The live
+    range is disjoint from the paper range, so a paper and a live container can
+    never be assigned the same host port. Raises :class:`RuntimeError` if the
+    whole live range is taken (v1 capacity, not expected).
+    """
+    used = set(used_ports)
+    for port in range(LIVE_PORT_RANGE_START, LIVE_PORT_RANGE_END):
+        if port not in used:
+            return port
+    raise RuntimeError(
+        f"all {LIVE_PORT_RANGE_END - LIVE_PORT_RANGE_START} live ports "
+        f"in [{LIVE_PORT_RANGE_START}, {LIVE_PORT_RANGE_END}) are in use; "
+        "v1 capacity exceeded"
+    )
+
+
+def prepare_live_worker(
+    strategy_id: str,
+    pair_whitelist: list[str],
+    stake_amount: float,
+    strategy_module_path: Path,
+    port: int,
+    *,
+    provider: SecretProvider | None = None,
+) -> Path:
+    """Render the live config and write the per-strategy live worker dir.
+
+    The docker-free half of :func:`spawn_live_container`, split out so the
+    config write is unit-testable without booting a container. Pipeline:
+
+    1. Resolve the strategy class name from the module (AST, no import).
+    2. ``render_live_config`` — deep-merge live-base.json, cap stake to
+       LIVE_CAPITAL_CAP_USD, substitute the live keys (raising
+       MissingSecretError / SecretCollisionError on a cred problem, BRD §1.1
+       rule 5). dry_run stays false.
+    3. Write ``config-live.json`` to ``LIVE_WORKERS_ROOT/<strategy_id>``
+       (NEVER paper's _workers/), copy the strategy module into ``strategies/``,
+       and write the ``.live-port`` sidecar that ``stop_live_container`` reads.
+
+    Returns the path to the written ``config-live.json``.
+    """
+    try:
+        strategy_class = _strategy_class_name(strategy_module_path)
+    except PaperSpawnError as exc:
+        # Re-type to the live hierarchy; the message ("no IStrategy subclass…")
+        # is accurate regardless of paper/live.
+        raise LiveSpawnError(str(exc)) from exc
+
+    resolved = render_live_config(
+        strategy_id=strategy_id,
+        pair_whitelist=pair_whitelist,
+        stake_amount=stake_amount,
+        strategy_class=strategy_class,
+        port=port,
+        provider=provider,
+    )
+
+    worker_dir = LIVE_WORKERS_ROOT / strategy_id
+    strategies_dir = worker_dir / "strategies"
+    strategies_dir.mkdir(parents=True, exist_ok=True)
+    (worker_dir / "logs").mkdir(parents=True, exist_ok=True)
+
+    config_path = worker_dir / "config-live.json"
+    config_path.write_text(json.dumps(resolved, indent=4), encoding="utf-8")
+
+    shutil.copy2(strategy_module_path, strategies_dir / strategy_module_path.name)
+    (worker_dir / ".live-port").write_text(str(port), encoding="utf-8")
+    return config_path
+
+
+async def _await_live_ping(base_url: str, container_name: str, strategy_id: str) -> None:
+    """Poll ``GET /api/v1/ping`` until 200 or the spawn budget elapses.
+
+    On timeout, dump the container's recent logs to aid diagnosis, then raise
+    :class:`LiveSpawnTimeout`. Factored out (vs paper's inline loop) so
+    :func:`spawn_live_container` is unit-testable with this stubbed.
+    """
+    deadline = asyncio.get_event_loop().time() + _SPAWN_PING_TIMEOUT_S
+    last_error = ""
+    async with httpx.AsyncClient(timeout=2.0) as client:
+        while asyncio.get_event_loop().time() < deadline:
+            try:
+                resp = await client.get(f"{base_url}/api/v1/ping")
+                if resp.status_code == 200:
+                    logger.info(
+                        "live container ready strategy_id=%s url=%s",
+                        strategy_id,
+                        base_url,
+                    )
+                    return
+                last_error = f"status={resp.status_code}"
+            except httpx.HTTPError as exc:
+                last_error = f"transport={exc}"
+            await asyncio.sleep(_SPAWN_PING_INTERVAL_S)
+
+    logs_cmd = ["docker", "logs", "--tail", "100", container_name]
+    log_stdout, log_stderr, _rc = await _run_subprocess(logs_cmd, 10, env=os.environ)
+    logger.error(
+        "live container failed to ping within %.0fs strategy_id=%s "
+        "last_error=%s container_logs_tail=%r",
+        _SPAWN_PING_TIMEOUT_S,
+        strategy_id,
+        last_error,
+        _tail(log_stdout + b"\n" + log_stderr),
+    )
+    raise LiveSpawnTimeout(
+        f"live container {container_name} did not respond to /api/v1/ping "
+        f"within {_SPAWN_PING_TIMEOUT_S:.0f}s (last_error={last_error}); "
+        "see orchestrator logs for container output"
+    )
+
+
+async def spawn_live_container(
+    strategy_id: str,
+    pair_whitelist: list[str],
+    stake_amount: float,
+    strategy_module_path: Path,
+    port: int,
+) -> str:
+    """Boot one LIVE-trading Freqtrade container; return its API URL.
+
+    Mirrors :func:`spawn_paper_container`'s contract — idempotent boot, waits
+    for ``/api/v1/ping`` 200, returns ``http://127.0.0.1:<port>`` — but for the
+    live path: distinct userdir, live keys, dry_run:false config.
+
+    The compose service ``freqtrade-live`` is profile-gated (``profiles:
+    ["live"]``) so paper's bare ``docker compose up -d`` never starts it; here
+    we target it explicitly with ``up -d freqtrade-live``.
+
+    Raises:
+        MissingSecretError / SecretCollisionError: live creds absent or colliding
+            with paper creds (BRD §1.1 rule 5), surfaced from render_live_config.
+        LiveSpawnError: bad strategy module, compose-up failure, or IO error.
+        LiveSpawnTimeout: container did not respond to /ping within the budget.
+    """
+    # 1. Render + write the resolved live config (fail-fast on cred problems).
+    config_path = prepare_live_worker(
+        strategy_id, pair_whitelist, stake_amount, strategy_module_path, port
+    )
+
+    # 2. compose up — target the profiled live service explicitly so only it
+    # starts (the un-profiled paper service is untouched).
+    config_relpath = config_path.relative_to(REPO_ROOT).as_posix()
+    compose_env = {
+        **os.environ,
+        "STRATEGY_ID": strategy_id,
+        "LIVE_PORT": str(port),
+        "LIVE_CONFIG_PATH": config_relpath,
+    }
+    project_name = f"ait-live-{strategy_id}"
+    up_cmd = [
+        "docker",
+        "compose",
+        "-f",
+        str(COMPOSE_FILE),
+        "-p",
+        project_name,
+        "up",
+        "-d",
+        "freqtrade-live",
+    ]
+    _stdout, stderr, returncode = await _run_subprocess(
+        up_cmd, _COMPOSE_UP_TIMEOUT_S, env=compose_env
+    )
+    if returncode != 0:
+        raise LiveSpawnError(
+            f"docker compose up (live) failed for strategy_id={strategy_id} "
+            f"(exit {returncode}): stderr_tail={_tail(stderr)!r}"
+        )
+
+    # 3. Poll /ping. Raises LiveSpawnTimeout on failure (after dumping logs).
+    base_url = f"http://127.0.0.1:{port}"
+    container_name = f"ait-live-{strategy_id}"
+    await _await_live_ping(base_url, container_name, strategy_id)
+    return base_url
+
+
+async def stop_live_container(strategy_id: str) -> None:
+    """Graceful stop of a live container — mirror of :func:`stop_paper_container`.
+
+    1. Read the ``.live-port`` sidecar; if absent, skip the REST stop.
+    2. Best-effort ``POST /api/v1/stop`` (5s budget) with the live REST
+       password. A failure logs a warning and falls through.
+    3. ``docker compose -p ait-live-<sid> down --remove-orphans``; a failure
+       raises :class:`LiveStopError` (orphan live container is a real concern).
+    """
+    worker_dir = LIVE_WORKERS_ROOT / strategy_id
+    port_sidecar = worker_dir / ".live-port"
+
+    if port_sidecar.exists():
+        try:
+            port = int(port_sidecar.read_text(encoding="utf-8").strip())
+            api_password = os.environ.get("BINANCE_LIVE_API_PASSWORD", "")
+            if api_password:
+                creds = FreqtradeCredentials(username="freqtrader", password=api_password)
+                async with FreqtradeAPI(
+                    base_url=f"http://127.0.0.1:{port}",
+                    credentials=creds,
+                    timeout_s=_REST_STOP_TIMEOUT_S,
+                ) as client:
+                    await client.stop()
+                    logger.info(
+                        "rest stop (live) succeeded strategy_id=%s port=%d",
+                        strategy_id,
+                        port,
+                    )
+            else:
+                logger.warning(
+                    "BINANCE_LIVE_API_PASSWORD unset; skipping REST stop "
+                    "strategy_id=%s and going straight to compose down",
+                    strategy_id,
+                )
+        except (FreqtradeAPIError, ValueError, OSError) as exc:
+            logger.warning(
+                "rest stop (live) failed strategy_id=%s exc=%s; "
+                "falling through to compose down",
+                strategy_id,
+                exc,
+            )
+    else:
+        logger.info(
+            "no live port sidecar found strategy_id=%s; skipping REST stop",
+            strategy_id,
+        )
+
+    project_name = f"ait-live-{strategy_id}"
+    down_cmd = [
+        "docker",
+        "compose",
+        "-f",
+        str(COMPOSE_FILE),
+        "-p",
+        project_name,
+        "down",
+        "--remove-orphans",
+    ]
+    _stdout, stderr, returncode = await _run_subprocess(
+        down_cmd, _COMPOSE_DOWN_TIMEOUT_S, env=os.environ
+    )
+    if returncode != 0:
+        raise LiveStopError(
+            f"docker compose down (live) failed for strategy_id={strategy_id} "
+            f"(exit {returncode}): stderr_tail={_tail(stderr)!r}"
+        )
+    logger.info("live container removed strategy_id=%s", strategy_id)
 
 
 # ───────────────────────── subprocess plumbing ─────────────────────────

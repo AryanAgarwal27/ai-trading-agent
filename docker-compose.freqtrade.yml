@@ -84,3 +84,51 @@ services:
       timeout: 5s
       retries: 12
       start_period: 20s
+
+  # Stage 8b LIVE-trading service. REAL MONEY: the mounted config has
+  # dry_run:false. Profile-gated so paper's bare `up -d` (which targets no
+  # service) never starts it; spawn_live_container targets it explicitly via
+  # `docker compose -p ait-live-<sid> up -d freqtrade-live`. The `:-` defaults
+  # on the live-only vars keep paper's compose-up parse clean (the live service
+  # interpolates to harmless values when paper, not live, is being spawned).
+  freqtrade-live:
+    profiles: ["live"]
+    image: freqtradeorg/freqtrade:stable_freqai
+    container_name: ait-live-${STRATEGY_ID}
+    # restart: "no" — lifecycle owned by spawn_live_container / live_pause +
+    # the out-of-band kill switch (Stage 8f), NOT by docker. A crashed live
+    # container must surface to live_pause, never be silently restarted.
+    restart: "no"
+    mem_limit: 1g
+    cpus: 0.5
+    ports:
+      # Loopback-only (BRD §15). Live host port comes from the [8200,8299]
+      # range (next_free_live_port), disjoint from paper's [8100,8199].
+      - "127.0.0.1:${LIVE_PORT:-18299}:8080"
+    volumes:
+      # DISTINCT live userdir (_live_workers/), never paper's _workers/.
+      - ./freqtrade/user_data/_live_workers/${STRATEGY_ID}:/freqtrade/user_data
+      - ./freqtrade/user_data/data:/freqtrade/user_data/data:ro
+      # Per-strategy resolved live config (config-live.json), bind-mounted RO.
+      - ./${LIVE_CONFIG_PATH:-freqtrade/user_data/configs/live-base.json}:/freqtrade/user_data/configs/config-live.json:ro
+    environment:
+      # LIVE subaccount credentials — SEPARATE from paper (BRD §1.1 rule 5).
+      # render_live_config substitutes these into the on-disk config already;
+      # these are a belt-and-braces passthrough. Defaulted empty so a paper
+      # compose-up (which doesn't set them) interpolates without warnings.
+      BINANCE_LIVE_API_KEY: ${BINANCE_LIVE_API_KEY:-}
+      BINANCE_LIVE_API_SECRET: ${BINANCE_LIVE_API_SECRET:-}
+      BINANCE_LIVE_API_PASSWORD: ${BINANCE_LIVE_API_PASSWORD:-}
+      FREQTRADE__BOT_NAME: ${STRATEGY_ID:-}
+    command:
+      - "trade"
+      - "--config"
+      - "/freqtrade/user_data/configs/config-live.json"
+    healthcheck:
+      test:
+        - "CMD-SHELL"
+        - "python -c \"import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8080/api/v1/ping', timeout=2).status == 200 else 1)\""
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 20s
