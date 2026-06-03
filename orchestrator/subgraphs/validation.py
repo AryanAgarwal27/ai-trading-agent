@@ -283,19 +283,25 @@ def prepare_validation_inputs(state: ValidationState) -> dict[str, Any]:
     """
     updates: dict[str, Any] = {}
 
-    if not state.get("strategy_path"):
+    # Guards key on key-ABSENCE, not falsy-value: an explicitly-empty
+    # upstream value (param_sets=[], folds=[], strategy_path="") must
+    # propagate to plan_backtests and fail loudly with zero Sends, NOT
+    # be silently re-derived. The verification test in test_research_
+    # validation_handoff.py exists to catch the zero-Sends failure mode;
+    # a falsy-check guard would mask it.
+    if "strategy_path" not in state:
         gen_path = (state.get("artifacts") or {}).get("generated_strategy_path")
         if gen_path:
             updates["strategy_path"] = gen_path
 
-    if not state.get("param_sets"):
+    if "param_sets" not in state:
         params = state.get("params") or {}
         # TODO(v2-hyperopt): param_set_id collides across sweep iterations.
         # When hyperopt sweep lands, derive id as f"{strategy_id}__{param_hash}".
         ps_id = state.get("strategy_id") or "research_proposal"
         updates["param_sets"] = [{"id": ps_id, **params}]
 
-    if not state.get("folds"):
+    if "folds" not in state:
         updates["folds"] = plan_walk_forward(data_start=_default_walk_forward_start())
 
     return updates
