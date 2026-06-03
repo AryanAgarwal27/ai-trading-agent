@@ -33,13 +33,27 @@ from __future__ import annotations
 
 import logging
 import os
+from collections.abc import Awaitable, Callable
+from datetime import UTC, datetime
+from typing import Any
 
 import httpx
+import psycopg
 from apscheduler.jobstores.memory import MemoryJobStore
 from apscheduler.jobstores.sqlalchemy import SQLAlchemyJobStore
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
-from orchestrator.subgraphs.paper import ScheduleWakeFn
+from orchestrator.gates.thresholds import (
+    DAILY_LOSS_LIMIT_PCT,
+    KILL_SWITCH_CONSECUTIVE_LOSSES,
+    KILL_SWITCH_DRAWDOWN,
+)
+from orchestrator.observability.events import publish_kill, record_kill_switch_event
+
+# _trailing_losses is private in paper.py; reused here (3rd call site). Tracked
+# as DEFERRED.md D-4 (promote to a util in a later refactor commit).
+from orchestrator.subgraphs.paper import ScheduleWakeFn, _trailing_losses
+from orchestrator.tools.freqtrade_api import FreqtradeAPI, FreqtradeAPIError, FreqtradeCredentials
 
 logger = logging.getLogger(__name__)
 
@@ -47,15 +61,30 @@ logger = logging.getLogger(__name__)
 WAKE_INTERVAL_HOURS = 6
 REGIME_INTERVAL_HOURS = 1
 KILL_SWITCH_INTERVAL_MINUTES = 5
+DAILY_LOSS_INTERVAL_MINUTES = 15
 
 # ─── Job-id conventions ─────────────────────────────────────────────────
 WAKE_JOB_PREFIX = "wake:"
 REGIME_JOB_ID = "regime_job"
 KILL_SWITCH_JOB_ID = "kill_switch_poll"
+DAILY_LOSS_JOB_ID = "daily_loss_poll"
 
 # A missed wake (orchestrator down) within this window still fires on
 # restart; older misses are skipped and caught by the next 6h cycle.
 _WAKE_MISFIRE_GRACE_S = 3600
+
+# Kill-switch REST timeout — tight (BRD §11): if Freqtrade is unresponsive,
+# log loud and proceed; the kill switch must not block the job loop.
+_KILL_REST_TIMEOUT_S = 5.0
+
+# action_taken values written to kill_switch_events (BRD §5.8).
+_ACTION_STOP = "POST /api/v1/stop"
+_ACTION_STOP_TIMEOUT = "stop_call_timeout"
+_ACTION_STOPBUY = "POST /api/v1/stopbuy"
+_ACTION_STOPBUY_TIMEOUT = "stopbuy_call_timeout"
+
+# Stop-action set the kill-switch idempotency guard checks against.
+_STOP_ACTIONS = (_ACTION_STOP, _ACTION_STOP_TIMEOUT)
 
 
 def _orchestrator_base_url() -> str:
@@ -140,16 +169,273 @@ async def _fire_regime_job() -> None:
     logger.info("regime_job: inserted regime=%s", regime)
 
 
-async def _fire_kill_switch_poll() -> None:
-    """PLACEHOLDER kill-switch poll (BRD §11 — real impl in Stage 8).
+# ════════════════════════════════════════════════════════════════════════
+# Kill switch + daily-loss (Stage 8f) — out-of-band, graph-independent
+# ════════════════════════════════════════════════════════════════════════
+#
+# BRD §1.1 rule 7 + §11: these jobs poll Freqtrade REST directly and call
+# /stop or /stopbuy on threshold breach. They do NOT wait for the graph to
+# wake, route through the coordinator, or respect any LLM verdict. They are
+# the HARD floor under the coordinator's SOFT safety layer (8d). The graph
+# learns of a kill via artifacts.kill_switch_event, which 8g sets from the
+# Redis subscription this job publishes to.
 
-    The real job will poll ``/api/v1/profit`` every 5 min for every LIVE
-    thread and call ``/api/v1/stop`` directly on a drawdown / consecutive-
-    loss breach, independent of the graph (BRD §11). No live threads
-    exist before Stage 8, so this is a liveness no-op — logged at debug
-    so the job's scheduling is observable without log spam.
+# Injection seams — defaults are the real DB/REST/Redis impls; tests pass stubs.
+LiveStrategiesFn = Callable[[], Awaitable[list[tuple[str, str]]]]
+RestClientFactory = Callable[[str], Any]
+AlreadyFiredFn = Callable[[str], Awaitable[bool]]
+RecordEventFn = Callable[..., Awaitable[int]]
+PublishKillFn = Callable[[str, dict[str, Any]], Awaitable[None]]
+
+
+def _libpq_dsn(url: str) -> str:
+    return url.replace("postgresql+psycopg://", "postgresql://", 1)
+
+
+async def _connect_app_db() -> psycopg.AsyncConnection:
+    return await psycopg.AsyncConnection.connect(_libpq_dsn(os.environ["DATABASE_URL"]))
+
+
+async def _list_live_strategies() -> list[tuple[str, str]]:
+    """Default ``list_live_fn`` — (strategy_id, api_url) for every live thread."""
+    conn = await _connect_app_db()
+    try:
+        async with conn.cursor() as cur:
+            await cur.execute(
+                "SELECT strategy_id, freqtrade_api_url FROM strategy_registry "
+                "WHERE stage = 'live' AND freqtrade_api_url IS NOT NULL"
+            )
+            rows = await cur.fetchall()
+    finally:
+        await conn.close()
+    return [(str(r[0]), str(r[1])) for r in rows]
+
+
+async def _kill_already_fired(strategy_id: str) -> bool:
+    """Fork 5d guard: has a /stop already fired THIS live run?
+
+    True iff a stop-action ``kill_switch_events`` row exists with
+    ``fired_at > strategy_registry.live_started_at`` — i.e. fired after the
+    current live run began. A fresh live_spawn bumps ``live_started_at`` and
+    un-suppresses. NULL ``live_started_at`` → comparison excludes the row →
+    returns False → kill fires (safe direction). See DEFERRED.md D-5.
     """
-    logger.debug("kill_switch_poll placeholder tick (Stage 8 wires real polling)")
+    conn = await _connect_app_db()
+    try:
+        async with conn.cursor() as cur:
+            await cur.execute(
+                "SELECT 1 FROM kill_switch_events kse "
+                "JOIN strategy_registry sr ON kse.strategy_id = sr.strategy_id "
+                "WHERE kse.strategy_id = %s "
+                "AND kse.action_taken = ANY(%s) "
+                "AND kse.fired_at > sr.live_started_at "
+                "ORDER BY kse.fired_at DESC LIMIT 1",
+                (strategy_id, list(_STOP_ACTIONS)),
+            )
+            row = await cur.fetchone()
+    finally:
+        await conn.close()
+    return row is not None
+
+
+async def _stopbuy_already_fired_24h(strategy_id: str) -> bool:
+    """daily_loss guard: a stopbuy row in the last 24h (sliding window).
+
+    stopbuy is a soft halt; a fresh calendar day legitimately re-evaluates, so
+    the guard is a 24h sliding window rather than the live-run anchor.
+    """
+    conn = await _connect_app_db()
+    try:
+        async with conn.cursor() as cur:
+            await cur.execute(
+                "SELECT 1 FROM kill_switch_events WHERE strategy_id = %s "
+                "AND action_taken = %s AND fired_at > now() - interval '24 hours' "
+                "ORDER BY fired_at DESC LIMIT 1",
+                (strategy_id, _ACTION_STOPBUY),
+            )
+            row = await cur.fetchone()
+    finally:
+        await conn.close()
+    return row is not None
+
+
+def _default_rest_client(api_url: str) -> FreqtradeAPI:
+    """Default ``rest_client_factory`` — a live-keyed REST client, tight timeout."""
+    creds = FreqtradeCredentials(
+        username="freqtrader",
+        password=os.environ.get("BINANCE_LIVE_API_PASSWORD", ""),
+    )
+    return FreqtradeAPI(base_url=api_url, credentials=creds, timeout_s=_KILL_REST_TIMEOUT_S)
+
+
+def _kill_reason(max_drawdown: float, consecutive_losses: int) -> str | None:
+    """Return the breach-reason string, or None if no threshold is breached."""
+    if max_drawdown >= KILL_SWITCH_DRAWDOWN:
+        return f"drawdown_{int(KILL_SWITCH_DRAWDOWN * 100)}pct_exceeded"
+    if consecutive_losses >= KILL_SWITCH_CONSECUTIVE_LOSSES:
+        return f"consecutive_losses_{KILL_SWITCH_CONSECUTIVE_LOSSES}_exceeded"
+    return None
+
+
+def _today_rel_profit(daily_resp: dict[str, Any]) -> float:
+    """Today's relative profit from a ``/api/v1/daily`` response.
+
+    Freqtrade 2026.4 /api/v1/daily returns ``data: [{date, abs_profit,
+    rel_profit, trade_count, ...}]`` (most recent first); field-name
+    verification is deferred to the AIT_RUN_REAL_LIVE_SPAWN_TESTS smoke per the
+    8a stub-only-CI stance. Defensive: missing/empty data → 0.0 (no breach).
+    """
+    data = daily_resp.get("data", []) if isinstance(daily_resp, dict) else []
+    if not data or not isinstance(data[0], dict):
+        return 0.0
+    return float(data[0].get("rel_profit", 0.0) or 0.0)
+
+
+async def kill_switch_poll_job(
+    *,
+    list_live_fn: LiveStrategiesFn | None = None,
+    rest_client_factory: RestClientFactory | None = None,
+    already_fired_fn: AlreadyFiredFn | None = None,
+    record_event_fn: RecordEventFn | None = None,
+    publish_fn: PublishKillFn | None = None,
+) -> None:
+    """Out-of-band kill switch (BRD §1.1 rule 7, §11). Every 5 min.
+
+    For each stage='live' strategy: poll /profit + /trades; on drawdown ≥
+    KILL_SWITCH_DRAWDOWN or consecutive losses ≥ KILL_SWITCH_CONSECUTIVE_LOSSES,
+    POST /stop directly (tight timeout), write a kill_switch_events row, and
+    publish to Redis. A strategy already killed this live run (Fork 5d guard) is
+    skipped. One strategy's failure never aborts the loop.
+    """
+    list_live = list_live_fn or _list_live_strategies
+    factory = rest_client_factory or _default_rest_client
+    already_fired = already_fired_fn or _kill_already_fired
+    record_event = record_event_fn or record_kill_switch_event
+    publish = publish_fn or publish_kill
+
+    for strategy_id, api_url in await list_live():
+        try:
+            if await already_fired(strategy_id):
+                logger.info("kill_switch already fired for %s, awaiting graph routing", strategy_id)
+                continue
+
+            action_taken = _ACTION_STOP
+            reason: str | None = None
+            max_dd = 0.0
+            consecutive = 0
+            profit: dict[str, Any] = {}
+
+            client = factory(api_url)
+            async with client:
+                profit_resp = await client.profit()
+                trades_resp = await client.trades(limit=500)
+                profit = profit_resp if isinstance(profit_resp, dict) else {}
+                trades = trades_resp.get("trades", []) if isinstance(trades_resp, dict) else []
+                max_dd = float(profit.get("max_drawdown", 0.0) or 0.0)
+                consecutive = _trailing_losses(trades)
+                reason = _kill_reason(max_dd, consecutive)
+                if reason is None:
+                    continue
+                # BREACH — POST /stop directly. On a hang, log loud and STILL
+                # record + publish (the graph must learn of the breach even if
+                # /stop didn't confirm — the operator reviews at live_pause).
+                try:
+                    await client.stop()
+                except (FreqtradeAPIError, httpx.HTTPError) as exc:
+                    logger.error(
+                        "KILL SWITCH /stop unresponsive sid=%s reason=%s exc=%s",
+                        strategy_id,
+                        reason,
+                        exc,
+                    )
+                    action_taken = _ACTION_STOP_TIMEOUT
+
+            fired_at = datetime.now(UTC).isoformat()
+            await record_event(
+                strategy_id=strategy_id,
+                reason=reason,
+                metrics={
+                    "max_drawdown": max_dd,
+                    "consecutive_losses": consecutive,
+                    "profit": profit,
+                },
+                action_taken=action_taken,
+            )
+            await publish(
+                strategy_id,
+                {
+                    "reason": reason,
+                    "fired_at": fired_at,
+                    "metrics_summary": {
+                        "max_drawdown": max_dd,
+                        "consecutive_losses": consecutive,
+                    },
+                },
+            )
+            logger.warning(
+                "KILL SWITCH FIRED sid=%s reason=%s action=%s",
+                strategy_id,
+                reason,
+                action_taken,
+            )
+        except Exception as exc:  # noqa: BLE001 — one strategy must not abort the loop
+            logger.error("kill_switch_poll error sid=%s exc=%s; continuing", strategy_id, exc)
+
+
+async def daily_loss_job(
+    *,
+    list_live_fn: LiveStrategiesFn | None = None,
+    rest_client_factory: RestClientFactory | None = None,
+    already_fired_fn: AlreadyFiredFn | None = None,
+    record_event_fn: RecordEventFn | None = None,
+) -> None:
+    """Daily-loss soft halt (BRD §11). Every 15 min.
+
+    For each stage='live' strategy: read the calendar-day /api/v1/daily bucket
+    (D-3 approximation of rolling-24h); if today's relative profit ≤
+    -DAILY_LOSS_LIMIT_PCT, POST /stopbuy (block new entries, let opens run) and
+    write a kill_switch_events row. NO Redis publish — stopbuy is a soft halt,
+    not a kill. Skip a strategy with a stopbuy in the last 24h.
+    """
+    list_live = list_live_fn or _list_live_strategies
+    factory = rest_client_factory or _default_rest_client
+    already_fired = already_fired_fn or _stopbuy_already_fired_24h
+    record_event = record_event_fn or record_kill_switch_event
+
+    for strategy_id, api_url in await list_live():
+        try:
+            if await already_fired(strategy_id):
+                logger.info(
+                    "daily_loss stopbuy already fired for %s within 24h, skipping", strategy_id
+                )
+                continue
+
+            today_rel = 0.0
+            daily: dict[str, Any] = {}
+            action_taken = _ACTION_STOPBUY
+
+            client = factory(api_url)
+            async with client:
+                # D-3: calendar-day bucket as a deliberate rolling-24h approximation.
+                daily = await client.daily(timescale=1)
+                today_rel = _today_rel_profit(daily)
+                if today_rel > -DAILY_LOSS_LIMIT_PCT:
+                    continue
+                try:
+                    await client.stopbuy()
+                except (FreqtradeAPIError, httpx.HTTPError) as exc:
+                    logger.error("daily_loss /stopbuy unresponsive sid=%s exc=%s", strategy_id, exc)
+                    action_taken = _ACTION_STOPBUY_TIMEOUT
+
+            await record_event(
+                strategy_id=strategy_id,
+                reason=f"daily_loss_{int(DAILY_LOSS_LIMIT_PCT * 100)}pct_exceeded",
+                metrics={"today_rel_profit": today_rel, "daily": daily},
+                action_taken=action_taken,
+            )
+            logger.warning("DAILY LOSS stopbuy sid=%s today_rel=%.4f", strategy_id, today_rel)
+        except Exception as exc:  # noqa: BLE001 — one strategy must not abort the loop
+            logger.error("daily_loss_job error sid=%s exc=%s; continuing", strategy_id, exc)
 
 
 # ════════════════════════════════════════════════════════════════════════
@@ -190,13 +476,22 @@ def register_recurring_jobs(scheduler: AsyncIOScheduler) -> None:
         misfire_grace_time=600,
     )
     scheduler.add_job(
-        _fire_kill_switch_poll,
+        kill_switch_poll_job,
         trigger="interval",
         minutes=KILL_SWITCH_INTERVAL_MINUTES,
         id=KILL_SWITCH_JOB_ID,
         replace_existing=True,
         coalesce=True,
         misfire_grace_time=60,
+    )
+    scheduler.add_job(
+        daily_loss_job,
+        trigger="interval",
+        minutes=DAILY_LOSS_INTERVAL_MINUTES,
+        id=DAILY_LOSS_JOB_ID,
+        replace_existing=True,
+        coalesce=True,
+        misfire_grace_time=120,
     )
 
 

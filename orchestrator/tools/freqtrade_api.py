@@ -84,6 +84,7 @@ class FreqtradeAPI:
     _PATH_PROFIT = "/api/v1/profit"
     _PATH_TRADES = "/api/v1/trades"
     _PATH_PERFORMANCE = "/api/v1/performance"
+    _PATH_DAILY = "/api/v1/daily"
     _PATH_STOPBUY = "/api/v1/stopbuy"
     _PATH_STOP = "/api/v1/stop"
     _PATH_LOGIN = "/api/v1/token/login"
@@ -157,6 +158,19 @@ class FreqtradeAPI:
     async def performance(self) -> list[dict[str, Any]]:
         """``GET /api/v1/performance``. Per-pair aggregate stats."""
         return cast(list[dict[str, Any]], await self._authed_get(self._PATH_PERFORMANCE))
+
+    async def daily(self, timescale: int = 1) -> dict[str, Any]:
+        """``GET /api/v1/daily?timescale=N``. Per-CALENDAR-DAY P&L buckets.
+
+        Used by the daily-loss-limit job (BRD §11). NOTE: this is calendar-day
+        bucketing (resets at UTC midnight), used as a deliberate approximation
+        of the "rolling 24h" spec — see DEFERRED.md D-3. ``timescale`` is the
+        number of days to return; the most recent day is ``data[0]``.
+        """
+        return cast(
+            dict[str, Any],
+            await self._authed_get(self._PATH_DAILY, params={"timescale": timescale}),
+        )
 
     async def stopbuy(self) -> dict[str, Any]:
         """``POST /api/v1/stopbuy`` — graceful: stop new entries, let opens run.

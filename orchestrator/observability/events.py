@@ -133,6 +133,21 @@ async def publish_gate_advanced(thread_id: str, payload: dict[str, Any]) -> None
     await _publish(channel, payload)
 
 
+async def publish_kill(strategy_id: str, payload: dict[str, Any]) -> None:
+    """Publish an out-of-band kill-switch fire to Redis (BRD §1.1 rule 7, §5.6).
+
+    Channel ``ai-trading-agent:kill_switch:<strategy_id>`` (the project
+    convention — multi-tenant prefix + event + id). Best-effort, same
+    swallow-and-log semantics as the gate publishers: the kill switch already
+    fired ``/stop`` and wrote the durable ``kill_switch_events`` row before
+    calling this; a lost Redis notification is recovered when the orchestrator
+    polls. The orchestrator's subscription (8g) sets
+    ``artifacts.kill_switch_event`` and routes the thread to ``live_pause``.
+    """
+    channel = f"{KILL_SWITCH_CHANNEL}:{strategy_id}"
+    await _publish(channel, payload)
+
+
 async def _publish(channel: str, payload: dict[str, Any]) -> None:
     """Shared publisher with the error-swallow semantics described above."""
     client = _redis_client()
@@ -218,6 +233,39 @@ async def record_gate_audit(
         await conn.commit()
         if row is None:
             raise RuntimeError("gate_audits INSERT ... RETURNING id produced no row")
+        return int(row[0])
+    finally:
+        await conn.close()
+
+
+async def record_kill_switch_event(
+    *,
+    strategy_id: str,
+    reason: str,
+    metrics: dict[str, Any],
+    action_taken: str,
+) -> int:
+    """Insert a ``kill_switch_events`` row (BRD §5.8) and return its ``id``.
+
+    Written by the out-of-band kill switch + daily-loss job (Stage 8f) on every
+    fire. ``fired_at`` defaults to ``now()`` on the DB side (the migration's
+    ``DEFAULT``). ``metrics`` is the profit/daily snapshot at fire time.
+    Mirrors :func:`record_gate_audit`'s connection lifecycle.
+    """
+    sql = (
+        "INSERT INTO kill_switch_events (strategy_id, reason, metrics, action_taken) "
+        "VALUES (%s, %s, %s, %s) RETURNING id"
+    )
+    params = (strategy_id, reason, json.dumps(metrics, default=str), action_taken)
+
+    conn = await _connect_app_db()
+    try:
+        async with conn.cursor() as cur:
+            await cur.execute(sql, params)
+            row = await cur.fetchone()
+        await conn.commit()
+        if row is None:
+            raise RuntimeError("kill_switch_events INSERT ... RETURNING id produced no row")
         return int(row[0])
     finally:
         await conn.close()

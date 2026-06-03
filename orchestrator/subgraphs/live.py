@@ -216,7 +216,15 @@ async def _write_live_registry(
     ``COALESCE`` on userdir/api_url preserves an already-set value across the
     multi-call sequence (the pre-spawn upsert passes api_url=None and must not
     null out a later success write on replay).
+
+    ``live_started_at`` (Fork 5d, Stage 8f) is bumped to ``now()`` on EVERY
+    call — it is the kill-switch idempotency anchor: the out-of-band kill
+    switch only suppresses a re-fire if its stop-row was written *after* this
+    timestamp, so a fresh live spawn (new run) un-suppresses the kill. See
+    DEFERRED.md D-5 for the latent pause-resume edge (resume doesn't re-spawn,
+    so it doesn't bump this).
     """
+    live_started_at = datetime.now(UTC)
     conn = await _connect_app_db()
     try:
         async with conn.cursor() as cur:
@@ -225,8 +233,8 @@ async def _write_live_registry(
                 INSERT INTO strategy_registry
                   (strategy_id, thread_id, name, template, stage, pairs,
                    timeframe, freqtrade_userdir, freqtrade_api_url,
-                   failure_reason, started_at, last_updated)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, now(), now())
+                   failure_reason, live_started_at, started_at, last_updated)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, now(), now())
                 ON CONFLICT (strategy_id) DO UPDATE SET
                   stage = EXCLUDED.stage,
                   freqtrade_userdir = COALESCE(
@@ -234,6 +242,7 @@ async def _write_live_registry(
                   freqtrade_api_url = COALESCE(
                       EXCLUDED.freqtrade_api_url, strategy_registry.freqtrade_api_url),
                   failure_reason = EXCLUDED.failure_reason,
+                  live_started_at = EXCLUDED.live_started_at,
                   last_updated = now()
                 """,
                 (
@@ -247,6 +256,7 @@ async def _write_live_registry(
                     userdir,
                     api_url,
                     failure_reason,
+                    live_started_at,
                 ),
             )
         await conn.commit()
