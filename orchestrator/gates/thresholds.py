@@ -108,3 +108,32 @@ MAX_POSITION_CONCENTRATION: float = 0.30
 
 LIVE_CAPITAL_CAP_USD: int = 500
 """SPEC §1 Q3: $500 live cap. Re-tuning gated on SPEC §4.2 criteria."""
+
+# ─── Supervisor capacity (BRD §10, §5.1) ─────────────────────────────────
+# Two distinct axes the Stage 9 supervisor's spawn gate reasons about. Both
+# read from the portfolio snapshot
+# (:func:`orchestrator.supervisor.aget_portfolio_snapshot`): ``active`` for
+# the resource axis, ``live`` for the capital axis.
+
+MAX_CONCURRENT_STRATEGIES: int = 4
+"""Resource axis: max total NON-ARCHIVED threads the supervisor may keep in
+flight at once (research / validation / paper_gate / paper / live_gate /
+live all count). Bounds the number of Freqtrade containers + LLM-run
+threads on the single 8GB/4-core host (BRD §3, §12). The supervisor's
+``aspawn_strategy`` refuses a spawn when
+``aget_portfolio_snapshot()["active"] >= MAX_CONCURRENT_STRATEGIES`` — no
+registry row, no thread kicked. Canonical value table: BRD §10."""
+
+MAX_CONCURRENT_LIVE_STRATEGIES: int = 1
+"""Capital axis: max strategies in ``stage="live"`` at once. SPEC §1 Q3
+locks $500 live capital and ``live_spawn`` caps each strategy's stake to
+the WHOLE ``LIVE_CAPITAL_CAP_USD`` (not a per-strategy slice), so a second
+concurrent live strategy would double real exposure beyond the budget —
+hence 1 for v1 (option (i), operator fork-A sign-off). This is a
+TRANSITION-time constraint (enforced where a paper-graduate is admitted to
+live, reading ``aget_portfolio_snapshot()["live"]``), NOT a spawn-time one:
+research-spawning is gated only by ``MAX_CONCURRENT_STRATEGIES`` so the
+pipeline can keep researching/papering candidates while one runs live.
+Raising N is a one-line edit here, but only after SPEC §4.2's capital-ramp
+criteria AND a stake-subdivision design (today's whole-amount cap would
+over-allocate). Canonical value table: BRD §10."""

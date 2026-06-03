@@ -728,6 +728,10 @@ MAX_POSITION_CONCENTRATION = 0.30   # one pair ≤ 30% of equity
 
 # Live capital
 LIVE_CAPITAL_CAP_USD = 500
+
+# Supervisor capacity (Stage 9)
+MAX_CONCURRENT_STRATEGIES = 4       # supervisor capacity gate (total non-archived); resource-bound on the 8GB/4-core host
+MAX_CONCURRENT_LIVE_STRATEGIES = 1  # capital-bound (SPEC §1 Q3 = $500 whole-amount per live spawn)
 ```
 
 **These values are operator-tunable in `SPEC.md` during Stage 0.** Defaults above stand otherwise. Re-tune after the first 10 strategies have completed a lifecycle.

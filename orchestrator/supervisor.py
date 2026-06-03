@@ -51,7 +51,10 @@ Seam shape (the testable boundary, for the 9c runner to wire):
 
 from __future__ import annotations
 
+import json
 import logging
+import uuid
+from collections.abc import Awaitable, Callable
 from contextvars import ContextVar
 from typing import Any, Literal
 
@@ -59,6 +62,9 @@ import psycopg
 from langchain_core.tools import tool
 from langgraph.store.base import BaseStore
 
+from orchestrator.gates.thresholds import (
+    MAX_CONCURRENT_STRATEGIES,
+)
 from orchestrator.tools.store_queries import aget_failures, aget_wins
 
 logger = logging.getLogger(__name__)
@@ -86,6 +92,41 @@ _current_regime: ContextVar[str] = ContextVar("supervisor.regime", default="unkn
 _current_portfolio: ContextVar[dict[str, Any] | None] = ContextVar(
     "supervisor.portfolio", default=None
 )
+
+# Seam types. Both take the strategy_id and return None; the registry row the
+# supervisor wrote is the handoff (spawn reads pairs/timeframe/template back).
+SpawnThreadFn = Callable[[str], Awaitable[None]]
+StopLiveContainerFn = Callable[[str], Awaitable[None]]
+
+
+# Write-path context (set by the 9c runner alongside the read context above).
+# The write @tool shells read these for the dependencies the agent does NOT
+# supply — the app-DB connection, the compiled graph, and the spawn/stop
+# seams. The plain ``aspawn_strategy`` / ``aretire_strategy`` impls take these
+# explicitly (unit tests inject them directly); the shells bridge from the
+# ContextVar the runner sets. ``None`` → the shell returns a structured
+# "no_runner_context" error rather than raising into the agent loop.
+_current_conn: ContextVar[psycopg.AsyncConnection | None] = ContextVar(
+    "supervisor.conn", default=None
+)
+_current_graph: ContextVar[Any | None] = ContextVar("supervisor.graph", default=None)
+_current_spawn_thread_fn: ContextVar[SpawnThreadFn | None] = ContextVar(
+    "supervisor.spawn_thread_fn", default=None
+)
+_current_stop_live_fn: ContextVar[StopLiveContainerFn | None] = ContextVar(
+    "supervisor.stop_live_fn", default=None
+)
+
+# Default spawn parameters. The supervisor seeds the registry row so the 9c
+# spawn_thread_fn can read pairs/timeframe/template back to build the initial
+# StrategyState (the registry row IS the spawn handoff — the seam stays
+# ``spawn_thread_fn(strategy_id)``). The researcher node overwrites
+# ``template`` in graph state once it chooses one; the registry seed is
+# "pending" until then.
+_DEFAULT_PAIRS: tuple[str, ...] = ("BTC/USDT", "ETH/USDT", "SOL/USDT", "BNB/USDT")  # SPEC §1 Q2
+_DEFAULT_TIMEFRAME = "5m"
+_PENDING_TEMPLATE = "pending"
+_RETIRE_REASON = "retired_by_supervisor"
 
 
 # ════════════════════════════════════════════════════════════════════════
@@ -305,3 +346,235 @@ def get_market_regime() -> str:
 # it now gives those sub-stages a single import point and locks the 9a
 # surface for the tests.
 READ_TOOLS = [view_portfolio, query_store, get_market_regime]
+
+
+# ════════════════════════════════════════════════════════════════════════
+# Write tools — portfolio mutations (Stage 9b)
+# ════════════════════════════════════════════════════════════════════════
+# Plain async impls (unit-tested directly with injected conn/graph/seams);
+# the @tool shells below read the write-path ContextVars and delegate.
+# Caller-owns-commit throughout — the 9c runner batches reconciliation +
+# these writes in one transaction (matches sync_registry_stage's contract).
+
+
+async def aspawn_strategy(
+    spawn_thread_fn: SpawnThreadFn,
+    conn: psycopg.AsyncConnection,
+    *,
+    name: str | None = None,
+    template: str | None = None,
+    pairs: list[str] | None = None,
+    timeframe: str | None = None,
+) -> dict[str, Any]:
+    """Mint a strategy, capacity-gate it, seed the registry, kick the graph.
+
+    Pipeline:
+      1. Read :func:`aget_portfolio_snapshot` for the current ``active`` count.
+      2. **Capacity gate (resource axis):** if
+         ``active >= MAX_CONCURRENT_STRATEGIES``, REFUSE — return
+         ``{"spawned": False, "reason": "capacity_exceeded", ...}`` WITHOUT
+         inserting a registry row or calling ``spawn_thread_fn``. This is the
+         money-relevant guard: a spawn that slips past it consumes a
+         container slot the host can't afford.
+      3. Else: mint a UUID ``strategy_id`` (``thread_id = strategy_<id>``),
+         insert a ``stage="research"`` registry row carrying the spawn
+         parameters (so ``spawn_thread_fn`` can read them back to build the
+         initial StrategyState — the registry row is the handoff), and call
+         ``spawn_thread_fn(strategy_id)`` exactly once.
+
+    The ``MAX_CONCURRENT_LIVE_STRATEGIES`` (capital axis) cap is deliberately
+    NOT enforced here — it binds at the paper→live transition, not at research
+    spawn (see the threshold docstring). Spawning is gated only by the total
+    cap so the pipeline keeps researching/papering while one strategy is live.
+
+    Caller owns the connection + transaction; this function does NOT commit.
+    """
+    snapshot = await aget_portfolio_snapshot(conn)
+    active = snapshot["active"]
+    if active >= MAX_CONCURRENT_STRATEGIES:
+        logger.info(
+            "spawn refused: active=%d >= MAX_CONCURRENT_STRATEGIES=%d",
+            active,
+            MAX_CONCURRENT_STRATEGIES,
+        )
+        return {
+            "spawned": False,
+            "reason": "capacity_exceeded",
+            "active": active,
+            "limit": MAX_CONCURRENT_STRATEGIES,
+        }
+
+    strategy_id = uuid.uuid4().hex
+    thread_id = f"strategy_{strategy_id}"
+    resolved_name = name or f"strategy_{strategy_id[:8]}"
+    resolved_template = template or _PENDING_TEMPLATE
+    resolved_pairs = pairs if pairs is not None else list(_DEFAULT_PAIRS)
+    resolved_timeframe = timeframe or _DEFAULT_TIMEFRAME
+
+    async with conn.cursor() as cur:
+        await cur.execute(
+            """
+            INSERT INTO strategy_registry
+              (strategy_id, thread_id, name, template, stage, pairs,
+               timeframe, started_at, last_updated)
+            VALUES (%s, %s, %s, %s, 'research', %s, %s, now(), now())
+            ON CONFLICT (strategy_id) DO NOTHING
+            """,
+            (
+                strategy_id,
+                thread_id,
+                resolved_name,
+                resolved_template,
+                json.dumps(resolved_pairs),
+                resolved_timeframe,
+            ),
+        )
+
+    # Kick the per-strategy graph. The seam runs the graph from START until
+    # its first interrupt (production impl lands with the 9c runner); tests
+    # inject a recording stub. Called exactly once, AFTER the registry row
+    # exists so spawn_thread_fn can read the spawn parameters back.
+    await spawn_thread_fn(strategy_id)
+
+    logger.info("spawned strategy_id=%s (active was %d)", strategy_id, active)
+    return {
+        "spawned": True,
+        "strategy_id": strategy_id,
+        "thread_id": thread_id,
+        "stage": "research",
+    }
+
+
+async def aretire_strategy(
+    graph: Any,
+    conn: psycopg.AsyncConnection,
+    strategy_id: str,
+    *,
+    stop_live_container_fn: StopLiveContainerFn | None = None,
+) -> dict[str, Any]:
+    """Archive a thread: halt its live container (if any), mark it archived.
+
+    This does NOT route through the graph — it performs the archive EFFECTS
+    directly, then marks the graph state so a later ``aget_state`` reads the
+    thread as archived:
+
+      1. ``aget_state`` the thread. No checkpoint (empty values) → graceful
+         no-op ``{"retired": False, "reason": "unknown_strategy"}`` (mirrors
+         the kill-subscription Fork-2 guard — never mint a phantom checkpoint).
+      2. If the thread is ``stage="live"``, call ``stop_live_container_fn``
+         (best-effort: a stop failure is logged, not raised, so it cannot
+         strand the archive). Default seam =
+         :func:`orchestrator.tools.freqtrade_lifecycle.stop_live_container`.
+      3. ``aupdate_state`` → ``stage="archived"`` + ``failure_reason`` so the
+         thread reads as terminal and the parent graph routes it to END on
+         any subsequent touch.
+      4. UPDATE the ``strategy_registry`` row → ``stage="archived"``.
+
+    Caller owns the connection + transaction; this function does NOT commit.
+
+    NOTE (surfaced in the 9b handoff): the supervisor should retire threads
+    that are PARKED or idle. ``aupdate_state`` on a thread actively executing
+    in a background spawn task (mid-research / mid-Send-fanout in validation)
+    would race that task; retiring such a transient thread is unsupported in
+    v1. The aupdate_state also clears the parent-visible interrupt surface for
+    a nested-subgraph park (the 8h finding) — desired here (the thread is no
+    longer resumable) but it leaves any APScheduler wake job for the thread
+    dangling (it 409s harmlessly on its next fire); wake-job cleanup is a
+    teardown detail deferred to the 9f live-wake work.
+    """
+    thread_id = f"strategy_{strategy_id}"
+    config = {"configurable": {"thread_id": thread_id}}
+
+    snapshot = await graph.aget_state(config)
+    values = getattr(snapshot, "values", None) or {}
+    if not values:
+        logger.warning("retire: thread %s has no checkpoint; no-op (unknown strategy)", thread_id)
+        return {"retired": False, "reason": "unknown_strategy", "strategy_id": strategy_id}
+
+    previous_stage = values.get("stage")
+
+    if previous_stage == "live":
+        stop_fn = stop_live_container_fn
+        if stop_fn is None:
+            # Lazy import keeps supervisor.py import-light; the real stop is
+            # only needed when actually retiring a live thread.
+            from orchestrator.tools.freqtrade_lifecycle import stop_live_container
+
+            stop_fn = stop_live_container
+        try:
+            await stop_fn(strategy_id)
+        except Exception as exc:  # noqa: BLE001 — a stop failure must not strand the archive
+            logger.error(
+                "retire: stop_live_container failed strategy_id=%s exc=%s; "
+                "archiving anyway (operator reviews orphaned container)",
+                strategy_id,
+                exc,
+            )
+
+    await graph.aupdate_state(config, {"stage": "archived", "failure_reason": _RETIRE_REASON})
+
+    async with conn.cursor() as cur:
+        await cur.execute(
+            "UPDATE strategy_registry SET stage = 'archived', "
+            "failure_reason = %s, last_updated = now() WHERE strategy_id = %s",
+            (_RETIRE_REASON, strategy_id),
+        )
+
+    logger.info("retired strategy_id=%s (was %s)", strategy_id, previous_stage)
+    return {"retired": True, "strategy_id": strategy_id, "previous_stage": previous_stage}
+
+
+# ─── Agent-facing write tools (ContextVar readers — wired in 9c) ───────
+
+
+@tool
+async def spawn_strategy(
+    name: str | None = None,
+    template: str | None = None,
+    pairs: list[str] | None = None,
+    timeframe: str | None = None,
+) -> dict[str, Any]:
+    """Spawn a new strategy research thread, if portfolio capacity allows.
+
+    Kicks off a fresh strategy lifecycle at the ``research`` stage. All args
+    are optional hints — leave them unset to let the researcher choose the
+    template and use the default v1 pair universe.
+
+    Returns ``{"spawned": True, "strategy_id", "thread_id", "stage"}`` on
+    success, or ``{"spawned": False, "reason": "capacity_exceeded", "active",
+    "limit"}`` when the portfolio is already at the concurrent-strategy cap —
+    call ``view_portfolio`` first to check headroom. Spawning beyond capacity
+    is refused, not queued.
+    """
+    conn = _current_conn.get()
+    spawn_fn = _current_spawn_thread_fn.get()
+    if conn is None or spawn_fn is None:
+        return {"spawned": False, "reason": "no_runner_context"}
+    return await aspawn_strategy(
+        spawn_fn, conn, name=name, template=template, pairs=pairs, timeframe=timeframe
+    )
+
+
+@tool
+async def retire_strategy(strategy_id: str) -> dict[str, Any]:
+    """Retire (archive) an active strategy thread by its ``strategy_id``.
+
+    Halts the strategy's live Freqtrade container if it is trading, then
+    marks the thread and its registry row ``archived``. Use this to free a
+    capacity slot — e.g. to make room under the concurrent-strategy cap, or
+    to retire a strategy that has stopped earning. Returns ``{"retired":
+    True, "previous_stage"}`` on success, or ``{"retired": False, "reason":
+    "unknown_strategy"}`` if no such thread exists.
+    """
+    conn = _current_conn.get()
+    graph = _current_graph.get()
+    stop_fn = _current_stop_live_fn.get()
+    if conn is None or graph is None:
+        return {"retired": False, "reason": "no_runner_context"}
+    return await aretire_strategy(graph, conn, strategy_id, stop_live_container_fn=stop_fn)
+
+
+# Combined surfaces for the 9c agent assembly. WRITE_TOOLS = the two mutations;
+# SUPERVISOR_TOOLS = the full toolset create_agent receives.
+WRITE_TOOLS = [spawn_strategy, retire_strategy]
+SUPERVISOR_TOOLS = READ_TOOLS + WRITE_TOOLS

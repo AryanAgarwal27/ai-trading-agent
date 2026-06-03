@@ -64,6 +64,9 @@ EXPECTED: dict[str, int | float] = {
     "MAX_POSITION_CONCENTRATION": 0.30,
     # Live capital
     "LIVE_CAPITAL_CAP_USD": 500,
+    # Supervisor capacity (Stage 9)
+    "MAX_CONCURRENT_STRATEGIES": 4,
+    "MAX_CONCURRENT_LIVE_STRATEGIES": 1,
 }
 
 
