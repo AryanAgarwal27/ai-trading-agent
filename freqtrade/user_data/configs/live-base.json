@@ -1,0 +1,107 @@
+{
+    // Stage 8 LIVE-trading base config. render_live_config (Stage 8a) +
+    // spawn_live_container (Stage 8b) deep-merge this with per-strategy
+    // fields (pair_whitelist, strategy class name, stake_amount capped to
+    // LIVE_CAPITAL_CAP_USD, timeframe, freqai block if applicable) and write
+    // the result to freqtrade/user_data/_workers/<strategy_id>/config-live.json.
+    //
+    // BRD §1.1 rule 5: this config carries the LIVE subaccount keys
+    // (${BINANCE_LIVE_API_KEY} / ${BINANCE_LIVE_API_SECRET}), NEVER the paper keys. They are
+    // resolved Python-side at config-write time via secrets.load_live_credentials,
+    // which refuses to return live creds that collide with paper creds.
+    //
+    // Anything in this file is the contract surface. Don't edit per-strategy
+    // values here — pass them through the render/merge.
+    //
+    // Freqtrade accepts // and /* */ comments in JSON configs.
+
+    // REAL MONEY: dry_run is false. This is the one field that turns paper
+    // into live; it is hard-set here and asserted by render_live_config.
+    "dry_run": false,
+    "stake_currency": "USDT",
+    // Conservative default; render_live_config caps the per-strategy override
+    // to LIVE_CAPITAL_CAP_USD (SPEC §1 Q3 = $500). With max_open_trades=4 this
+    // is ~$125/position, comfortably above Binance spot min notional.
+    "stake_amount": 125,
+    "max_open_trades": 4,
+    "tradable_balance_ratio": 0.99,
+    "trading_mode": "spot",
+    "margin_mode": "",
+    "cancel_open_orders_on_exit": true,
+
+    // BRD §11 in-container safety net (MaxDrawdown). The out-of-band
+    // APScheduler kill switch (Stage 8f, every 5 min) is the authoritative
+    // global-drawdown / consecutive-loss enforcer; this is belt-and-braces.
+    "protections": [
+        {
+            "method": "MaxDrawdown",
+            "lookback_period_candles": 288,
+            "trade_limit": 4,
+            "stop_duration_candles": 12,
+            "max_allowed_drawdown": 0.12
+        }
+    ],
+
+    // pair_whitelist intentionally empty; render_live_config fills from
+    // state.pairs. SPEC §1 Q2 universe is BTC/USDT, ETH/USDT, SOL/USDT,
+    // BNB/USDT — the strategy proposal picks a subset.
+    "exchange": {
+        "name": "binance",
+        "key": "${BINANCE_LIVE_API_KEY}",
+        "secret": "${BINANCE_LIVE_API_SECRET}",
+        "ccxt_config": {},
+        "ccxt_async_config": {},
+        "pair_whitelist": [],
+        "pair_blacklist": []
+    },
+
+    "entry_pricing": {
+        "price_side": "same",
+        "use_order_book": true,
+        "order_book_top": 1,
+        "price_last_balance": 0.0,
+        "check_depth_of_market": {
+            "enabled": false,
+            "bids_to_ask_delta": 1
+        }
+    },
+
+    "exit_pricing": {
+        "price_side": "same",
+        "use_order_book": true,
+        "order_book_top": 1
+    },
+
+    "pairlists": [
+        {
+            "method": "StaticPairList"
+        }
+    ],
+
+    "api_server": {
+        "enabled": true,
+        // Listens on 0.0.0.0 INSIDE the container; the host-side mapping in
+        // docker-compose.freqtrade.yml is 127.0.0.1:${LIVE_PORT}:8080, which
+        // is the real network boundary (BRD §15).
+        "listen_ip_address": "0.0.0.0",
+        "listen_port": 8080,
+        "verbosity": "error",
+        "enable_openapi": false,
+        "jwt_secret_key": "${BINANCE_LIVE_API_PASSWORD}",
+        "ws_token": "${BINANCE_LIVE_API_PASSWORD}",
+        "CORS_origins": [],
+        "username": "freqtrader",
+        "password": "${BINANCE_LIVE_API_PASSWORD}"
+    },
+
+    "bot_name": "${STRATEGY_ID}",
+
+    "initial_state": "running",
+    "force_entry_enable": false,
+
+    "internals": {
+        "process_throttle_secs": 5
+    },
+
+    "logfile": "/freqtrade/user_data/logs/freqtrade.log"
+}

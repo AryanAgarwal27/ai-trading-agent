@@ -44,6 +44,8 @@ from typing import Any
 
 import httpx
 
+from orchestrator.gates.thresholds import LIVE_CAPITAL_CAP_USD
+from orchestrator.security.secrets import SecretProvider, load_live_credentials
 from orchestrator.tools.freqtrade_api import FreqtradeAPI, FreqtradeAPIError, FreqtradeCredentials
 
 logger = logging.getLogger(__name__)
@@ -53,6 +55,7 @@ logger = logging.getLogger(__name__)
 
 REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 PAPER_BASE_CONFIG = REPO_ROOT / "freqtrade" / "user_data" / "configs" / "paper-base.json"
+LIVE_BASE_CONFIG = REPO_ROOT / "freqtrade" / "user_data" / "configs" / "live-base.json"
 COMPOSE_FILE = REPO_ROOT / "docker-compose.freqtrade.yml"
 WORKERS_ROOT = REPO_ROOT / "freqtrade" / "user_data" / "_workers"
 
@@ -146,16 +149,21 @@ def next_free_paper_port(used_ports: list[int]) -> int:
 _JSONC_LINE_COMMENT = re.compile(r"//.*")
 
 
-def _load_paper_base_config(path: Path = PAPER_BASE_CONFIG) -> dict[str, Any]:
-    """Load and parse the JSONC paper-base config.
+def _load_jsonc_config(path: Path) -> dict[str, Any]:
+    """Load and parse a JSONC config (strips ``//`` line comments).
 
-    Strips ``//`` line comments per the convention documented in
-    freqtrade/README.md. Block comments are not used; if the file ever
-    starts using them this function will need updating in lockstep.
+    Comment convention is documented in freqtrade/README.md. Block comments
+    are not used; if a config ever starts using them this needs updating in
+    lockstep. Shared by the paper (7a) and live (8a) base-config loaders.
     """
     raw = path.read_text(encoding="utf-8")
     stripped = _JSONC_LINE_COMMENT.sub("", raw)
     return dict(json.loads(stripped))
+
+
+def _load_paper_base_config(path: Path = PAPER_BASE_CONFIG) -> dict[str, Any]:
+    """Load and parse the JSONC paper-base config."""
+    return _load_jsonc_config(path)
 
 
 def _deep_merge(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]:
@@ -230,6 +238,58 @@ def _strategy_class_name(strategy_module_path: Path) -> str:
         f"no IStrategy subclass found in {strategy_module_path}; "
         "Freqtrade's --config strategy field cannot be filled"
     )
+
+
+# ───────────────────────── live config render (Stage 8a) ─────────────────────────
+
+
+def render_live_config(
+    *,
+    strategy_id: str,
+    pair_whitelist: list[str],
+    stake_amount: float,
+    strategy_class: str,
+    port: int,
+    provider: SecretProvider | None = None,
+) -> dict[str, Any]:
+    """Resolve ``live-base.json`` into a per-strategy LIVE config dict.
+
+    The config-write half of the live boundary (Stage 8a). Stage 8b's
+    ``spawn_live_container`` calls this, writes the result to the worker dir,
+    and boots the container; the rendering is split out so it is testable
+    without Docker or a real strategy module.
+
+    BRD §1.1 rule 5 is enforced upstream by
+    :func:`orchestrator.security.secrets.load_live_credentials`, which raises
+    if the live key/secret collide with the paper values. The per-trade
+    ``stake_amount`` is capped to ``LIVE_CAPITAL_CAP_USD`` (SPEC §1 Q3). The
+    resulting config carries ``dry_run: false`` (real money) and the LIVE
+    keys — never the paper keys.
+    """
+    creds = load_live_credentials(provider)
+    base = _load_jsonc_config(LIVE_BASE_CONFIG)
+
+    capped_stake = min(float(stake_amount), float(LIVE_CAPITAL_CAP_USD))
+    overrides: dict[str, Any] = {
+        "stake_amount": capped_stake,
+        "bot_name": strategy_id,
+        "strategy": strategy_class,
+        "exchange": {"pair_whitelist": pair_whitelist},
+    }
+    merged = _deep_merge(base, overrides)
+
+    serialized = json.dumps(merged, indent=4)
+    resolved = _substitute_placeholders(
+        serialized,
+        {
+            "BINANCE_LIVE_API_KEY": creds.key,
+            "BINANCE_LIVE_API_SECRET": creds.secret,
+            "BINANCE_LIVE_API_PASSWORD": creds.api_password,
+            "STRATEGY_ID": strategy_id,
+            "LIVE_PORT": str(port),
+        },
+    )
+    return dict(json.loads(resolved))
 
 
 # ───────────────────────── spawn ─────────────────────────
