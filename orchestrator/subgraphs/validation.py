@@ -290,6 +290,8 @@ def prepare_validation_inputs(state: ValidationState) -> dict[str, Any]:
 
     if not state.get("param_sets"):
         params = state.get("params") or {}
+        # TODO(v2-hyperopt): param_set_id collides across sweep iterations.
+        # When hyperopt sweep lands, derive id as f"{strategy_id}__{param_hash}".
         ps_id = state.get("strategy_id") or "research_proposal"
         updates["param_sets"] = [{"id": ps_id, **params}]
 
