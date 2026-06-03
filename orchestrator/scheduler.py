@@ -366,6 +366,7 @@ async def kill_switch_poll_job(
                 {
                     "reason": reason,
                     "fired_at": fired_at,
+                    "action_taken": action_taken,
                     "metrics_summary": {
                         "max_drawdown": max_dd,
                         "consecutive_losses": consecutive,

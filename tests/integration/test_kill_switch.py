@@ -188,6 +188,10 @@ async def test_kill_switch_drawdown_threshold_fires(monkeypatch: pytest.MonkeyPa
     payload = json.loads(body)
     assert payload["reason"] == "drawdown_12pct_exceeded"
     assert "fired_at" in payload and "metrics_summary" in payload
+    # 8g Change 1: action_taken flows through the publish payload, matching
+    # what was written to kill_switch_events (no subscription-side default).
+    assert payload["action_taken"] == "POST /api/v1/stop"
+    assert payload["action_taken"] == events[0]["action_taken"]
 
 
 async def test_kill_switch_consecutive_losses_threshold_fires(
@@ -251,6 +255,10 @@ async def test_kill_switch_freqtrade_unresponsive_logs_and_continues() -> None:
     )
     stub2 = _StubClient(profit={"max_drawdown": 0.0}, trades={"trades": []}, calls=calls2)
     events, rec = _capture_events()
+    published: list[tuple[str, dict[str, Any]]] = []
+
+    async def _capture_publish(strategy_id: str, payload: dict[str, Any]) -> None:
+        published.append((strategy_id, payload))
 
     async def _two_live() -> list[tuple[str, str]]:
         return [(sid1, "u1"), (sid2, "u2")]
@@ -260,13 +268,18 @@ async def test_kill_switch_freqtrade_unresponsive_logs_and_continues() -> None:
         already_fired_fn=_never_fired,
         rest_client_factory=lambda url: stub1 if url == "u1" else stub2,
         record_event_fn=rec,
-        publish_fn=_noop_publish,
+        publish_fn=_capture_publish,
     )
 
     assert calls1.get("stop") == 1  # attempted, raised
     sid1_events = [e for e in events if e["strategy_id"] == sid1]
     assert sid1_events and sid1_events[0]["action_taken"] == "stop_call_timeout"
     assert not [e for e in events if e["strategy_id"] == sid2], "sid2 had no breach"
+    # 8g Change 1: the non-default action_taken ("stop_call_timeout") flows
+    # through the publish payload too, matching the kill_switch_events row.
+    sid1_published = [p for s, p in published if s == sid1]
+    assert sid1_published and sid1_published[0]["action_taken"] == "stop_call_timeout"
+    assert sid1_published[0]["action_taken"] == sid1_events[0]["action_taken"]
 
 
 # ───────────────────────── daily_loss_job ─────────────────────────

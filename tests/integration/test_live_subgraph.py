@@ -63,9 +63,13 @@ async def cleanup_strategy_ids() -> Any:
         return
     async with await psycopg.AsyncConnection.connect(_dsn()) as conn:
         async with conn.cursor() as cur:
-            # gate_audits FK-references strategy_registry — delete children first
-            # (the live_pause / coordinator-escalation tests write gate_audits rows).
+            # gate_audits + kill_switch_events FK-reference strategy_registry —
+            # delete children first (live_pause / coordinator-escalation write
+            # gate_audits; the 8g kill-guard test writes kill_switch_events).
             await cur.execute("DELETE FROM gate_audits WHERE strategy_id = ANY(%s)", (ids,))
+            await cur.execute(
+                "DELETE FROM kill_switch_events WHERE strategy_id = ANY(%s)", (ids,)
+            )
             await cur.execute("DELETE FROM strategy_registry WHERE strategy_id = ANY(%s)", (ids,))
         await conn.commit()
 
@@ -366,6 +370,8 @@ def _make_graph(
     merge_verdict: Literal["continue", "pause", "fail"] = "continue",
     arbitrate_verdict: Literal["continue", "pause", "fail"] = "fail",
     captured: dict[str, Any] | None = None,
+    start_trading_fn: Any = None,
+    live_started_bump_fn: Any = None,
 ) -> Any:
     """Build the live subgraph with all external effects stubbed.
 
@@ -405,6 +411,8 @@ def _make_graph(
         merge_fn=_merge,
         arbitrate_fn=_arbitrate,
         stop_trading_fn=_stop_trading,
+        start_trading_fn=start_trading_fn,
+        live_started_bump_fn=live_started_bump_fn,
         checkpointer=InMemorySaver(),
     )
 
@@ -568,6 +576,221 @@ async def test_live_pause_resume_reject_routes_to_archive(
     assert "kill it" in snap.values["failure_reason"]
     row = await _latest_gate_audit(sid)
     assert row is not None and row["gate"] == "live_pause" and row["decision"] == "human_reject"
+
+
+# ════════════════════════════════════════════════════════════════════════
+# Stage 8g — kill-switch wake path + D-5 Option A resume
+# ════════════════════════════════════════════════════════════════════════
+
+_KILL_EVENT = {
+    "reason": "drawdown_12pct_exceeded",
+    "fired_at": "2026-06-03T14:32:11Z",
+    "metrics": {"max_drawdown": 0.131, "consecutive_losses": 4},
+    "action_taken": "POST /api/v1/stop",
+}
+
+
+async def _inject_kill_event(
+    graph: Any, cfg: dict[str, Any], event: dict[str, Any]
+) -> None:
+    """Simulate the 8g Redis subscription writing the kill event into state.
+
+    Merges into the existing artifacts (channel has no reducer) so live_spawn's
+    live_started_at survives.
+    """
+    snap = await graph.aget_state(cfg)
+    artifacts = dict(snap.values.get("artifacts") or {})
+    artifacts["kill_switch_event"] = dict(event)
+    await graph.aupdate_state(cfg, {"artifacts": artifacts})
+
+
+async def test_kill_switch_event_routes_live_wait_to_live_pause(
+    cleanup_strategy_ids: list[str],
+) -> None:
+    """artifacts.kill_switch_event set → live_wait wake skips live_evaluate and
+    routes straight to live_pause (no reviewer fan-out)."""
+    sid = f"live-{uuid.uuid4().hex[:8]}"
+    cleanup_strategy_ids.append(sid)
+    graph = _make_graph(captured={"snapshot": _CONTINUE_SNAP})
+    cfg = _cfg(sid)
+
+    await _drain(graph, _initial_state(sid), cfg)  # parks at live_wait
+    await _inject_kill_event(graph, cfg, _KILL_EVENT)
+    await _drain(graph, Command(resume={"wake": True}), cfg)
+
+    payload = await _interrupt_payload(graph, cfg)
+    assert payload is not None and payload["kind"] == "live_pause_review"
+    snap = await graph.aget_state(cfg)
+    reviewer_votes = [
+        v for v in snap.values.get("agent_votes", []) if v["agent"] in REVIEWER_AGENTS
+    ]
+    assert reviewer_votes == [], "live_evaluate fan-out must be skipped on the kill path"
+
+
+async def test_kill_path_live_pause_payload_uses_kill_switch_discriminator(
+    cleanup_strategy_ids: list[str],
+) -> None:
+    """On the kill path the live_pause payload takes the kill-switch branch:
+    path='kill_switch', coordinator=None, reviewer_votes=None, event populated
+    (aligns with test_live_pause_review_kill_switch_path_renders, Stage 6g)."""
+    sid = f"live-{uuid.uuid4().hex[:8]}"
+    cleanup_strategy_ids.append(sid)
+    graph = _make_graph(captured={"snapshot": _CONTINUE_SNAP})
+    cfg = _cfg(sid)
+
+    await _drain(graph, _initial_state(sid), cfg)
+    await _inject_kill_event(graph, cfg, _KILL_EVENT)
+    await _drain(graph, Command(resume={"wake": True}), cfg)
+
+    payload = await _interrupt_payload(graph, cfg)
+    assert payload is not None
+    summary = payload["summary"]
+    assert summary["path"] == "kill_switch"
+    assert summary["coordinator"] is None
+    assert summary["reviewer_votes"] is None
+    assert summary["kill_switch_event"]["reason"] == "drawdown_12pct_exceeded"
+    assert summary["kill_switch_event"]["action_taken"] == "POST /api/v1/stop"
+
+
+async def test_no_kill_switch_event_routes_to_live_evaluate(
+    cleanup_strategy_ids: list[str],
+) -> None:
+    """Regression guard: without a kill event, live_wait wake → live_evaluate
+    (three reviewer votes), and a continue re-arms live_wait — never live_pause."""
+    sid = f"live-{uuid.uuid4().hex[:8]}"
+    cleanup_strategy_ids.append(sid)
+    graph = _make_graph(captured={"snapshot": _CONTINUE_SNAP})
+    cfg = _cfg(sid)
+
+    await _drain(graph, _initial_state(sid), cfg)
+    await _drain(graph, Command(resume={"wake": True}), cfg)
+
+    snap = await graph.aget_state(cfg)
+    reviewer_votes = [
+        v for v in snap.values.get("agent_votes", []) if v["agent"] in REVIEWER_AGENTS
+    ]
+    assert len(reviewer_votes) == 3
+    payload = await _interrupt_payload(graph, cfg)
+    assert payload is not None and payload["kind"] == "live_wait"
+
+
+async def test_live_pause_approve_starts_trading_and_bumps_live_started(
+    cleanup_strategy_ids: list[str],
+) -> None:
+    """D-5 Option A: live_pause approve POSTs /start (resume trading) AND bumps
+    strategy_registry.live_started_at — both must hold."""
+    sid = f"live-{uuid.uuid4().hex[:8]}"
+    cleanup_strategy_ids.append(sid)
+    seen: dict[str, Any] = {"started": False, "bumped": None}
+
+    async def _start(_state: Any) -> None:
+        seen["started"] = True
+
+    async def _bump(strategy_id: str) -> None:
+        seen["bumped"] = strategy_id
+
+    graph = _make_graph(
+        merge_verdict="pause",
+        captured={"snapshot": _PAUSE_SNAP},
+        start_trading_fn=_start,
+        live_started_bump_fn=_bump,
+    )
+    cfg = _cfg(sid)
+
+    await _drain(graph, _initial_state(sid), cfg)
+    await _drain(graph, Command(resume={"wake": True}), cfg)  # parks at live_pause
+    await _drain(graph, Command(resume={"approved": True, "notes": "fixed"}), cfg)
+
+    assert seen["started"] is True, "approve must POST /start to resume trading"
+    assert seen["bumped"] == sid, "approve must bump live_started_at"
+    snap = await graph.aget_state(cfg)
+    assert snap.values["stage"] == "live"
+
+
+async def test_kill_path_approve_clears_event_and_next_wake_evaluates(
+    cleanup_strategy_ids: list[str],
+) -> None:
+    """On the kill path, live_pause approve CLEARS artifacts.kill_switch_event so
+    the next live_wait wake routes to live_evaluate, not back to live_pause."""
+    sid = f"live-{uuid.uuid4().hex[:8]}"
+    cleanup_strategy_ids.append(sid)
+
+    async def _noop_start(_state: Any) -> None:
+        return None
+
+    async def _noop_bump(_sid: str) -> None:
+        return None
+
+    graph = _make_graph(
+        captured={"snapshot": _CONTINUE_SNAP},
+        start_trading_fn=_noop_start,
+        live_started_bump_fn=_noop_bump,
+    )
+    cfg = _cfg(sid)
+
+    await _drain(graph, _initial_state(sid), cfg)  # parks at live_wait
+    await _inject_kill_event(graph, cfg, _KILL_EVENT)
+    await _drain(graph, Command(resume={"wake": True}), cfg)  # parks at live_pause (kill)
+    await _drain(graph, Command(resume={"approved": True, "notes": "ok"}), cfg)  # → live_wait
+
+    snap = await graph.aget_state(cfg)
+    assert snap.values["artifacts"].get("kill_switch_event") is None, (
+        "approve on the kill path must clear kill_switch_event"
+    )
+
+    await _drain(graph, Command(resume={"wake": True}), cfg)  # next wake → live_evaluate
+    snap2 = await graph.aget_state(cfg)
+    reviewer_votes = [
+        v for v in snap2.values.get("agent_votes", []) if v["agent"] in REVIEWER_AGENTS
+    ]
+    assert len(reviewer_votes) == 3, "next wake after kill-approve must evaluate, not re-pause"
+    payload = await _interrupt_payload(graph, cfg)
+    assert payload is not None and payload["kind"] == "live_wait"
+
+
+async def test_kill_guard_unsuppresses_after_live_started_bump(
+    cleanup_strategy_ids: list[str],
+) -> None:
+    """D-5 closure: scheduler._kill_already_fired flips True→False once
+    live_started_at is bumped past the prior kill row's fired_at."""
+    from datetime import timedelta
+
+    from orchestrator.scheduler import _kill_already_fired
+    from orchestrator.subgraphs.live import _default_bump_live_started_at
+
+    sid = f"live-{uuid.uuid4().hex[:8]}"
+    cleanup_strategy_ids.append(sid)
+    now = datetime.now(UTC)
+    t_live_start = now - timedelta(hours=2)
+    t_fired = now - timedelta(hours=1)  # kill fired AFTER the live run began
+
+    async with await psycopg.AsyncConnection.connect(_dsn()) as conn:
+        async with conn.cursor() as cur:
+            await cur.execute(
+                """
+                INSERT INTO strategy_registry
+                  (strategy_id, thread_id, name, template, stage, pairs,
+                   timeframe, live_started_at, started_at, last_updated)
+                VALUES (%s, %s, %s, 'mean_reversion_template', 'live',
+                        '["BTC/USDT"]', '5m', %s, now(), now())
+                """,
+                (sid, f"strategy_{sid}", f"t-{sid}", t_live_start),
+            )
+            await cur.execute(
+                """
+                INSERT INTO kill_switch_events
+                  (strategy_id, fired_at, reason, metrics, action_taken)
+                VALUES (%s, %s, 'drawdown_12pct_exceeded', '{}', 'POST /api/v1/stop')
+                """,
+                (sid, t_fired),
+            )
+        await conn.commit()
+
+    # Before bump: kill fired after live_started_at → suppressed.
+    assert await _kill_already_fired(sid) is True
+    # Bump live_started_at to now() (> t_fired) → un-suppressed.
+    await _default_bump_live_started_at(sid)
+    assert await _kill_already_fired(sid) is False
 
 
 def test_build_live_subgraph_compiles_with_defaults() -> None:

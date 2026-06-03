@@ -51,6 +51,11 @@ from langgraph.types import Command
 from pydantic import BaseModel, Field
 
 from orchestrator.graph import build_per_strategy_graph
+from orchestrator.kill_subscription import (
+    cancel_kill_subscription,
+    make_kill_event_writer,
+    run_kill_subscription,
+)
 from orchestrator.observability.events import (
     _connect_app_db,
     publish_gate_advanced,
@@ -415,6 +420,27 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
                 "graph replaced with smoke-only live_pause_review graph. "
                 "UNSET this env var for any real run."
             )
+
+        # ── Redis kill-switch subscription (Stage 8g, BRD §5.6). ───────
+        # Long-running task: PSUBSCRIBE ai-trading-agent:kill_switch:*, and on
+        # each event write artifacts.kill_switch_event into the matching
+        # thread's state so its next live_wait wake routes to live_pause. Wired
+        # AFTER the smoke-override branches so the writer closes over the FINAL
+        # app.state.graph. The writer is exposed on app.state so a future
+        # /live_pause/resume endpoint or test can reuse it; the task is
+        # cancel-on-shutdown via the AsyncExitStack callback.
+        #
+        # NOTE: kill events written to state via this subscription require a live-wake
+        # mechanism to actually trigger live_pause routing in production. Tests drive
+        # wakes via Command(resume=...) directly. See DEFERRED.md D-6.
+        app.state.kill_event_writer_fn = make_kill_event_writer(app.state.graph)
+        kill_task: asyncio.Task[None] = asyncio.create_task(
+            run_kill_subscription(
+                redis_client, kill_event_writer_fn=app.state.kill_event_writer_fn
+            )
+        )
+        app.state.kill_subscription_task = kill_task
+        stack.push_async_callback(cancel_kill_subscription, kill_task)
 
         yield
 

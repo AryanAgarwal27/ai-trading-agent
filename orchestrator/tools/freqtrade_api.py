@@ -87,6 +87,7 @@ class FreqtradeAPI:
     _PATH_DAILY = "/api/v1/daily"
     _PATH_STOPBUY = "/api/v1/stopbuy"
     _PATH_STOP = "/api/v1/stop"
+    _PATH_START = "/api/v1/start"
     _PATH_LOGIN = "/api/v1/token/login"
     _PATH_REFRESH = "/api/v1/token/refresh"
 
@@ -189,6 +190,19 @@ class FreqtradeAPI:
         learns about the stop via Redis pubsub on its next wake.
         """
         return cast(dict[str, Any], await self._authed_post(self._PATH_STOP))
+
+    async def start(self) -> dict[str, Any]:
+        """``POST /api/v1/start`` — resume trading on a halted instance.
+
+        The inverse of :meth:`stop`. Used by the live subgraph's
+        ``live_pause`` approve path (Stage 8g, DEFERRED.md D-5 Option A): a
+        ``live_pause`` halts the container via ``/stop``; an operator
+        approve-to-continue must restart trading so the strategy actually
+        resumes rather than parking in an approved-but-idle state. Paired
+        with bumping ``strategy_registry.live_started_at`` so the
+        out-of-band kill-switch idempotency guard un-suppresses.
+        """
+        return cast(dict[str, Any], await self._authed_post(self._PATH_START))
 
     # ────────────────────────── internals ──────────────────────────
 

@@ -101,6 +101,13 @@ BuildSnapshotFn = Callable[[Mapping[str, Any]], Awaitable[dict[str, Any]]]
 # must leave the container queryable/resumable for the next wake (BRD §5.6).
 StopTradingFn = Callable[[Mapping[str, Any]], Awaitable[None]]
 StopContainerFn = Callable[[str], Awaitable[None]]
+# 8g (DEFERRED.md D-5 Option A). start_trading_fn POSTs /api/v1/start to resume
+# a halted container on live_pause-approve; live_started_bump_fn bumps
+# strategy_registry.live_started_at to un-suppress the kill-switch idempotency
+# guard for the fresh continue (without the bump, the pre-pause kill row would
+# permanently suppress the kill switch — a safety hole).
+StartTradingFn = Callable[[Mapping[str, Any]], Awaitable[None]]
+LiveStartedBumpFn = Callable[[str], Awaitable[None]]
 
 # BaseCheckpointSaver is generic on its serializer; accept any concrete saver
 # (InMemorySaver for tests, AsyncPostgresSaver for production) — mirror paper.py.
@@ -258,6 +265,29 @@ async def _write_live_registry(
                     failure_reason,
                     live_started_at,
                 ),
+            )
+        await conn.commit()
+    finally:
+        await conn.close()
+
+
+async def _default_bump_live_started_at(strategy_id: str) -> None:
+    """Default ``live_started_bump_fn`` — bump the kill-switch idempotency anchor.
+
+    Sets ``strategy_registry.live_started_at = now()`` so the out-of-band
+    kill-switch guard (``kse.fired_at > sr.live_started_at`` in
+    scheduler.py) treats any pre-pause kill row as stale and re-fires on a
+    fresh breach. Called on ``live_pause`` approve-continue (Stage 8g, the
+    sub-stage that wires ``/start``-on-resume — DEFERRED.md D-5 closure
+    point). live_spawn bumps the same column on first spawn.
+    """
+    conn = await _connect_app_db()
+    try:
+        async with conn.cursor() as cur:
+            await cur.execute(
+                "UPDATE strategy_registry SET live_started_at = now(), "
+                "last_updated = now() WHERE strategy_id = %s",
+                (strategy_id,),
             )
         await conn.commit()
     finally:
@@ -676,15 +706,18 @@ def _fan_out_reviewers(state: LiveState) -> list[Send]:
 
 
 def live_wait(state: LiveState) -> dict[str, Any]:
-    """Park the live thread until a wake (BRD §5.6); resume → live_evaluate.
+    """Park the live thread until a wake (BRD §5.6); resume routes conditionally.
 
     Wakes via (a) the APScheduler wake job calling the FastAPI /wake endpoint,
-    or (b) a kill-switch publish. KILL-SWITCH WAKE PATH: SEE 8f — Stage 8f wires
-    the out-of-band kill switch, which publishes a kill event and (8f's change)
-    makes this resume route conditionally to live_pause when
-    ``artifacts.kill_switch_event`` is set. For 8e there is no kill-switch
-    wiring: resume always proceeds to live_evaluate (plain edge below). Bare
-    interrupt → no side effects on replay.
+    or (b) the next wake after a kill-switch publish. KILL-SWITCH WAKE PATH
+    (8g): the out-of-band kill switch (8f) publishes a kill event; the Redis
+    subscription (main.py lifespan, 8g) sets ``artifacts.kill_switch_event``
+    on this thread's state. On the next wake, :func:`_route_after_live_wait`
+    sees the event and routes straight to ``live_pause`` (skipping
+    live_evaluate), where ``build_interrupt_payload`` takes the kill-switch
+    branch (no coordinator vote — BRD §5.6). With no event set, resume
+    proceeds to live_evaluate as normal. Bare interrupt → no side effects on
+    replay.
     """
     interrupt({"kind": "live_wait", "strategy_id": state.get("strategy_id")})
     return {}
@@ -712,6 +745,27 @@ async def _default_live_stop_trading(state: Mapping[str, Any]) -> None:
         await client.stop()
 
 
+async def _default_live_start_trading(state: Mapping[str, Any]) -> None:
+    """Default ``start_trading_fn`` — POST /api/v1/start (resume a halted bot).
+
+    The inverse of :func:`_default_live_stop_trading`. Called on
+    ``live_pause`` approve-continue so the strategy actually resumes trading
+    rather than parking in an approved-but-idle state (DEFERRED.md D-5
+    Option A). Best-effort — a /start failure is logged, not raised; the
+    operator's approve decision still routes the thread to live_wait.
+    """
+    api_url = state.get("freqtrade_api_url")
+    if not api_url:
+        return
+    password = os.environ.get("BINANCE_LIVE_API_PASSWORD", "")
+    if not password:
+        logger.warning("BINANCE_LIVE_API_PASSWORD unset; skipping live /start")
+        return
+    creds = FreqtradeCredentials(username="freqtrader", password=password)
+    async with FreqtradeAPI(base_url=api_url, credentials=creds, timeout_s=5.0) as client:
+        await client.start()
+
+
 def _project_reviewer_gate_decisions(state: Mapping[str, Any]) -> dict[str, Any]:
     """Project the latest reviewer votes into ``gate_decisions`` for the payload.
 
@@ -736,23 +790,38 @@ async def live_pause(
     config: RunnableConfig | None = None,
     *,
     stop_trading_fn: StopTradingFn | None = None,
+    start_trading_fn: StartTradingFn | None = None,
+    live_started_bump_fn: LiveStartedBumpFn | None = None,
     gate_audit_writer_fn: GateAuditWriterFn | None = None,
 ) -> Command[Any]:
     """Halt the live bot, surface live_pause_review HITL, route on resume.
 
     POST /api/v1/stop (best-effort halt; container survives), then
-    interrupt() with the SPEC §4.1 live_pause_review payload (coordinator
-    branch; the kill-switch branch is taken automatically by
-    build_interrupt_payload when 8f sets artifacts.kill_switch_event). On
-    resume: approve → live_wait (re-arm), reject → archive. A gate_audits row
-    (gate='live_pause', human_approve/human_reject) is written on resume.
+    interrupt() with the SPEC §4.1 live_pause_review payload. The payload's
+    coordinator-vs-kill-switch discriminator is owned entirely by
+    build_interrupt_payload: when ``artifacts.kill_switch_event`` is set (8g
+    Redis subscription routed us here from live_wait), it takes the
+    kill-switch branch (no coordinator rationale — BRD §5.6 out-of-band);
+    otherwise the coordinator branch. We never branch the payload shape inline.
+
+    On resume (DEFERRED.md D-5 Option A — 8g wires /start-on-resume):
+      - approve → POST /api/v1/start (resume trading), bump
+        ``strategy_registry.live_started_at`` (un-suppress the kill-switch
+        idempotency guard for the fresh continue), CLEAR
+        ``artifacts.kill_switch_event`` (so the next live_wait wake routes to
+        live_evaluate, not back here), then → live_wait (re-arm).
+      - reject → archive (no /start, no bump).
+    A gate_audits row (gate='live_pause', human_approve/human_reject) is
+    written on resume.
 
     NOTE (diverges from paper's gate pattern): paper_gate/live_gate do NOT write
     gate_audits in-node — the FastAPI /approve endpoint does. live_pause writes
     it in-node so the subgraph's HITL decision is durably recorded without a
-    web layer (a dedicated live_pause-resume endpoint is 8g/dashboard territory).
+    web layer (a dedicated live_pause-resume endpoint is dashboard territory).
     """
     stop_fn = stop_trading_fn or _default_live_stop_trading
+    start_fn = start_trading_fn or _default_live_start_trading
+    bump_fn = live_started_bump_fn or _default_bump_live_started_at
     write_audit = gate_audit_writer_fn or record_gate_audit
     sid = state["strategy_id"]
     thread_id = _thread_id_for(config, sid) if config is not None else f"strategy_{sid}"
@@ -809,13 +878,39 @@ async def live_pause(
     )
 
     if approved:
+        # D-5 Option A: resume trading + bump the kill-switch idempotency
+        # anchor + clear the kill-switch event. Both side effects are
+        # best-effort (a /start or bump failure must not strand the operator's
+        # approve decision), but logged loud — a failed bump leaves the kill
+        # guard suppressed for the restarted strategy (the D-5 hole, mitigated
+        # by the loud log until a durable retry lands).
+        try:
+            await start_fn(state)
+        except Exception as exc:  # noqa: BLE001 — a start failure must not strand HITL
+            logger.error("live_pause /start failed strategy_id=%s exc=%s", sid, exc)
+        # Best-effort: a DB-write failure here re-opens D-5's hole for THIS approve
+        # but won't strand the operator. Durable retry is a Stage-11 hardening item.
+        try:
+            await bump_fn(sid)
+        except Exception as exc:  # noqa: BLE001 — a bump failure must not strand HITL
+            logger.error(
+                "live_pause live_started_at bump failed strategy_id=%s exc=%s "
+                "(kill guard may stay suppressed for this continue — D-5)",
+                sid,
+                exc,
+            )
+        # Clear the kill-switch event so the next live_wait wake proceeds to
+        # live_evaluate rather than looping straight back to live_pause.
+        cleared_artifacts = dict(state.get("artifacts") or {})
+        cleared_artifacts["kill_switch_event"] = None
         return Command(
             goto="live_wait",
             update={
+                "artifacts": cleared_artifacts,
                 "gate_decisions": {
                     **existing,
                     "live_pause": {"approved": True, "notes": notes, "by": "human"},
-                }
+                },
             },
         )
     return Command(
@@ -873,6 +968,19 @@ def _route_after_live_spawn(state: LiveState) -> Literal["live_wait", "archive"]
     return "archive" if state.get("stage") == "archived" else "live_wait"
 
 
+def _route_after_live_wait(state: LiveState) -> Literal["live_evaluate", "live_pause"]:
+    """Route live_wait's resume (Stage 8g kill-switch wake path, BRD §5.6).
+
+    If the Redis kill subscription has set ``artifacts.kill_switch_event`` on
+    this thread, the out-of-band kill switch already stopped the container —
+    route STRAIGHT to live_pause (skip the reviewer fan-out: there is nothing
+    to evaluate on a halted bot, and BRD §5.6 mandates no coordinator vote on
+    the kill path). Otherwise proceed to live_evaluate as a normal wake.
+    """
+    artifacts = state.get("artifacts") or {}
+    return "live_pause" if artifacts.get("kill_switch_event") else "live_evaluate"
+
+
 def build_live_subgraph(
     *,
     spawn_live_container_fn: SpawnLiveContainerFn | None = None,
@@ -886,6 +994,8 @@ def build_live_subgraph(
     arbitrate_fn: ArbitrateFn | None = None,
     gate_audit_writer_fn: GateAuditWriterFn | None = None,
     stop_trading_fn: StopTradingFn | None = None,
+    start_trading_fn: StartTradingFn | None = None,
+    live_started_bump_fn: LiveStartedBumpFn | None = None,
     checkpointer: CheckpointSaver | None = None,
 ) -> CompiledStateGraph[LiveState, LiveState, LiveState, LiveState]:
     """Compile the Stage 8e live subgraph (BRD §5.6).
@@ -895,7 +1005,10 @@ def build_live_subgraph(
         START → live_spawn ──fail──> archive ──> END
                     │ stage="live"
                     ▼
-                live_wait ──(wake / resume)──> live_evaluate
+                live_wait ──kill_switch_event?──> live_pause   (8g)
+                    │ else (normal wake)
+                    ▼
+                live_evaluate
                     ▲                               │ Send×3
                     │                ┌──────────────┼──────────────┐
                     │                ▼              ▼              ▼
@@ -952,6 +1065,8 @@ def build_live_subgraph(
             state,
             config,
             stop_trading_fn=stop_trading_fn,
+            start_trading_fn=start_trading_fn,
+            live_started_bump_fn=live_started_bump_fn,
             gate_audit_writer_fn=gate_audit_writer_fn,
         )
 
@@ -971,7 +1086,11 @@ def build_live_subgraph(
 
     builder.add_edge(START, "live_spawn")
     builder.add_conditional_edges("live_spawn", _route_after_live_spawn, ["live_wait", "archive"])
-    builder.add_edge("live_wait", "live_evaluate")
+    # 8g: live_wait resume routes conditionally — kill-switch event → live_pause
+    # (skip the reviewer fan-out), otherwise → live_evaluate (normal wake).
+    builder.add_conditional_edges(
+        "live_wait", _route_after_live_wait, ["live_evaluate", "live_pause"]
+    )
     builder.add_conditional_edges(
         "live_evaluate",
         _fan_out_reviewers,

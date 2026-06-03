@@ -92,9 +92,90 @@ def _research_passthrough(_state: StrategyState) -> dict[str, Any]:
     return {}
 
 
-def _build_stub_composed_graph(saver: Any, *, monitor_decision: str = "advance") -> Any:
+_LIVE_CONTINUE_SNAP = {
+    "max_drawdown": 0.0,
+    "daily_pnl_pct": 0.0,
+    "consecutive_losses": 0,
+    "live_returns": [0.01, 0.02],
+    "paper_returns": [0.01, 0.02],
+    "current_regime": "mid_vol_up",
+    "approval_regime": "mid_vol_up",
+}
+# risk_check -> pause (drawdown), regime_check -> pause (regime shift): 2 pause
+# majority -> coordinator pause -> live_pause.
+_LIVE_PAUSE_SNAP = {
+    "max_drawdown": 0.15,
+    "daily_pnl_pct": 0.0,
+    "consecutive_losses": 0,
+    "live_returns": [],
+    "paper_returns": [],
+    "current_regime": "high_vol_down",
+    "approval_regime": "low_vol_up",
+}
+
+
+def _stub_live_subgraph(*, snapshot: dict[str, Any] | None = None) -> Any:
+    """Real live subgraph (8e topology) with every external effect stubbed.
+
+    registry_writer_fn keeps its real default (real Postgres registry row from
+    live_spawn — the parent tests run against real PG and clean up by id). All
+    Docker / LLM / REST / start-trading / bump effects are stubbed so the
+    composed parent flows through live_spawn → live_wait without infra.
+    """
+    from orchestrator.agents.coordinator import LiveVerdict
+    from orchestrator.subgraphs.live import build_live_subgraph
+
+    snap = snapshot or _LIVE_CONTINUE_SNAP
+
+    async def _spawn(*, port: int, **_k: Any) -> str:
+        return f"http://127.0.0.1:{port}"
+
+    async def _stop_container(_sid: str) -> None:
+        return None
+
+    async def _rationale(_facts: dict[str, Any]) -> str:
+        return "stub rationale"
+
+    async def _review(_c: dict[str, Any]) -> Any:
+        return LiveVerdict(verdict="pause", rationale="perf", confidence=0.8)
+
+    async def _merge(_v: Any) -> Any:
+        return LiveVerdict(verdict="pause", rationale="merge", confidence=0.7)
+
+    async def _arbitrate(_v: Any, _m: Any) -> Any:
+        return LiveVerdict(verdict="fail", rationale="arb", confidence=0.9)
+
+    async def _noop_state(_s: Any) -> None:
+        return None
+
+    async def _noop_bump(_sid: str) -> None:
+        return None
+
+    async def _snapshot_fn(_s: Any) -> dict[str, Any]:
+        return dict(snap)
+
+    return build_live_subgraph(
+        spawn_live_container_fn=_spawn,
+        stop_live_container_fn=_stop_container,
+        build_snapshot_fn=_snapshot_fn,
+        rationale_fn=_rationale,
+        review_fn=_review,
+        merge_fn=_merge,
+        arbitrate_fn=_arbitrate,
+        stop_trading_fn=_noop_state,
+        start_trading_fn=_noop_state,
+        live_started_bump_fn=_noop_bump,
+    )
+
+
+def _build_stub_composed_graph(
+    saver: Any,
+    *,
+    monitor_decision: str = "advance",
+    live_snapshot: dict[str, Any] | None = None,
+) -> Any:
     """Compose the parent with stub research + paper_gate-only validation
-    + real-paper-subgraph-with-stubbed-leaves."""
+    + real-paper-subgraph-with-stubbed-leaves + stubbed-live-subgraph (8g)."""
     rb: StateGraph[StrategyState, StrategyState, StrategyState, StrategyState] = StateGraph(
         StrategyState
     )
@@ -124,6 +205,7 @@ def _build_stub_composed_graph(saver: Any, *, monitor_decision: str = "advance")
         research_subgraph=research,
         validation_subgraph=validation,
         paper_subgraph=paper,
+        live_subgraph=_stub_live_subgraph(snapshot=live_snapshot),
     )
 
 
@@ -159,6 +241,12 @@ async def cleanup_strategy_ids() -> Any:
         return
     async with await psycopg.AsyncConnection.connect(_dsn()) as conn:
         async with conn.cursor() as cur:
+            # Children first (FK to strategy_registry): live_pause / coordinator
+            # may write gate_audits; the 8g live path may write kill_switch_events.
+            await cur.execute("DELETE FROM gate_audits WHERE strategy_id = ANY(%s)", (ids,))
+            await cur.execute(
+                "DELETE FROM kill_switch_events WHERE strategy_id = ANY(%s)", (ids,)
+            )
             await cur.execute(
                 "DELETE FROM strategy_registry WHERE strategy_id = ANY(%s)", (ids,)
             )
@@ -206,11 +294,61 @@ async def test_full_pipeline_research_to_live(
     await autoresume_for_test(graph, thread_id, {"wake": True})
     assert await _parked_kind(graph, config) == "live_gate"
 
-    # Approve live_gate → stage="live" → END.
+    # Approve live_gate → stage="live" → parent routes into live_subgraph →
+    # live_spawn runs → parks at live_wait (8g paper→live handoff).
     await hitl_autoapprove(graph, thread_id)
     final = await graph.aget_state(config)
     assert final.values["stage"] == "live"
     assert final.values["gate_decisions"]["live"]["approved"] is True
+    assert await _parked_kind(graph, config) == "live_wait", (
+        "8g: after live_gate approve the parent must route into the live "
+        "subgraph and park at live_wait (live_spawn ran)"
+    )
+    # live_spawn wrote the registry row at stage='live'.
+    async with await psycopg.AsyncConnection.connect(_dsn()) as conn:
+        async with conn.cursor() as cur:
+            await cur.execute(
+                "SELECT stage FROM strategy_registry WHERE strategy_id = %s", (strategy_id,)
+            )
+            row = await cur.fetchone()
+    assert row is not None and row[0] == "live", "live_spawn must register stage='live'"
+
+
+async def test_live_interrupts_propagate_to_parent(
+    cleanup_strategy_ids: list[str], hitl_autoapprove: Any
+) -> None:
+    """8g: the live subgraph's live_wait + live_pause interrupts surface to the
+    parent graph (mirrors 7g's nested-interrupt-surfacing lesson for paper).
+
+    A pause-inducing snapshot drives coordinator→pause→live_pause so BOTH live
+    interrupts are exercised through the composed parent.
+    """
+    strategy_id = f"pg-{uuid.uuid4().hex[:8]}"
+    cleanup_strategy_ids.append(strategy_id)
+    thread_id = f"strategy_{strategy_id}"
+
+    graph = _build_stub_composed_graph(
+        InMemorySaver(), monitor_decision="advance", live_snapshot=_LIVE_PAUSE_SNAP
+    )
+    config = {"configurable": {"thread_id": thread_id}}
+
+    async for _ in graph.astream(_initial_state(strategy_id), config=config):
+        pass
+    await hitl_autoapprove(graph, thread_id)  # paper_gate
+    await autoresume_for_test(graph, thread_id, {"wake": True})  # paper_wait → live_gate
+    await hitl_autoapprove(graph, thread_id)  # live_gate → live_subgraph
+
+    # 1. live_wait interrupt surfaces through the parent composition.
+    assert await _parked_kind(graph, config) == "live_wait", (
+        "live_wait interrupt did not surface to the parent"
+    )
+
+    # 2. Wake → live_evaluate → coordinator(pause) → live_pause interrupt
+    # surfaces through the parent composition.
+    await autoresume_for_test(graph, thread_id, {"wake": True})
+    assert await _parked_kind(graph, config) == "live_pause_review", (
+        "live_pause interrupt did not surface to the parent"
+    )
 
 
 # ───────────────────────── test 2: /threads visibility (6f loop) ─────────
