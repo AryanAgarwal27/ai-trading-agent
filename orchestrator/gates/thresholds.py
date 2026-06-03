@@ -21,6 +21,14 @@ from __future__ import annotations
 MIN_TRADES_IS: int = 150
 """Minimum total IS trades across all folds. Fewer = statistically uninformative."""
 
+MIN_TRADES_PER_FOLD: int = 5
+"""Minimum trades in ANY single fold. Guards Flag 1 (Stage 7h): if the
+default walk-forward window falls outside the cached OHLCV range, early
+folds can produce 0 trades silently — masked by a fat aggregate
+``trades`` count. A zero-trade fold means the strategy was never tested
+on that slice; failing the gate is safer than promoting on incomplete
+evidence."""
+
 MIN_OOS_TRADES: int = 30
 """Minimum total OOS trades across all folds. Below this, OOS Sharpe is noise."""
 

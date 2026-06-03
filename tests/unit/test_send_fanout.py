@@ -33,13 +33,38 @@ from langchain_core.runnables import RunnableConfig
 from langgraph.checkpoint.memory import InMemorySaver
 from langgraph.types import Send
 
+from orchestrator.gates import thresholds
 from orchestrator.state import BacktestResult
 from orchestrator.subgraphs.validation import (
     ValidationState,
+    aggregate_results,
     build_validation_subgraph,
+    gate_backtest,
     plan_backtests,
     prepare_validation_inputs,
 )
+
+
+def _healthy_summary(**overrides: Any) -> dict[str, Any]:
+    """A backtest summary dict that clears every BRD §10 threshold.
+
+    Used as the base for gate_backtest tests; overrides plug in the
+    single field under test.
+    """
+    base: dict[str, Any] = {
+        "param_set_id": "ps_1",
+        "fold_count": 6,
+        "sharpe_is": 2.0,
+        "min_sharpe_per_fold": 0.5,
+        "profit_factor": 2.0,
+        "max_dd": 0.05,
+        "trades": 300,
+        "trades_per_fold": [50, 50, 50, 50, 50, 50],
+        "oos_sharpe_mean": 0.0,
+        "oos_ratio": 0.0,
+    }
+    base.update(overrides)
+    return base
 
 
 def _make_param_sets(n: int) -> list[dict[str, Any]]:
@@ -211,3 +236,119 @@ def test_prepare_validation_inputs_falls_back_to_generated_strategy_path() -> No
         }
     )
     assert updates["strategy_path"] == "/tmp/gen.py"
+
+
+# ─── aggregate_results + gate_backtest unit tests (Q1 fix, Stage 7h) ───
+
+
+def _bt_result(
+    *, param_set_id: str, fold_id: str, trades: int, is_sharpe: float = 1.6
+) -> BacktestResult:
+    return BacktestResult(
+        param_set_id=param_set_id,
+        pair="BTC/USDT",
+        timeframe="5m",
+        fold_id=fold_id,
+        is_sharpe=is_sharpe,
+        oos_sharpe=0.0,
+        profit_factor=1.6,
+        max_dd=0.1,
+        trades=trades,
+        raw_zip_path="",
+    )
+
+
+def test_aggregate_results_persists_trades_per_fold_ordered_by_fold() -> None:
+    """aggregate_results writes per-fold trade counts AND sorts by fold_id.
+
+    Send fan-out arrival order is not fold order; the operator reading
+    trades_per_fold expects fold_1, fold_2, …, fold_N. The aggregate
+    field ``trades`` is preserved for back-compat (the existing IS
+    threshold still keys off it).
+    """
+    # Build results in NON-fold order to exercise the sort.
+    pairs: list[tuple[str, int]] = [
+        ("fold_3", 60), ("fold_1", 0), ("fold_6", 50),
+        ("fold_4", 70), ("fold_2", 55), ("fold_5", 65),
+    ]
+    results = [_bt_result(param_set_id="ps_1", fold_id=fid, trades=t) for fid, t in pairs]
+
+    update = aggregate_results({"backtest_results": results, "gate_decisions": {}})
+
+    summary = update["gate_decisions"]["backtest"]["param_sets"][0]
+    assert summary["param_set_id"] == "ps_1"
+    assert summary["fold_count"] == 6
+    # Ordered fold_1 … fold_6: 0, 55, 60, 70, 65, 50.
+    assert summary["trades_per_fold"] == [0, 55, 60, 70, 65, 50]
+    # Aggregate kept for back-compat with MIN_TRADES_IS.
+    assert summary["trades"] == sum(summary["trades_per_fold"])
+
+
+def test_gate_backtest_fails_on_zero_trade_fold() -> None:
+    """Q1 fix: a single 0-trade fold archives the strategy, even if the
+    aggregate ``trades`` total clears MIN_TRADES_IS. The failure_reason
+    carries the recognizable ``insufficient_trades_per_fold`` token.
+    """
+    state: ValidationState = {
+        "gate_decisions": {
+            "backtest": {
+                "param_sets": [
+                    _healthy_summary(
+                        trades_per_fold=[0, 60, 60, 60, 60, 60],
+                        trades=300,  # clears MIN_TRADES_IS easily
+                    )
+                ],
+                "best_param_set_id": "ps_1",
+            }
+        }
+    }
+
+    cmd = gate_backtest(state)
+
+    assert cmd.goto == "archive"
+    assert cmd.update["stage"] == "archived"
+    failure_reason = cmd.update["failure_reason"]
+    assert failure_reason.startswith("backtest_gate:")
+    assert "insufficient_trades_per_fold" in failure_reason, (
+        f"failure_reason must carry the recognizable token; got {failure_reason!r}"
+    )
+    assert "min=0" in failure_reason
+    assert f"MIN_TRADES_PER_FOLD={thresholds.MIN_TRADES_PER_FOLD}" in failure_reason
+    # The per-fold list is in the failure for operator diagnostics.
+    assert "per_fold=[0, 60, 60, 60, 60, 60]" in failure_reason
+
+    failures = cmd.update["gate_decisions"]["backtest"]["failures"]
+    assert any("insufficient_trades_per_fold" in f for f in failures)
+
+
+def test_gate_backtest_passes_when_all_folds_meet_per_fold_min() -> None:
+    """Healthy per-fold counts → gate passes, routes to plan_robustness."""
+    state: ValidationState = {
+        "gate_decisions": {
+            "backtest": {
+                "param_sets": [_healthy_summary()],
+                "best_param_set_id": "ps_1",
+            }
+        }
+    }
+    cmd = gate_backtest(state)
+    assert cmd.goto == "plan_robustness"
+    assert cmd.update["gate_decisions"]["backtest"]["passed"] is True
+    assert cmd.update["gate_decisions"]["backtest"]["failures"] == []
+
+
+def test_gate_backtest_handles_missing_trades_per_fold_field() -> None:
+    """Defensive: a summary lacking trades_per_fold (e.g. an old payload
+    before this fix) shouldn't crash the gate. The aggregate trades
+    check still fires; the per-fold check is skipped silently.
+    """
+    state: ValidationState = {
+        "gate_decisions": {
+            "backtest": {
+                "param_sets": [_healthy_summary(trades_per_fold=None)],
+                "best_param_set_id": "ps_1",
+            }
+        }
+    }
+    cmd = gate_backtest(state)
+    assert cmd.goto == "plan_robustness"

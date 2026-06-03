@@ -338,6 +338,21 @@ def aggregate_results(state: ValidationState) -> dict[str, Any]:
 
     summaries: list[dict[str, Any]] = []
     for ps_id, rs in by_ps.items():
+        # Send fan-out arrival order is NOT fold order. Sort by the
+        # numeric suffix of fold_id so trades_per_fold (and the parallel
+        # lists below) align with fold 1, 2, …, N as the operator reads
+        # them. Falls back to lex order if a fold_id lacks a "_<int>"
+        # tail (defensive — test fixtures sometimes use "fold_0").
+        def _fold_key(r: BacktestResult) -> tuple[int, str]:
+            fid = r["fold_id"]
+            tail = fid.rsplit("_", 1)[-1]
+            try:
+                return (int(tail), fid)
+            except ValueError:
+                return (10**9, fid)
+
+        rs = sorted(rs, key=_fold_key)
+
         is_sharpes = [r["is_sharpe"] for r in rs]
         profit_factors = [r["profit_factor"] for r in rs]
         max_dds = [r["max_dd"] for r in rs]
@@ -355,7 +370,13 @@ def aggregate_results(state: ValidationState) -> dict[str, Any]:
                 "min_sharpe_per_fold": min(is_sharpes) if is_sharpes else 0.0,
                 "profit_factor": statistics.fmean(profit_factors) if profit_factors else 0.0,
                 "max_dd": max(max_dds) if max_dds else 0.0,
+                # Aggregate kept for back-compat; per-fold list added so a
+                # silent-zero early fold (Flag 1 / Stage 7h) is visible to
+                # gate_backtest AND the paper_gate dashboard, not masked
+                # by a fat aggregate (e.g. [0,0,0,60,60,60] sums to 180
+                # which looks fine).
                 "trades": sum(trade_counts),
+                "trades_per_fold": trade_counts,
                 "oos_sharpe_mean": oos_sharpe_mean,
                 "oos_ratio": (
                     oos_sharpe_mean / sharpe_is_mean
@@ -443,6 +464,18 @@ def gate_backtest(
     failures: list[str] = []
     if best["trades"] < thresholds.MIN_TRADES_IS:
         failures.append(f"trades={best['trades']} < MIN_TRADES_IS={thresholds.MIN_TRADES_IS}")
+    # Per-fold minimum (Flag 1 / Stage 7h). A 0-trade fold means the
+    # walk-forward window fell outside the cached OHLCV — the strategy
+    # was never tested on that slice. Failing loud here keeps the
+    # aggregate `trades` count from masking it (e.g. [0,0,0,60,60,60]
+    # sums to 180 which clears MIN_TRADES_IS).
+    trades_per_fold = best.get("trades_per_fold") or []
+    if trades_per_fold and min(trades_per_fold) < thresholds.MIN_TRADES_PER_FOLD:
+        failures.append(
+            f"insufficient_trades_per_fold: min={min(trades_per_fold)} < "
+            f"MIN_TRADES_PER_FOLD={thresholds.MIN_TRADES_PER_FOLD}; "
+            f"per_fold={trades_per_fold}"
+        )
     if best["sharpe_is"] < thresholds.MIN_SHARPE_IS:
         failures.append(
             f"sharpe_is={best['sharpe_is']:.3f} < MIN_SHARPE_IS={thresholds.MIN_SHARPE_IS}"

@@ -696,6 +696,7 @@ All thresholds live in `orchestrator/gates/thresholds.py`. **Do not put threshol
 
 # Backtest hard gate (in-sample, anchored 6-fold walk-forward)
 MIN_TRADES_IS = 150
+MIN_TRADES_PER_FOLD = 5             # guard zero-trade folds (walk-forward outside cache)
 MIN_OOS_TRADES = 30
 MIN_SHARPE_IS = 1.5
 MIN_PROFIT_FACTOR_IS = 1.5
