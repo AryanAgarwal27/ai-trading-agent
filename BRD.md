@@ -131,7 +131,7 @@ Claude Code is responsible for everything else: installing Freqtrade, FreqAI, La
 
 The orchestrator runs **two graph kinds**:
 
-1. **Supervisor graph** — one thread, `thread_id="supervisor"`. ReAct agent (Sonnet 4.6) with portfolio-level tools. Runs on APScheduler cron + event triggers.
+1. **Supervisor graph** — one thread, `thread_id="supervisor"`. ReAct agent (Sonnet 4.6) with portfolio-level tools. Runs on APScheduler cron + event triggers. **v1 statelessness (Stage 9c):** `thread_id="supervisor"` is a stable invoke-config identifier only — v1 wires **no checkpointer**, so the supervisor reasons *stateless-per-run* and the durable decision record is the `telemetry` row (`source="supervisor_decision"`; Fork C), not an accumulating LLM conversation. The literal "one thread" here must not be read as implying persistent memory. Enabling cross-run reflection by wiring the saver is a deliberate v1 deferral (see `DEFERRED.md` D-8); the owner of any such future change MUST concurrently adopt bounded-context management (per-run summarization or sliding-window retention) before the persistent thread accumulates production token cost.
 2. **Per-strategy graph** — one thread per strategy, `thread_id="strategy_<uuid>"`. Composes four subgraphs in sequence.
 
 Both graphs share a single `PostgresSaver` checkpointer and a single `PostgresStore`.
@@ -256,7 +256,8 @@ class StrategyState(TypedDict):
 
     # Execution
     freqtrade_userdir: Optional[str]
-    freqtrade_process_id: Optional[int]
+    freqtrade_process_id: Optional[str]   # str, not int — Docker Compose handle,
+                                          # not an OS PID (BRD §7.4; SPEC 7c)
     freqtrade_api_url: Optional[str]
     artifacts: dict
 
@@ -287,7 +288,8 @@ CREATE TABLE strategy_registry (
     timeframe   TEXT NOT NULL,
     freqtrade_userdir   TEXT,
     freqtrade_api_url   TEXT,
-    freqtrade_pid       INT,
+    freqtrade_pid       INT,            -- VESTIGIAL: created by migration 0001,
+                                        -- never written by any code path. See note below.
     started_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
     last_updated TIMESTAMPTZ NOT NULL DEFAULT now(),
     failure_reason TEXT
@@ -332,6 +334,8 @@ CREATE TABLE regime_log (
     PRIMARY KEY (at, detector)
 );
 ```
+
+> **Note on `strategy_registry.freqtrade_pid` (Stage 9h docs pass).** This column is **vestigial**: migration `0001_init` created it as `INT` (it predates the BRD §7.4 Docker-Compose decision), but **no code path writes or reads it**. The live/paper container handle lives in `StrategyState.freqtrade_process_id` (a `str` — the Compose project name, e.g. `paper-<strategy_id>` / `live-<strategy_id>`; BRD §5.7, SPEC 7c) and in `artifacts.live_container_id`, neither of which maps to this column. The originally-planned "§5.8 `freqtrade_pid INT → freqtrade_process_id TEXT`" rename (SPEC 2026-05-27 7c entry) is intentionally **NOT** applied to the doc here, because renaming the doc without a migration would make this schema diverge from the actual `0001`-created column — the docs would lie. The real reconciliation (a migration that renames + retypes `freqtrade_pid INT` → `freqtrade_process_id TEXT`, or drops the unused column) is deferred to **Stage 11 hardening**; until then the BRD documents the column as it actually exists.
 
 ### 5.9 Long-term Store namespaces
 
