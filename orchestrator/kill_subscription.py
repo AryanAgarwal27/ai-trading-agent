@@ -5,10 +5,19 @@ The out-of-band kill switch (``scheduler.kill_switch_poll_job``) POSTs
 ``ai-trading-agent:kill_switch:<strategy_id>`` (``events.publish_kill``). This
 module is the consumer: a long-running FastAPI-lifespan task PSUBSCRIBEs the
 pattern, parses each event, and writes ``artifacts.kill_switch_event`` into the
-LangGraph state for the matching thread. On that thread's next ``live_wait``
-wake, ``live._route_after_live_wait`` routes it to ``live_pause`` (BRD §5.6 —
-"the orchestrator routes the thread to live_pause on next wake", no coordinator
-vote), and ``build_interrupt_payload`` takes the kill-switch branch.
+LangGraph state for the matching thread, then DIRECTLY resumes the thread (9f,
+D-6 kill path). ``live._route_after_live_wait`` reads the event and routes
+straight to ``live_pause`` (BRD §5.6 — no coordinator vote), and
+``build_interrupt_payload`` takes the kill-switch branch.
+
+9f (D-6 kill path closure): the resume is a direct ``Command(resume=...)``, NOT
+the periodic /wake job, because the ``aupdate_state`` that writes the kill event
+clears the PARENT-visible interrupt surface (the 8h finding) — so /wake would
+409 the kill-written thread. Command(resume=...) straight to the thread bypasses
+the endpoint's interrupt-presence guard and resumes the still-parked nested
+``live_wait``. The periodic /wake path (kind="live_wait") is the SEPARATE no-kill
+re-eval trigger and must never operate on a kill-written thread (regression-
+guarded in tests/unit/test_live_wake.py).
 
 Decoupling (Stage 8g design note "subscription writes to state without coupling
 concerns"): the state write is injected as a seam (``kill_event_writer_fn``) so
@@ -32,9 +41,15 @@ import logging
 from collections.abc import Awaitable, Callable
 from typing import Any
 
+from langgraph.types import Command
+
 from orchestrator.observability.events import KILL_SWITCH_CHANNEL
 
 logger = logging.getLogger(__name__)
+
+# Hold references to fire-and-forget kill direct-resume tasks so they aren't GC'd
+# mid-run (mirrors supervisor._BACKGROUND_SPAWN_TASKS). 9f closes D-6's kill path.
+_KILL_RESUME_TASKS: set[asyncio.Task[None]] = set()
 
 # PSUBSCRIBE pattern — every strategy's kill channel. KILL_SWITCH_CHANNEL is the
 # static ``ai-trading-agent:kill_switch`` prefix; the publisher appends
@@ -111,11 +126,43 @@ def make_kill_event_writer(graph: Any) -> KillEventWriterFn:
         artifacts["kill_switch_event"] = _normalize_kill_event(event)
         await graph.aupdate_state(config, {"artifacts": artifacts})
         logger.warning(
-            "KILL EVENT routed to graph: thread=%s reason=%s — will route to "
-            "live_pause on next wake",
+            "KILL EVENT written to graph state: thread=%s reason=%s — direct-resuming",
             thread_id,
             event.get("reason"),
         )
+
+        # 9f (D-6 kill path, Option (b) — mandated by the 8h finding): the
+        # parent-level aupdate_state above CLEARED the parent-visible interrupt
+        # surface (tasks[*].interrupts is now empty), so /wake would 409. But the
+        # NESTED live_wait interrupt is still parked-and-resumable, so resume the
+        # thread DIRECTLY here via Command(resume=...). _route_after_live_wait
+        # (8g) reads artifacts.kill_switch_event and routes straight to live_pause,
+        # which emits a live_pause_review interrupt — the new HITL park point the
+        # operator advances via /approve. Fire-and-forget: do NOT await to
+        # completion (the resumed graph runs the whole live_pause path, and the
+        # subscription loop must keep consuming other events). A resume failure is
+        # logged loudly; the durable kill_switch_events row (8f) already exists, so
+        # the failure is recoverable manually — one crashed resume must not kill
+        # the loop or strand other threads.
+        async def _direct_resume() -> None:
+            try:
+                async for _ in graph.astream(
+                    Command(resume={"wake": True, "source": "kill_subscription"}),
+                    config=config,
+                ):
+                    pass
+                logger.info("kill direct-resume complete thread=%s (now at live_pause)", thread_id)
+            except Exception as exc:  # noqa: BLE001 — fire-and-forget; recoverable via the kse row
+                logger.error(
+                    "kill direct-resume FAILED thread=%s exc=%s — kill_switch_events row "
+                    "persists; resume manually via /approve once state is sound",
+                    thread_id,
+                    exc,
+                )
+
+        task = asyncio.create_task(_direct_resume())
+        _KILL_RESUME_TASKS.add(task)
+        task.add_done_callback(_KILL_RESUME_TASKS.discard)
 
     return _writer
 

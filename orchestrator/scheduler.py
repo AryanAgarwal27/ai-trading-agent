@@ -39,6 +39,7 @@ from typing import Any
 
 import httpx
 import psycopg
+from apscheduler.jobstores.base import JobLookupError
 from apscheduler.jobstores.memory import MemoryJobStore
 from apscheduler.jobstores.sqlalchemy import SQLAlchemyJobStore
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
@@ -60,12 +61,25 @@ logger = logging.getLogger(__name__)
 
 # ─── Cadences (BRD §5.5, §5.9, §11) ────────────────────────────────────
 WAKE_INTERVAL_HOURS = 6
+# Live periodic re-eval cadence (Stage 9f). Deliberately the SAME 6h as paper —
+# NOT a tighter cadence — because acute live safety is already covered out-of-band
+# by the 5-min kill-switch poll + 15-min daily-loss job (BRD §11); the live-wake's
+# only job is the SOFT periodic LLM re-eval (performance drift vs paper, regime
+# mismatch → coordinator → live_pause). BRD §12 budgets ~360 live cycles / 90 days
+# = 4/day = 6h; a 30-min cadence would be ~12x that LLM spend for marginal
+# soft-drift latency the kill switch doesn't need. Env-overridable for ops tuning.
+LIVE_WAKE_INTERVAL_HOURS = 6
 REGIME_INTERVAL_HOURS = 1
 KILL_SWITCH_INTERVAL_MINUTES = 5
 DAILY_LOSS_INTERVAL_MINUTES = 15
 
 # ─── Job-id conventions ─────────────────────────────────────────────────
 WAKE_JOB_PREFIX = "wake:"
+# Live-wake jobs get a SEPARATE id namespace from paper's ``wake:<thread_id>`` so
+# the two never collide on a thread that graduated paper→live (and so cleanup can
+# target the live job by strategy_id). Keyed on strategy_id (the cleanup API,
+# unschedule_live_wake, takes strategy_id).
+LIVE_WAKE_JOB_PREFIX = "live_wake:"
 REGIME_JOB_ID = "regime_job"
 KILL_SWITCH_JOB_ID = "kill_switch_poll"
 DAILY_LOSS_JOB_ID = "daily_loss_poll"
@@ -116,32 +130,42 @@ def _orchestrator_base_url() -> str:
 # ════════════════════════════════════════════════════════════════════════
 
 
-async def _fire_wake(thread_id: str, base_url: str) -> None:
-    """POST /threads/{thread_id}/wake on the orchestrator (loopback).
+async def _fire_wake(thread_id: str, base_url: str, kind: str = "paper_wait") -> None:
+    """POST /threads/{thread_id}/wake?kind=<kind> on the orchestrator (loopback).
 
     Reads ``OPERATOR_TOKEN`` from the env at fire time (SPEC §6) — never
     persisted in the jobstore. Failures are logged, not raised: a wake
     that can't be delivered (orchestrator mid-restart, transient) is
-    retried on the next 6h cycle; raising here would just spam the
+    retried on the next cycle; raising here would just spam the
     APScheduler error log without recovering anything.
+
+    ``kind`` (Stage 9f) declares which parked-interrupt kind this wake is for —
+    ``"paper_wait"`` (default, so the Stage-7f paper wake jobs persisted with
+    only ``args=[thread_id, base_url]`` keep working unchanged) or ``"live_wait"``
+    (the live-wake jobs registered by :func:`make_schedule_live_wake_fn`). The
+    /wake endpoint validates the parked interrupt matches ``kind`` and 409s
+    otherwise, so a live-wake can never resume a paper park or vice versa.
     """
     token = os.environ.get("OPERATOR_TOKEN", "")
     headers = {"X-Operator-Token": token} if token else {}
     url = f"{base_url}/threads/{thread_id}/wake"
     try:
         async with httpx.AsyncClient(timeout=30.0) as client:
-            resp = await client.post(url, headers=headers)
+            resp = await client.post(url, headers=headers, params={"kind": kind})
         if resp.status_code >= 400:
             logger.warning(
-                "wake call non-2xx thread_id=%s status=%s body=%s",
+                "wake call non-2xx thread_id=%s kind=%s status=%s body=%s",
                 thread_id,
+                kind,
                 resp.status_code,
                 resp.text[:200],
             )
         else:
-            logger.info("wake delivered thread_id=%s", thread_id)
+            logger.info("wake delivered thread_id=%s kind=%s", thread_id, kind)
     except httpx.HTTPError as exc:
-        logger.warning("wake call transport error thread_id=%s exc=%s", thread_id, exc)
+        logger.warning(
+            "wake call transport error thread_id=%s kind=%s exc=%s", thread_id, kind, exc
+        )
 
 
 async def _fire_regime_job() -> None:
@@ -653,6 +677,74 @@ def make_schedule_wake_fn(
         )
 
     return schedule_wake_fn
+
+
+# ─── Live-wake (Stage 9f, D-6 periodic re-eval path) ────────────────────
+# (strategy_id) -> remove that strategy's live-wake job. Injected into
+# live_archive + aretire_strategy so an archived live thread's recurring wake
+# job is cancelled rather than left to fire forever and harmlessly 409.
+UnscheduleWakeFn = Callable[[str], Awaitable[None]]
+
+
+def make_schedule_live_wake_fn(
+    scheduler: AsyncIOScheduler, *, base_url: str | None = None
+) -> ScheduleWakeFn:
+    """Return the live ``schedule_wake_fn`` (Stage 9f) — symmetric to paper's.
+
+    Same ``ScheduleWakeFn`` shape ``(thread_id, strategy_id)`` and same
+    module-level :func:`_fire_wake` target as :func:`make_schedule_wake_fn`, but
+    registers a SEPARATE interval job ``live_wake:<strategy_id>`` firing every
+    ``LIVE_WAKE_INTERVAL_HOURS`` (6h — see the constant's note) and passing
+    ``kind="live_wait"`` so the /wake endpoint routes the resume into the live
+    subgraph's ``live_wait`` park (not paper's). Persisted in the SQLAlchemy
+    jobstore (the default) so a parked live thread keeps being woken across an
+    orchestrator restart (BRD §4). ``replace_existing=True`` → re-spawn / replay
+    re-arms rather than duplicating. Job-id is keyed on ``strategy_id`` so
+    :func:`make_unschedule_live_wake_fn` can cancel it at archive.
+    """
+    resolved_base = base_url or _orchestrator_base_url()
+
+    async def schedule_live_wake_fn(thread_id: str, strategy_id: str) -> None:
+        scheduler.add_job(
+            _fire_wake,
+            trigger="interval",
+            hours=LIVE_WAKE_INTERVAL_HOURS,
+            args=[thread_id, resolved_base],
+            kwargs={"kind": "live_wait"},
+            id=f"{LIVE_WAKE_JOB_PREFIX}{strategy_id}",
+            replace_existing=True,
+            coalesce=True,
+            misfire_grace_time=_WAKE_MISFIRE_GRACE_S,
+        )
+        logger.info(
+            "scheduled LIVE wake job strategy_id=%s thread_id=%s every %dh",
+            strategy_id,
+            thread_id,
+            LIVE_WAKE_INTERVAL_HOURS,
+        )
+
+    return schedule_live_wake_fn
+
+
+def make_unschedule_live_wake_fn(scheduler: AsyncIOScheduler) -> UnscheduleWakeFn:
+    """Return the live-wake cleanup fn (Stage 9f) — cancels ``live_wake:<sid>``.
+
+    Called at every live-archive path (``live_archive``, supervisor
+    ``aretire_strategy`` when the thread was live) so an archived live thread's
+    recurring wake job is removed. Idempotent: removing a non-existent job (never
+    scheduled, already removed, or a startup-replayed orphan already gone) is a
+    swallowed no-op — a missed cleanup only costs harmless 409s on the next fire.
+    """
+
+    async def unschedule_live_wake(strategy_id: str) -> None:
+        job_id = f"{LIVE_WAKE_JOB_PREFIX}{strategy_id}"
+        try:
+            scheduler.remove_job(job_id)
+            logger.info("unscheduled LIVE wake job strategy_id=%s", strategy_id)
+        except JobLookupError:
+            logger.debug("unschedule_live_wake: no job %s (already gone)", job_id)
+
+    return unschedule_live_wake
 
 
 async def shutdown_scheduler(scheduler: AsyncIOScheduler) -> None:

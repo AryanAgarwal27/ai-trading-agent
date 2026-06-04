@@ -76,7 +76,7 @@ from orchestrator.observability.events import (
     record_gate_audit,
 )
 from orchestrator.security.secrets import EnvSecretProvider, SecretProvider
-from orchestrator.subgraphs.paper import PaperState
+from orchestrator.subgraphs.paper import PaperState, ScheduleWakeFn
 from orchestrator.tools.compare import compare_paper_to_backtest
 from orchestrator.tools.freqtrade_api import FreqtradeAPI, FreqtradeCredentials
 from orchestrator.tools.freqtrade_lifecycle import (
@@ -96,6 +96,22 @@ logger = logging.getLogger(__name__)
 # tuple when the helper surfaces a container id.
 SpawnLiveContainerFn = Callable[..., Awaitable[str | tuple[str, str]]]
 RegistryWriterFn = Callable[..., Awaitable[None]]
+# 9f (D-6 periodic live-wake). schedule_wake_fn registers the recurring live-wake
+# job at live_spawn (symmetric to paper's); unschedule_wake_fn cancels it at
+# live_archive so an archived thread's wake doesn't fire forever. Defaults are
+# no-ops so the subgraph builds + unit-tests without a scheduler.
+UnscheduleWakeFn = Callable[[str], Awaitable[None]]
+
+
+async def _noop_schedule_wake(thread_id: str, strategy_id: str) -> None:
+    """Default ``schedule_wake_fn`` — no scheduler wired (tests / standalone)."""
+    return None
+
+
+async def _noop_unschedule_wake(strategy_id: str) -> None:
+    """Default ``unschedule_wake_fn`` — no scheduler wired (tests / standalone)."""
+    return None
+
 
 # 8e assembly seams.
 # build_snapshot_fn is the live analog of paper's build_context_fn — fetches the
@@ -310,6 +326,7 @@ async def live_spawn(
     spawn_live_container_fn: SpawnLiveContainerFn | None = None,
     secrets_provider: SecretProvider | None = None,
     registry_writer_fn: RegistryWriterFn | None = None,
+    schedule_wake_fn: ScheduleWakeFn | None = None,
 ) -> dict[str, Any]:
     """First node in the live subgraph — see module docstring for contract.
 
@@ -414,6 +431,13 @@ async def live_spawn(
 
     # 5. Update registry with the URL and return the success state-update.
     await write_registry(**identity, stage="live", userdir=userdir, api_url=api_url)
+
+    # 9f (D-6 periodic live-wake): register the recurring live-wake job now that
+    # the thread is genuinely live and about to park at live_wait. Symmetric to
+    # paper's schedule_wake node; idempotent (replace_existing) so a replay /
+    # re-spawn re-arms. Registered AFTER spawn success, so the live_spawn-FAILURE
+    # path above never schedules a job (nothing to clean up there).
+    await (schedule_wake_fn or _noop_schedule_wake)(thread_id, strategy_id)
 
     # Preserve an existing live_started_at across re-runs (replay / re-spawn).
     started_iso = artifacts.get("live_started_at") or datetime.now(UTC).isoformat()
@@ -951,6 +975,7 @@ async def live_archive(
     config: RunnableConfig | None = None,
     *,
     stop_container_fn: StopContainerFn | None = None,
+    unschedule_wake_fn: UnscheduleWakeFn | None = None,
 ) -> dict[str, Any]:
     """Terminal sink: tear the live container down, stamp stage + failure_reason.
 
@@ -959,8 +984,14 @@ async def live_archive(
     stop_live_container. Best-effort: a teardown failure is logged, not raised
     (a leaked container is an ops concern surfaced via logs, not a reason to
     strand the graph). Mirrors paper_teardown folded into the terminal node.
+
+    9f: also cancels the recurring live-wake job (``unschedule_wake_fn``) so an
+    archived thread's wake doesn't fire forever and 409. Best-effort like the
+    teardown — a cleanup failure logs but never strands the archive (a missed
+    cancel only costs harmless 409s on the next fire).
     """
     stop_fn = stop_container_fn or stop_live_container
+    unschedule_fn = unschedule_wake_fn or _noop_unschedule_wake
     sid = str(state.get("strategy_id", ""))
     try:
         await stop_fn(sid)
@@ -971,6 +1002,10 @@ async def live_archive(
             sid,
             exc,
         )
+    try:
+        await unschedule_fn(sid)
+    except Exception as exc:  # noqa: BLE001 — cleanup must not strand the archive
+        logger.error("live_archive unschedule_wake failed strategy_id=%s exc=%s", sid, exc)
     # 9e: emission deliberately omitted; cron is the backstop for funnel-internal
     # completions — see supervisor_subscription.py docstring. (live_archive is the
     # PRIMARY live exit — coordinator-fail / live_pause-reject — but it archives
@@ -1019,6 +1054,8 @@ def build_live_subgraph(
     stop_trading_fn: StopTradingFn | None = None,
     start_trading_fn: StartTradingFn | None = None,
     live_started_bump_fn: LiveStartedBumpFn | None = None,
+    schedule_wake_fn: ScheduleWakeFn | None = None,
+    unschedule_wake_fn: UnscheduleWakeFn | None = None,
     checkpointer: CheckpointSaver | None = None,
 ) -> CompiledStateGraph[LiveState, LiveState, LiveState, LiveState]:
     """Compile the Stage 8e live subgraph (BRD §5.6).
@@ -1060,6 +1097,7 @@ def build_live_subgraph(
             spawn_live_container_fn=spawn_live_container_fn,
             secrets_provider=secrets_provider,
             registry_writer_fn=registry_writer_fn,
+            schedule_wake_fn=schedule_wake_fn,
         )
 
     async def _live_evaluate(state: LiveState, config: RunnableConfig) -> dict[str, Any]:
@@ -1094,7 +1132,12 @@ def build_live_subgraph(
         )
 
     async def _archive(state: LiveState, config: RunnableConfig) -> dict[str, Any]:
-        return await live_archive(state, config, stop_container_fn=stop_live_container_fn)
+        return await live_archive(
+            state,
+            config,
+            stop_container_fn=stop_live_container_fn,
+            unschedule_wake_fn=unschedule_wake_fn,
+        )
 
     builder: StateGraph[LiveState, LiveState, LiveState, LiveState] = StateGraph(LiveState)
     builder.add_node("live_spawn", _live_spawn)

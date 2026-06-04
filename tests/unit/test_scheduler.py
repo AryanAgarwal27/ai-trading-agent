@@ -89,9 +89,15 @@ async def test_fire_wake_posts_with_operator_token_header(
         async def __aexit__(self, *_a: Any) -> bool:
             return False
 
-        async def post(self, url: str, headers: dict[str, str] | None = None) -> _FakeResp:
+        async def post(
+            self,
+            url: str,
+            headers: dict[str, str] | None = None,
+            params: dict[str, str] | None = None,
+        ) -> _FakeResp:
             captured["url"] = url
             captured["headers"] = headers
+            captured["params"] = params
             return _FakeResp()
 
     monkeypatch.setattr("orchestrator.scheduler.httpx.AsyncClient", _FakeClient)
@@ -100,6 +106,8 @@ async def test_fire_wake_posts_with_operator_token_header(
 
     assert captured["url"] == "http://127.0.0.1:8000/threads/strategy_t1/wake"
     assert captured["headers"] == {"X-Operator-Token": "tok-7f-abc"}
+    # 9f: default kind is paper_wait (backward compat for Stage-7f paper jobs).
+    assert captured["params"] == {"kind": "paper_wait"}
 
 
 async def test_fire_wake_swallows_transport_error(

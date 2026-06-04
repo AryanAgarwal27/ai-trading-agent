@@ -77,6 +77,7 @@ from orchestrator.subgraphs.live import (
     SpawnLiveContainerFn,
     StartTradingFn,
     StopTradingFn,
+    UnscheduleWakeFn,
     build_live_subgraph,
 )
 from orchestrator.subgraphs.live import (
@@ -181,6 +182,12 @@ def build_per_strategy_graph(
     merge_fn: MergeFn | None = None,
     arbitrate_fn: ArbitrateFn | None = None,
     gate_audit_writer_fn: GateAuditWriterFn | None = None,
+    # ── Live periodic-wake seams (Stage 9f, D-6). The live analog of paper's
+    # schedule_wake_fn — registers live_wake:<sid> at live_spawn (every 6h,
+    # kind="live_wait") and cancels it at live_archive. Supplied by the lifespan
+    # (APScheduler-backed); default no-ops keep the graph buildable in tests.
+    schedule_live_wake_fn: ScheduleWakeFn | None = None,
+    unschedule_live_wake_fn: UnscheduleWakeFn | None = None,
 ) -> CompiledStateGraph[StrategyState, StrategyState, StrategyState, StrategyState]:
     """Compile the per-strategy parent graph (BRD §5.2).
 
@@ -240,6 +247,8 @@ def build_per_strategy_graph(
         stop_trading_fn=stop_trading_fn,
         start_trading_fn=start_trading_fn,
         live_started_bump_fn=live_started_bump_fn,
+        schedule_wake_fn=schedule_live_wake_fn,
+        unschedule_wake_fn=unschedule_live_wake_fn,
         checkpointer=None,  # nested under the parent's saver
     )
 

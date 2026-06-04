@@ -64,7 +64,9 @@ from orchestrator.observability.events import (
 )
 from orchestrator.scheduler import (
     build_scheduler,
+    make_schedule_live_wake_fn,
     make_schedule_wake_fn,
+    make_unschedule_live_wake_fn,
     register_recurring_jobs,
     register_supervisor_cron,
     shutdown_scheduler,
@@ -387,13 +389,24 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         stack.push_async_callback(shutdown_scheduler, scheduler)
         app.state.scheduler = scheduler
         app.state.schedule_wake_fn = make_schedule_wake_fn(scheduler)
+        # 9f (D-6 periodic live-wake): the live analog of schedule_wake_fn +
+        # its cleanup. schedule registers live_wake:<sid> at live_spawn (6h,
+        # kind="live_wait"); unschedule cancels it at live_archive + supervisor
+        # retire. Exposed on app.state so the supervisor partial can reuse the
+        # cleanup fn for aretire.
+        app.state.schedule_live_wake_fn = make_schedule_live_wake_fn(scheduler)
+        app.state.unschedule_live_wake_fn = make_unschedule_live_wake_fn(scheduler)
 
         # The production parent graph composes research → validation →
-        # paper (Stage 7g), with the APScheduler-backed schedule_wake_fn
-        # wired into the paper subgraph. All other leaf seams default to
-        # their real implementations inside build_per_strategy_graph.
+        # paper (Stage 7g) → live (Stage 8g), with the APScheduler-backed
+        # paper + live wake seams threaded into the paper/live subgraphs. All
+        # other leaf seams default to their real implementations.
         app.state.graph = build_per_strategy_graph(
-            saver, store, schedule_wake_fn=app.state.schedule_wake_fn
+            saver,
+            store,
+            schedule_wake_fn=app.state.schedule_wake_fn,
+            schedule_live_wake_fn=app.state.schedule_live_wake_fn,
+            unschedule_live_wake_fn=app.state.unschedule_live_wake_fn,
         )
 
         # ── Smoke-only graph overrides (env-gated, off by default). ────
@@ -452,7 +465,15 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         # runner without rebuilding the closure. The job lives in a dedicated
         # in-memory jobstore (the closure isn't picklable) — see
         # register_supervisor_cron.
-        app.state.run_supervisor_fn = partial(run_supervisor, app.state.graph, store)
+        # 9f: bind the live-wake cleanup so a supervisor retire of a LIVE thread
+        # cancels its recurring wake job (aretire_strategy calls it only when the
+        # retired thread was in the live stage).
+        app.state.run_supervisor_fn = partial(
+            run_supervisor,
+            app.state.graph,
+            store,
+            unschedule_wake_fn=app.state.unschedule_live_wake_fn,
+        )
         register_supervisor_cron(scheduler, run_supervisor_fn=app.state.run_supervisor_fn)
 
         # ── Supervisor event-driven trigger (Stage 9e, BRD §5.1, §13 row 9). ──
@@ -669,30 +690,51 @@ async def approve_thread(
     return {"resumed": True, "next_stage": next_stage, "audit_id": audit_id}
 
 
+# Wake kinds /wake will resume. paper_wait (Stage 7f) + live_wait (Stage 9f
+# D-6 periodic re-eval). A HITL gate kind (paper_gate / live_gate /
+# live_pause_review) is NEVER wake-able — that is /approve's job.
+WAKEABLE_KINDS: frozenset[str] = frozenset({"paper_wait", "live_wait"})
+
+
 @app.post("/threads/{thread_id}/wake")
 async def wake_thread(
     thread_id: str,
     request: Request,
+    kind: str = "paper_wait",
     token: str = Depends(_require_operator_token),
 ) -> dict[str, Any]:
-    """Wake a paper thread parked at ``paper_wait`` (Stage 7f).
+    """Wake a thread parked at ``paper_wait`` (Stage 7f) or ``live_wait`` (9f).
 
-    Called by the APScheduler 6h wake job (loopback, X-Operator-Token —
-    SPEC §6 d6736ba) and resumes the thread with
-    ``Command(resume={"wake": True})`` so it proceeds to ``paper_monitor``.
+    Called by the APScheduler wake job (loopback, X-Operator-Token — SPEC §6
+    d6736ba) and resumes the thread with ``Command(resume={"wake": True}})`` so
+    it proceeds (paper → ``paper_monitor``; live → ``live_evaluate`` via
+    ``_route_after_live_wait`` on the no-kill path).
 
-    Distinct from ``/approve``:
-    - It is NOT a HITL decision; the resume payload is a wake signal, not
-      an ApprovalDecision. So it does NOT write a ``gate_audits`` row.
-    - It refuses (409) to wake a thread parked at anything OTHER than
-      ``paper_wait``. Waking a thread parked at a HITL gate
-      (paper_gate / live_gate) would feed ``{"wake": True}`` into the
-      gate's decision validation, which — lacking an ``approved`` key —
-      would archive the strategy. The node-name guard prevents that.
+    The ``kind`` query param (default ``"paper_wait"`` so the Stage-7f paper
+    wake jobs — which send no kind — keep working) declares which park the
+    caller intends. The endpoint REFUSES (409) unless the thread's parent-
+    visible interrupt kind equals ``kind``. Consequences:
 
-    Same per-thread ``asyncio.Lock`` as /approve so a wake and an
-    operator approve can't race on the same thread.
+    - Distinct from ``/approve``: a wake is NOT a HITL decision (no
+      ``gate_audits`` row). Feeding ``{"wake": True}`` into a HITL gate's
+      decision validation would archive the strategy, so a HITL-gate park is
+      never wake-able.
+    - **9f kill-path independence (regression-guarded):** a kill-written thread
+      has had its parent interrupt CLEARED by ``kill_subscription``'s
+      ``aupdate_state`` (the 8h finding), so ``interrupted_tasks`` is empty →
+      409 here. That is the desired contract: the kill path is the ONLY resumer
+      for kill-written threads (it direct-resumes via ``Command(resume=...)``).
+      The periodic ``kind="live_wait"`` wake must never operate on such a thread.
+
+    Same per-thread ``asyncio.Lock`` as /approve so a wake and an operator
+    approve can't race on the same thread.
     """
+    if kind not in WAKEABLE_KINDS:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=f"kind={kind!r} is not wake-able; expected one of {tuple(WAKEABLE_KINDS)}.",
+        )
+
     graph = request.app.state.graph
     thread_locks: defaultdict[str, asyncio.Lock] = request.app.state.thread_locks
 
@@ -707,23 +749,27 @@ async def wake_thread(
                 status_code=status.HTTP_409_CONFLICT,
                 detail=(
                     f"thread {thread_id!r} is not parked at an interrupt "
-                    f"(next={snapshot.next!r}). Nothing to wake."
+                    f"(next={snapshot.next!r}). Nothing to wake. (A kill-written "
+                    "thread has no parent interrupt — it is resumed by the kill "
+                    "subscription, not /wake.)"
                 ),
             )
 
-        # Identify the parked gate by the interrupt payload "kind" — the
-        # paper_wait interrupt carries kind="paper_wait". Under the
-        # composed parent graph the parked task is the ``paper_subgraph``
-        # node, so a task-name check would never match; the payload kind
-        # is nesting-invariant (same reasoning as /approve's _interrupt_kind).
+        # Identify the parked gate by the interrupt payload "kind" (the
+        # paper_wait / live_wait interrupt carries it). Under the composed parent
+        # graph the parked task is the SUBGRAPH node, so a task-name check would
+        # never match; the payload kind is nesting-invariant (same reasoning as
+        # /approve's _interrupt_kind). The wake must match the requested kind so a
+        # live-wake can never resume a paper park (or vice versa) and neither can
+        # resume a HITL gate.
         parked_kind = _interrupt_kind(interrupted_tasks[0])
-        if parked_kind != "paper_wait":
+        if parked_kind != kind:
             raise HTTPException(
                 status_code=status.HTTP_409_CONFLICT,
                 detail=(
-                    f"thread {thread_id!r} is parked at gate kind={parked_kind!r}, "
-                    "not 'paper_wait'; /wake only resumes the paper wake-cycle. "
-                    "Use /approve for HITL gates."
+                    f"thread {thread_id!r} is parked at kind={parked_kind!r}, not the "
+                    f"requested wake kind={kind!r}; /wake only resumes a matching "
+                    "paper_wait/live_wait park. Use /approve for HITL gates."
                 ),
             )
 

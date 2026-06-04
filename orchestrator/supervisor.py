@@ -133,6 +133,15 @@ AuditWriterFn = Callable[[psycopg.AsyncConnection, dict[str, Any]], Awaitable[No
 # runner's post-commit retire emission is hermetic in unit tests; defaults to
 # events.publish_thread_completed (self-contained, best-effort).
 CompletionPublisherFn = Callable[[str, dict[str, Any]], Awaitable[None]]
+# 9f (D-6): (strategy_id) → cancel that strategy's recurring live-wake job.
+# aretire_strategy calls it ONLY when the retired thread was live (only live
+# threads have a live_wake job). Default no-op so retire works without a
+# scheduler (tests / standalone); production injects make_unschedule_live_wake_fn.
+UnscheduleWakeFn = Callable[[str], Awaitable[None]]
+
+
+async def _noop_unschedule_wake(strategy_id: str) -> None:
+    return None
 
 
 # ════════════════════════════════════════════════════════════════════════
@@ -486,6 +495,7 @@ async def aretire_strategy(
     strategy_id: str,
     *,
     stop_live_container_fn: StopLiveContainerFn | None = None,
+    unschedule_wake_fn: UnscheduleWakeFn | None = None,
 ) -> dict[str, Any]:
     """Archive a thread: halt its live container (if any), mark it archived.
 
@@ -542,6 +552,17 @@ async def aretire_strategy(
             "failure_reason = %s, last_updated = now() WHERE strategy_id = %s",
             (_RETIRE_REASON, strategy_id),
         )
+
+    # 9f (D-6): only a LIVE thread has a recurring live-wake job — cancel it so
+    # it doesn't fire forever and 409. Best-effort: a cleanup failure logs but
+    # never strands the retire (the registry archive already happened; a missed
+    # cancel only costs harmless 409s). Caller-owns-commit is unaffected — this
+    # touches the scheduler, not the conn.
+    if previous_stage == "live":
+        try:
+            await (unschedule_wake_fn or _noop_unschedule_wake)(strategy_id)
+        except Exception as exc:  # noqa: BLE001 — cleanup must not strand the retire
+            logger.error("retire: unschedule_wake failed strategy_id=%s exc=%s", strategy_id, exc)
 
     logger.info("retired strategy_id=%s (was %s)", strategy_id, previous_stage)
     return {"retired": True, "strategy_id": strategy_id, "previous_stage": previous_stage}
@@ -804,6 +825,7 @@ async def _execute_action(
     graph: Any,
     conn: psycopg.AsyncConnection,
     enqueue_fn: SpawnThreadFn,
+    unschedule_wake_fn: UnscheduleWakeFn | None = None,
 ) -> dict[str, Any]:
     """Execute one decision action via the plain write impls (Arch 2).
 
@@ -827,7 +849,9 @@ async def _execute_action(
                 "action": "retire",
                 "result": {"retired": False, "reason": "missing_strategy_id"},
             }
-        result = await aretire_strategy(graph, conn, action.strategy_id)
+        result = await aretire_strategy(
+            graph, conn, action.strategy_id, unschedule_wake_fn=unschedule_wake_fn
+        )
         return {"action": "retire", "result": result}
     return {"action": "no_op", "result": {"rationale": action.rationale}}
 
@@ -842,6 +866,7 @@ async def run_supervisor(
     spawn_thread_fn: SpawnThreadFn | None = None,
     audit_writer_fn: AuditWriterFn | None = None,
     completion_publisher_fn: CompletionPublisherFn | None = None,
+    unschedule_wake_fn: UnscheduleWakeFn | None = None,
     dry_run: bool = False,
 ) -> SupervisorDecision:
     """One end-to-end supervisor invocation (BRD §5.1, §13 row 9).
@@ -897,8 +922,11 @@ async def run_supervisor(
     Seams: ``agent`` (default ``build_supervisor_agent()``), ``spawn_thread_fn``
     (default the real producer bound to ``graph``), ``audit_writer_fn`` (default
     the telemetry writer), ``completion_publisher_fn`` (default
-    :func:`orchestrator.observability.events.publish_thread_completed`). Tests
-    inject them to stay hermetic.
+    :func:`orchestrator.observability.events.publish_thread_completed`),
+    ``unschedule_wake_fn`` (9f — cancels a retired LIVE thread's recurring
+    live-wake job; default no-op, production injects
+    :func:`orchestrator.scheduler.make_unschedule_live_wake_fn`). Tests inject
+    them to stay hermetic.
     """
     audit = audit_writer_fn or _default_audit_writer
     publish_completion = completion_publisher_fn or publish_thread_completed
@@ -952,7 +980,8 @@ async def run_supervisor(
             return decision
 
         action_results = [
-            await _execute_action(action, graph, conn, _enqueue) for action in decision.actions
+            await _execute_action(action, graph, conn, _enqueue, unschedule_wake_fn)
+            for action in decision.actions
         ]
 
         # 9e: collect the strategy_ids that ACTUALLY archived this run (retire
