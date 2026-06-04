@@ -70,7 +70,11 @@ from orchestrator.gates.thresholds import (
     LIVE_CAPITAL_CAP_USD,
     MAX_OPEN_TRADES,
 )
-from orchestrator.observability.events import publish_gate_pending, record_gate_audit
+from orchestrator.observability.events import (
+    publish_gate_pending,
+    publish_thread_completed,
+    record_gate_audit,
+)
 from orchestrator.security.secrets import EnvSecretProvider, SecretProvider
 from orchestrator.subgraphs.paper import PaperState
 from orchestrator.tools.compare import compare_paper_to_backtest
@@ -387,6 +391,19 @@ async def live_spawn(
             exc,
         )
         await write_registry(**identity, stage="archived", userdir=userdir, failure_reason=reason)
+        # 9e (emission point B): write_registry commits internally, so the
+        # registry row is committed-archived here — publish thread_completed
+        # (registry-backed, post-commit, Option 1-minimal). Self-contained +
+        # best-effort (swallows Redis failures); recovered on the next cron.
+        await publish_thread_completed(
+            strategy_id,
+            {
+                "strategy_id": strategy_id,
+                "completed_at": datetime.now(UTC).isoformat(),
+                "final_stage": "archived",
+                "completion_reason": reason,
+            },
+        )
         return {"stage": "archived", "failure_reason": reason}
 
     # Normalize: helper may return just the api_url, or (api_url, container_id).
@@ -954,6 +971,12 @@ async def live_archive(
             sid,
             exc,
         )
+    # 9e: emission deliberately omitted; cron is the backstop for funnel-internal
+    # completions — see supervisor_subscription.py docstring. (live_archive is the
+    # PRIMARY live exit — coordinator-fail / live_pause-reject — but it archives
+    # graph state only; the registry transition is deferred to sync_registry_stage.
+    # Do NOT add publish_thread_completed here — Option 1-minimal, regression-guarded
+    # by tests/unit/test_supervisor_subscription.py.)
     return {
         "stage": "archived",
         "failure_reason": state.get("failure_reason") or "live_archived_without_reason",

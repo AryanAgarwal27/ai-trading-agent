@@ -58,6 +58,12 @@ TELEMETRY_CHANNEL: str = "ai-trading-agent:telemetry"
 AUDIT_CHANNEL: str = "ai-trading-agent:audit"
 """Reserved for Stage 10. Generic audit-trail tail for ops dashboards."""
 
+THREAD_COMPLETED_CHANNEL: str = "ai-trading-agent:thread_completed"
+"""Stage 9e. Fired when a strategy thread reaches terminal ``archived`` in the
+``strategy_registry``. Consumed by ``orchestrator.supervisor_subscription``,
+which debounces completions into a single coalesced supervisor run (the
+event-driven half of the 9d/9e dual trigger)."""
+
 
 # ─── DSN normalization ─────────────────────────────────────────────────
 
@@ -145,6 +151,30 @@ async def publish_kill(strategy_id: str, payload: dict[str, Any]) -> None:
     ``artifacts.kill_switch_event`` and routes the thread to ``live_pause``.
     """
     channel = f"{KILL_SWITCH_CHANNEL}:{strategy_id}"
+    await _publish(channel, payload)
+
+
+async def publish_thread_completed(strategy_id: str, payload: dict[str, Any]) -> None:
+    """Publish a strategy-thread completion to Redis (Stage 9e, BRD §13 row 9).
+
+    Channel ``ai-trading-agent:thread_completed:<strategy_id>``. Mirrors
+    :func:`publish_kill` exactly — self-contained (opens its own short-lived
+    client via :func:`_publish`), best-effort with the same swallow-and-log
+    semantics: the durable record is the ``archived`` ``strategy_registry`` row
+    the caller committed BEFORE calling this, so a lost notification is
+    recovered on the next supervisor cron tick (whose ``sync_registry_stage``
+    sees the reconciled portfolio regardless).
+
+    Emission contract (Stage 9e, Option 1-minimal — operator sign-off): callers
+    publish AFTER the archive write commits, from exactly three REGISTRY-archive
+    points — ``paper_teardown`` (paper kill / live_gate-reject), ``live_spawn``
+    boot failure, and ``run_supervisor``'s post-commit retire pass. The
+    graph-only archive sinks (research / validation / ``live_archive``) and
+    ``sync_registry_stage`` deliberately do NOT publish; the nightly cron is the
+    backstop for those funnel-internal completions. See
+    ``orchestrator/supervisor_subscription.py`` for the consumer + rationale.
+    """
+    channel = f"{THREAD_COMPLETED_CHANNEL}:{strategy_id}"
     await _publish(channel, payload)
 
 

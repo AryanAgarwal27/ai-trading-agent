@@ -70,6 +70,11 @@ from orchestrator.scheduler import (
     shutdown_scheduler,
 )
 from orchestrator.supervisor import run_supervisor
+from orchestrator.supervisor_subscription import (
+    cancel_supervisor_subscription,
+    make_schedule_supervisor_run,
+    run_supervisor_subscription,
+)
 
 load_dotenv()
 
@@ -449,6 +454,29 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         # register_supervisor_cron.
         app.state.run_supervisor_fn = partial(run_supervisor, app.state.graph, store)
         register_supervisor_cron(scheduler, run_supervisor_fn=app.state.run_supervisor_fn)
+
+        # ── Supervisor event-driven trigger (Stage 9e, BRD §5.1, §13 row 9). ──
+        # The other half of the supervisor's dual trigger (9d = nightly cron).
+        # Long-running task: PSUBSCRIBE ai-trading-agent:thread_completed:*; each
+        # completion (a thread reaching terminal archived in the REGISTRY —
+        # paper_teardown, live_spawn failure, supervisor retire) schedules a
+        # single COALESCED supervisor run via a debounced one-shot. Wired AFTER
+        # register_supervisor_cron so the supervisor_memory jobstore the one-shot
+        # targets already exists, and over the SAME lifespan-bound
+        # run_supervisor_fn (final graph + store). The debounced scheduler fn is
+        # exposed on app.state for a future manual-trigger endpoint / debugging;
+        # the task is cancel-on-shutdown via the AsyncExitStack callback.
+        app.state.schedule_supervisor_run_fn = make_schedule_supervisor_run(
+            scheduler, app.state.run_supervisor_fn
+        )
+        supervisor_sub_task: asyncio.Task[None] = asyncio.create_task(
+            run_supervisor_subscription(
+                redis_client,
+                schedule_supervisor_run_fn=app.state.schedule_supervisor_run_fn,
+            )
+        )
+        app.state.supervisor_subscription_task = supervisor_sub_task
+        stack.push_async_callback(cancel_supervisor_subscription, supervisor_sub_task)
 
         yield
 

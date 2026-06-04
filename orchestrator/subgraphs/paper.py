@@ -55,7 +55,7 @@ from orchestrator.agents.monitors import (
 from orchestrator.gates import thresholds
 from orchestrator.gates.hitl import build_interrupt_payload
 from orchestrator.gates.thresholds import LIVE_CAPITAL_CAP_USD, MAX_OPEN_TRADES
-from orchestrator.observability.events import publish_gate_pending
+from orchestrator.observability.events import publish_gate_pending, publish_thread_completed
 from orchestrator.state import AgentVote, StrategyState
 from orchestrator.tools.freqtrade_api import FreqtradeAPI, FreqtradeCredentials
 from orchestrator.tools.freqtrade_lifecycle import (
@@ -779,6 +779,23 @@ async def paper_teardown(
         await conn.commit()
     finally:
         await conn.close()
+
+    # 9e (emission point A): the registry row is now committed-archived, so
+    # publish thread_completed — registry-backed, post-commit (Option 1-minimal,
+    # no phantom event). Self-contained + best-effort (events.publish_thread_completed
+    # opens its own client and swallows Redis failures); a lost publish is
+    # recovered on the next supervisor cron. paper_teardown is NOT a gate node
+    # (no interrupt/replay), so an await here before the return is a plain side
+    # effect alongside the stop-container + DB writes it already performs.
+    await publish_thread_completed(
+        strategy_id,
+        {
+            "strategy_id": strategy_id,
+            "completed_at": datetime.now(UTC).isoformat(),
+            "final_stage": "archived",
+            "completion_reason": state.get("failure_reason"),
+        },
+    )
 
     return {}
 

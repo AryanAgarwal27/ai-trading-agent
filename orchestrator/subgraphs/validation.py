@@ -1079,6 +1079,11 @@ def gate_robustness(state: ValidationState) -> Command[Literal["archive", "risk_
 
 def archive(state: ValidationState) -> dict[str, Any]:
     """Terminal sink: stamps stage and preserves failure_reason if set."""
+    # 9e: emission deliberately omitted; cron is the backstop for funnel-internal
+    # completions — see supervisor_subscription.py docstring. (Archives graph state
+    # only; the registry transition is deferred to sync_registry_stage. Do NOT add
+    # publish_thread_completed here — Option 1-minimal, regression-guarded by
+    # tests/unit/test_supervisor_subscription.py.)
     return {
         "stage": "archived",
         "failure_reason": state.get("failure_reason") or "validation_archived_without_reason",

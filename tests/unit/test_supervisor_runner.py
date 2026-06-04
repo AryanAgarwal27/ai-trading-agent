@@ -238,6 +238,12 @@ async def test_retire_updates_state_registry_and_logs() -> None:
     conn = _FakeConn()
     graph = _StubGraph(state_values={"stage": "paper", "strategy_id": "s_x"})
     audit, metrics = _audit_capture()
+    # 9e: inject the completion publisher seam (default would hit a real Redis
+    # socket) and assert the retire emits thread_completed POST-commit, once.
+    completions: list[tuple[str, dict[str, Any]]] = []
+
+    async def _publish(strategy_id: str, payload: dict[str, Any]) -> None:
+        completions.append((strategy_id, payload))
 
     decision = SupervisorDecision(
         actions=[SupervisorAction(action="retire", strategy_id="s_x", rationale="stalled 30d")],
@@ -253,6 +259,7 @@ async def test_retire_updates_state_registry_and_logs() -> None:
         agent=_StubAgent(decision=decision),
         spawn_thread_fn=AsyncMock(),
         audit_writer_fn=audit,
+        completion_publisher_fn=_publish,
     )
 
     assert len(graph.updates) == 1
@@ -261,6 +268,46 @@ async def test_retire_updates_state_registry_and_logs() -> None:
     assert len(archive_updates) == 1
     assert conn.commits == 1
     assert metrics[0]["action_results"][0]["result"]["retired"] is True
+    # 9e point C: exactly one thread_completed for the archived strategy, shaped
+    # per the publish_thread_completed contract.
+    assert len(completions) == 1
+    sid, payload = completions[0]
+    assert sid == "s_x"
+    assert payload["strategy_id"] == "s_x"
+    assert payload["final_stage"] == "archived"
+    assert payload["completion_reason"] == "retired_by_supervisor"
+    assert "completed_at" in payload
+
+
+async def test_failed_retire_does_not_emit_completion() -> None:
+    """9e no-phantom guard: a retire that did NOT archive a row (unknown
+    strategy → retired=False) emits no thread_completed event."""
+    conn = _FakeConn()
+    graph = _StubGraph(state_values={})  # empty → aretire returns retired=False
+    audit, _metrics = _audit_capture()
+    completions: list[str] = []
+
+    async def _publish(strategy_id: str, payload: dict[str, Any]) -> None:
+        completions.append(strategy_id)
+
+    decision = SupervisorDecision(
+        actions=[SupervisorAction(action="retire", strategy_id="ghost", rationale="gone")],
+        overall_rationale="try retire a phantom",
+        confidence=0.5,
+    )
+
+    await run_supervisor(
+        graph,
+        InMemoryStore(),
+        conn,
+        trigger="event",
+        agent=_StubAgent(decision=decision),
+        spawn_thread_fn=AsyncMock(),
+        audit_writer_fn=audit,
+        completion_publisher_fn=_publish,
+    )
+
+    assert completions == []  # no archived row → no event
 
 
 # ─── no_op ────────────────────────────────────────────────────────────────

@@ -277,6 +277,11 @@ def archive(state: ResearchState) -> dict[str, Any]:
     generator already set both fields on archive paths; this node is the
     routing destination, ensuring there's a single sink edge to END.
     """
+    # 9e: emission deliberately omitted; cron is the backstop for funnel-internal
+    # completions — see supervisor_subscription.py docstring. (Archives graph state
+    # only; the registry transition is deferred to sync_registry_stage. Do NOT add
+    # publish_thread_completed here — Option 1-minimal, regression-guarded by
+    # tests/unit/test_supervisor_subscription.py.)
     return {
         "stage": "archived",
         "failure_reason": (state.get("failure_reason") or "research_archived_without_reason"),

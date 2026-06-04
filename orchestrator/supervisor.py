@@ -72,7 +72,11 @@ from langgraph.store.base import BaseStore
 from pydantic import BaseModel, ConfigDict, Field
 
 from orchestrator.gates.thresholds import MAX_CONCURRENT_STRATEGIES
-from orchestrator.observability.events import _connect_app_db, record_telemetry
+from orchestrator.observability.events import (
+    _connect_app_db,
+    publish_thread_completed,
+    record_telemetry,
+)
 from orchestrator.tools.store_queries import aget_failures, aget_wins
 
 logger = logging.getLogger(__name__)
@@ -125,6 +129,10 @@ _current_strategies: ContextVar[list[dict[str, Any]] | None] = ContextVar(
 SpawnThreadFn = Callable[[str], Awaitable[None]]
 StopLiveContainerFn = Callable[[str], Awaitable[None]]
 AuditWriterFn = Callable[[psycopg.AsyncConnection, dict[str, Any]], Awaitable[None]]
+# 9e: (strategy_id, payload) → publish a thread_completed event. Injected so the
+# runner's post-commit retire emission is hermetic in unit tests; defaults to
+# events.publish_thread_completed (self-contained, best-effort).
+CompletionPublisherFn = Callable[[str, dict[str, Any]], Awaitable[None]]
 
 
 # ════════════════════════════════════════════════════════════════════════
@@ -833,6 +841,7 @@ async def run_supervisor(
     agent: Any | None = None,
     spawn_thread_fn: SpawnThreadFn | None = None,
     audit_writer_fn: AuditWriterFn | None = None,
+    completion_publisher_fn: CompletionPublisherFn | None = None,
     dry_run: bool = False,
 ) -> SupervisorDecision:
     """One end-to-end supervisor invocation (BRD §5.1, §13 row 9).
@@ -875,12 +884,26 @@ async def run_supervisor(
     REAL production reasoning sequence — the agent calls the read tools as its
     protocol mandates — without mutating the DB.
 
+    Thread-completion emission (Stage 9e, point C — Option 1-minimal): for each
+    action that ACTUALLY archived a registry row this run (a ``retire`` whose
+    impl returned ``retired=True``), a ``thread_completed`` event is published
+    AFTER the batch commit, in the post-commit block alongside the spawn drain —
+    so every event has a backing committed-archived row (no phantom). Spawns,
+    no_ops, capacity-refused retires, and ``sync_registry_stage`` transitions
+    (point D) deliberately do NOT emit; the nightly cron is the backstop for
+    those. Best-effort per emission: a publish failure is logged and swallowed
+    (the committed archive is the source of truth), never rolling back.
+
     Seams: ``agent`` (default ``build_supervisor_agent()``), ``spawn_thread_fn``
     (default the real producer bound to ``graph``), ``audit_writer_fn`` (default
-    the telemetry writer). Tests inject all three.
+    the telemetry writer), ``completion_publisher_fn`` (default
+    :func:`orchestrator.observability.events.publish_thread_completed`). Tests
+    inject them to stay hermetic.
     """
     audit = audit_writer_fn or _default_audit_writer
+    publish_completion = completion_publisher_fn or publish_thread_completed
     spawn_queue: list[str] = []
+    retired_strategy_ids: list[str] = []
 
     async def _enqueue(sid: str) -> None:
         spawn_queue.append(sid)
@@ -932,6 +955,15 @@ async def run_supervisor(
             await _execute_action(action, graph, conn, _enqueue) for action in decision.actions
         ]
 
+        # 9e: collect the strategy_ids that ACTUALLY archived this run (retire
+        # impl returned retired=True) — only those transitioned a registry row,
+        # so only those get a post-commit thread_completed event (no phantom).
+        retired_strategy_ids = [
+            r["result"]["strategy_id"]
+            for r in action_results
+            if r.get("action") == "retire" and r.get("result", {}).get("retired") is True
+        ]
+
         metrics = {
             "trigger": trigger,
             "flake": flake,
@@ -953,5 +985,27 @@ async def run_supervisor(
             await _producer(sid)
         except Exception as exc:  # noqa: BLE001 — one bad kick must not abort the drain
             logger.error("run_supervisor: spawn kick failed strategy_id=%s exc=%s", sid, exc)
+
+    # Post-commit thread_completed emission (9e point C) — the retire UPDATEs are
+    # now committed-archived, so publish AFTER the commit (registry-backed, no
+    # phantom). Best-effort per emission: publish_thread_completed already
+    # swallows Redis failures, and this try/except is the belt-and-braces drain
+    # guard (one bad publish must not abort the rest); a missed publish is
+    # recovered on the next cron. Skipped on the dry_run path (returns earlier).
+    for sid in retired_strategy_ids:
+        try:
+            await publish_completion(
+                sid,
+                {
+                    "strategy_id": sid,
+                    "completed_at": datetime.now(UTC).isoformat(),
+                    "final_stage": _ARCHIVED_STAGE,
+                    "completion_reason": _RETIRE_REASON,
+                },
+            )
+        except Exception as exc:  # noqa: BLE001 — one bad publish must not abort the drain
+            logger.error(
+                "run_supervisor: thread_completed publish failed strategy_id=%s exc=%s", sid, exc
+            )
 
     return decision
