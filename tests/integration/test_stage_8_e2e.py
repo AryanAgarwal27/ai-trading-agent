@@ -28,12 +28,14 @@ STUBBED (not safely runnable in CI — and NOT part of Stage 8's DoD):
 
 TIMING: BRD §13 row 8's "< 5 min" is the APScheduler poll interval
 (``KILL_SWITCH_INTERVAL_MINUTES = 5`` in scheduler.py), NOT a wall-clock budget.
-The job fires synchronously when invoked; this test invokes it directly. Per
-DEFERRED.md D-6, the production live-wake mechanism is a later sub-stage, so this
-test drives the post-kill wake via ``Command(resume=...)`` — exactly D-6's
-"acceptable for tests" pattern. The test asserts CORRECTNESS (the chain routes
-to live_pause) and bounds the kill→route wall time to prove there is no
-5-minute sleep in the code path — it does NOT assert interval timing.
+The job fires synchronously when invoked; this test invokes it directly. The
+production live-wake mechanism was an open gap (DEFERRED.md D-6) when this test
+was first written; **D-6 closed in Stage 9f** — ``make_kill_event_writer`` now
+fires a fire-and-forget ``Command(resume=...)`` itself. This test therefore syncs
+with that real auto-resume (``await asyncio.gather(*_KILL_RESUME_TASKS)``) rather
+than driving a manual resume. The test asserts CORRECTNESS (the chain routes to
+live_pause) and bounds the kill→route wall time to prove there is no 5-minute
+sleep in the code path — it does NOT assert interval timing.
 """
 
 from __future__ import annotations
@@ -50,8 +52,8 @@ import pytest
 import redis.asyncio as aioredis
 from langgraph.checkpoint.memory import InMemorySaver
 from langgraph.graph import END, START, StateGraph
-from langgraph.types import Command
 
+import orchestrator.kill_subscription as kill_subscription
 from orchestrator.agents.coordinator import REVIEWER_AGENTS, LiveVerdict
 from orchestrator.agents.monitors import PaperMonitorContext, PaperMonitorVerdict
 from orchestrator.gates.hitl import autoresume_for_test
@@ -453,37 +455,26 @@ async def test_stage_8_e2e_paper_to_live_to_killswitch_pause(
     # Timing: bounds correctness, not the 5-min interval (see module docstring).
     assert elapsed < 30.0, f"kill→state propagation took {elapsed:.2f}s (no 5-min sleep expected)"
 
-    # ── 4. Wake the thread (D-6 test-driven wake) → routes to live_pause ──
+    # ── 4. 9f auto-resume → routes to live_pause (D-6 closed in 9f) ──────
     #
-    # FRAMEWORK-BEHAVIOR REGRESSION GUARD. The subscription wrote the kill event
-    # via a PARENT-level graph.aupdate_state on a thread parked at a NESTED
-    # (live_subgraph → live_wait) interrupt. Empirically (8h diagnostic), that
-    # parent-level update CLEARS the parent-visible interrupt surface — the
-    # nested subgraph stays parked and resumable via Command(resume=...), but
-    # aget_state().tasks[*].interrupts goes empty at the parent. The two asserts
-    # below lock that in: if a future LangGraph release changes how aupdate_state
-    # affects nested-subgraph interrupt visibility, this fails loudly.
-    pre_wake = await graph.aget_state(config)
-    assert (pre_wake.values.get("artifacts") or {}).get(
-        "kill_switch_event"
-    ) is not None, "kill event must be present in parent state after the subscription write"
-    assert sum(len(getattr(t, "interrupts", ())) for t in pre_wake.tasks) == 0, (
-        "parent-level aupdate_state on a nested-interrupt thread clears the "
-        "parent-visible interrupt surface (8h finding — see DEFERRED.md D-6)"
-    )
-
-    # CONSTRAINT: because the kill event cleared the parent-visible interrupt,
-    # this wake CANNOT use autoresume_for_test / hitl_autoapprove — their guard
-    # ("is there a parent-visible interrupt?") would false-negative here. The
-    # nested live_wait is still parked and resumes correctly via a raw
-    # Command(resume=...), which is exactly how the production live-wake
-    # mechanism (DEFERRED.md D-6, not yet built) must resume the thread: NOT via
-    # the interrupt-presence-gated /wake endpoint. The EARLIER wakes in this test
-    # (paper_gate, paper_wait, live_gate) correctly DO use autoresume_for_test /
-    # hitl_autoapprove because no aupdate_state intervened — those threads are
-    # genuinely parent-visible-parked at the time they are resumed.
-    async for _ in graph.astream(Command(resume={"wake": True}), config=config):
-        pass
+    # The subscription wrote the kill event via a PARENT-level
+    # graph.aupdate_state on a thread parked at a NESTED (live_subgraph →
+    # live_wait) interrupt, which CLEARS the parent-visible interrupt surface
+    # (8h finding) — so the interrupt-presence-gated /wake endpoint cannot resume
+    # it. 9f's make_kill_event_writer (D-6 closed) handles exactly this: after the
+    # aupdate_state it fires a direct Command(resume={"wake": True, ...}) as a
+    # FIRE-AND-FORGET task (tracked in kill_subscription._KILL_RESUME_TASKS). We
+    # sync with that REAL production auto-resume here — awaiting the task instead
+    # of driving a manual resume (which, stacked on top of the auto-resume, would
+    # double-fire live_pause and call stop_trading twice — the regression the 9g
+    # integration CI surfaced on its first run).
+    #
+    # The 8h framework-behavior guard (parent-aupdate_state clears the
+    # parent-visible interrupt while the nested subgraph stays parked-and-
+    # resumable) is now OWNED by test_d6_live_wake.py::
+    # test_periodic_wake_refuses_kill_written_thread (9f); not duplicated here,
+    # and unobservable here anyway now that the auto-resume re-parks the thread.
+    await asyncio.gather(*list(kill_subscription._KILL_RESUME_TASKS))
 
     assert rec.get("stop_trading_called") == 1, "live_pause must POST /stop (halt)"
 

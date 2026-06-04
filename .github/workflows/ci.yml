@@ -62,3 +62,90 @@ jobs:
 
       - name: pytest unit (exclude integration)
         run: pytest -m "not integration" tests/unit
+
+  # ── Integration job (Stage 9g, closes DEFERRED.md D-7) ────────────────
+  # Runs the integration suite against REAL postgres + redis service
+  # containers — the gap D-7 named: ~84 integration tests had never run in
+  # CI. Separate job (not the unit matrix): Python 3.13 only, because
+  # integration exercises service/wiring behavior, not Python-version-
+  # specific language features (the unit matrix covers 3.11-3.13). Ruff +
+  # mypy are NOT re-run here — they are version-agnostic and already gated
+  # by the unit job; re-running them would be pure redundancy.
+  integration:
+    name: pytest integration (postgres + redis)
+    runs-on: ubuntu-22.04
+    timeout-minutes: 15
+
+    services:
+      # pgvector/pgvector:pg15 = postgres:15 + pgvector, matching the local
+      # docker-compose stack and BRD §5.8 — local↔CI DB-image parity so
+      # "passes locally" implies "passes in CI" (the whole point of D-7).
+      postgres:
+        image: pgvector/pgvector:pg15
+        env:
+          POSTGRES_USER: ait
+          POSTGRES_PASSWORD: ait
+          POSTGRES_DB: ai_trading_agent
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U ait -d ai_trading_agent"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+      redis:
+        image: redis:7
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python 3.13
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+
+      - name: Upgrade pip (need >=25.1 for PEP 735 --group support)
+        run: python -m pip install --upgrade "pip>=25.1"
+
+      - name: Install runtime deps + project (editable)
+        run: pip install -e .
+
+      - name: Install dev deps (PEP 735 dependency group)
+        run: pip install --group dev
+
+      - name: Alembic upgrade head
+        env:
+          # DATABASE_URL takes the postgresql+psycopg:// SQLAlchemy dialect
+          # (alembic env.py + SQLAlchemy). The two LANGGRAPH_* URIs below use
+          # RAW postgresql:// — AsyncPostgresSaver/Store.from_conn_string pass
+          # the URI straight to psycopg, which rejects the +psycopg dialect
+          # ("missing = ... in connection info"). This split mirrors .env and
+          # was caught by running the suite against real services in 9g.
+          DATABASE_URL: postgresql+psycopg://ait:ait@localhost:5432/ai_trading_agent
+        run: alembic upgrade head
+
+      - name: pytest integration (exclude @freqtrade real-spawn subset)
+        env:
+          DATABASE_URL: postgresql+psycopg://ait:ait@localhost:5432/ai_trading_agent
+          LANGGRAPH_CHECKPOINT_URI: postgresql://ait:ait@localhost:5432/ai_trading_agent
+          LANGGRAPH_STORE_URI: postgresql://ait:ait@localhost:5432/ai_trading_agent
+          REDIS_URL: redis://localhost:6379/0
+          OPERATOR_TOKEN: ci-stub-token
+          ANTHROPIC_API_KEY: ci-stub-key
+          # Explicit intent; conftest.py forces this to "memory" for every test
+          # regardless, so no integration test exercises (or depends on) the
+          # production SQLAlchemy jobstore.
+          AIT_SCHEDULER_JOBSTORE: memory
+          # Deliberately NOT set: AIT_RUN_REAL_SPAWN_TESTS /
+          # AIT_RUN_REAL_LIVE_SPAWN_TESTS — the @freqtrade real-spawn subset
+          # (6 tests) stays opt-in even in CI and is excluded by the marker below.
+        run: pytest -m "integration and not freqtrade" -v
