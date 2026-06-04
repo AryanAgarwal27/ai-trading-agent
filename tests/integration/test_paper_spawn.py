@@ -25,7 +25,7 @@ import re
 import uuid
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import psycopg
 import pytest
@@ -136,7 +136,9 @@ async def test_paper_spawn_writes_registry_row_before_spawn_call(
         return "http://127.0.0.1:8123"
 
     state = _minimal_state(strategy_id, str(DUMMY_STRATEGY))
-    result = await paper_spawn(state, _empty_config(), spawn_container_fn=stub_spawn)
+    result = await paper_spawn(
+        cast(Any, state), cast(Any, _empty_config()), spawn_container_fn=stub_spawn
+    )
 
     assert seen_row_at_spawn["value"], (
         "registry row absent at spawn-time — orphan-container risk; "
@@ -157,7 +159,9 @@ async def test_paper_spawn_returns_paper_stage_on_success(
 
     before = datetime.now(UTC)
     state = _minimal_state(strategy_id, str(DUMMY_STRATEGY))
-    result = await paper_spawn(state, _empty_config(), spawn_container_fn=stub_spawn)
+    result = await paper_spawn(
+        cast(Any, state), cast(Any, _empty_config()), spawn_container_fn=stub_spawn
+    )
     after = datetime.now(UTC)
 
     assert result["stage"] == "paper"
@@ -194,7 +198,9 @@ async def test_paper_spawn_archives_on_timeout(
         raise PaperSpawnTimeout("container did not /ping within budget")
 
     state = _minimal_state(strategy_id, str(DUMMY_STRATEGY))
-    result = await paper_spawn(state, _empty_config(), spawn_container_fn=stub_spawn)
+    result = await paper_spawn(
+        cast(Any, state), cast(Any, _empty_config()), spawn_container_fn=stub_spawn
+    )
 
     assert result["stage"] == "archived"
     assert result["failure_reason"].startswith("paper_spawn_timeout:")
@@ -212,7 +218,9 @@ async def test_paper_spawn_archives_on_generic_failure(
         raise RuntimeError("docker daemon unreachable")
 
     state = _minimal_state(strategy_id, str(DUMMY_STRATEGY))
-    result = await paper_spawn(state, _empty_config(), spawn_container_fn=stub_spawn)
+    result = await paper_spawn(
+        cast(Any, state), cast(Any, _empty_config()), spawn_container_fn=stub_spawn
+    )
 
     assert result["stage"] == "archived"
     assert result["failure_reason"] == (
@@ -258,7 +266,9 @@ async def test_paper_spawn_handles_port_collision(
         return f"http://127.0.0.1:{port}"
 
     state = _minimal_state(new_id, str(DUMMY_STRATEGY))
-    result = await paper_spawn(state, _empty_config(), spawn_container_fn=stub_spawn)
+    result = await paper_spawn(
+        cast(Any, state), cast(Any, _empty_config()), spawn_container_fn=stub_spawn
+    )
 
     assert received["port"] == 8102, (
         f"expected port 8102 with [8100, 8101] taken, got {received['port']}; "

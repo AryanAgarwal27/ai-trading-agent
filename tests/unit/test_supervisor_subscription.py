@@ -84,7 +84,7 @@ class _FakeRedis:
         return self._pubsub
 
 
-def _pmessage(channel: str, data: Any) -> dict[str, Any]:
+def _pmessage(channel: str | bytes, data: Any) -> dict[str, Any]:
     return {"type": "pmessage", "channel": channel, "data": data}
 
 
@@ -331,15 +331,15 @@ async def test_no_emission_at_graph_only_archive_sinks(monkeypatch: pytest.Monke
     monkeypatch.setattr(live_mod, "publish_thread_completed", _spy)
 
     # research / validation archive: pure sync sinks — no emission.
-    research_archive({"stage": "archived", "failure_reason": "critic_loop_exhausted"})  # type: ignore[arg-type]
-    validation_archive({"stage": "archived", "failure_reason": "robustness_gate"})  # type: ignore[arg-type]
+    research_archive({"stage": "archived", "failure_reason": "critic_loop_exhausted"})
+    validation_archive({"stage": "archived", "failure_reason": "robustness_gate"})
 
     # live_archive: terminal teardown (stop only) — no emission.
     async def _noop_stop(strategy_id: str) -> None:
         return None
 
     await live_mod.live_archive(
-        {"strategy_id": "s1", "stage": "archived", "failure_reason": "coordinator_fail"},  # type: ignore[arg-type]
+        {"strategy_id": "s1", "stage": "archived", "failure_reason": "coordinator_fail"},
         None,
         stop_container_fn=_noop_stop,
     )

@@ -13,9 +13,10 @@ narrower than the loop tests."""
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import pytest
+from langchain_core.runnables import RunnableConfig
 from langgraph.checkpoint.memory import InMemorySaver
 from langgraph.store.memory import InMemoryStore
 
@@ -149,14 +150,17 @@ async def test_subgraph_runs_end_to_end_with_stubs(tmp_path: Path) -> None:
         lookahead_runner=_make_pass_lookahead_runner(),
         checkpointer=InMemorySaver(),
     )
-    config = {"configurable": {"thread_id": "test_topology_001"}}
+    config: RunnableConfig = {"configurable": {"thread_id": "test_topology_001"}}
     final = await graph.ainvoke(
-        {
-            "strategy_id": "test_topo_001",
-            "pairs": ["BTC/USDT"],
-            "timeframe": "5m",
-            "current_regime": "low_vol_up",
-        },
+        cast(
+            Any,
+            {
+                "strategy_id": "test_topo_001",
+                "pairs": ["BTC/USDT"],
+                "timeframe": "5m",
+                "current_regime": "low_vol_up",
+            },
+        ),
         config=config,
     )
 
@@ -235,14 +239,17 @@ async def test_load_context_reads_from_store(tmp_path: Path) -> None:
         lookahead_runner=_make_pass_lookahead_runner(),
         checkpointer=InMemorySaver(),
     )
-    config = {"configurable": {"thread_id": "test_load_ctx_001"}}
+    config: RunnableConfig = {"configurable": {"thread_id": "test_load_ctx_001"}}
     final = await graph.ainvoke(
-        {
-            "strategy_id": "test_load_001",
-            "pairs": ["BTC/USDT"],
-            "timeframe": "5m",
-            "current_regime": "low_vol_up",
-        },
+        cast(
+            Any,
+            {
+                "strategy_id": "test_load_001",
+                "pairs": ["BTC/USDT"],
+                "timeframe": "5m",
+                "current_regime": "low_vol_up",
+            },
+        ),
         config=config,
     )
 
@@ -291,13 +298,16 @@ async def test_load_context_defaults_regime_when_missing(tmp_path: Path) -> None
         lookahead_runner=_make_pass_lookahead_runner(),
         checkpointer=InMemorySaver(),
     )
-    config = {"configurable": {"thread_id": "test_no_regime_001"}}
+    config: RunnableConfig = {"configurable": {"thread_id": "test_no_regime_001"}}
     final = await graph.ainvoke(
-        {
-            "strategy_id": "test_no_regime",
-            "pairs": ["BTC/USDT"],
-            "timeframe": "5m",
-        },
+        cast(
+            Any,
+            {
+                "strategy_id": "test_no_regime",
+                "pairs": ["BTC/USDT"],
+                "timeframe": "5m",
+            },
+        ),
         config=config,
     )
     assert final["current_regime"] == "unknown"

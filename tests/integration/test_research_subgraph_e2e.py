@@ -28,9 +28,10 @@ BRD §13 Stage 5 DoD pinned by this test:
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import pytest
+from langchain_core.runnables import RunnableConfig
 from langgraph.checkpoint.memory import InMemorySaver
 from pydantic import BaseModel
 
@@ -61,7 +62,7 @@ def _midpoint_params(schema_cls: type[BaseModel]) -> BaseModel:
     return schema_cls(**raw)
 
 
-def _make_stub_researcher(template_name: str):
+def _make_stub_researcher(template_name: str) -> Any:
     async def stub(state: dict[str, Any]) -> dict[str, Any]:
         existing = state.get("artifacts") or {}
         return {
@@ -90,7 +91,7 @@ def _make_stub_researcher(template_name: str):
     return stub
 
 
-def _make_stub_pass_critic():
+def _make_stub_pass_critic() -> Any:
     async def stub(state: dict[str, Any]) -> dict[str, Any]:
         existing = state.get("artifacts") or {}
         prior = list(existing.get("critic_verdicts") or [])
@@ -114,8 +115,10 @@ def _make_stub_pass_critic():
     return stub
 
 
-def _make_stub_pass_lookahead():
-    async def stub(strategy_path, *, pairs, timeframe, timerange):
+def _make_stub_pass_lookahead() -> Any:
+    async def stub(
+        strategy_path: Any, *, pairs: Any, timeframe: Any, timerange: Any
+    ) -> dict[str, Any]:
         return {
             "passed": True,
             "details": "stub: no look-ahead bias",
@@ -128,8 +131,10 @@ def _make_stub_pass_lookahead():
     return stub
 
 
-def _make_stub_fail_lookahead():
-    async def stub(strategy_path, *, pairs, timeframe, timerange):
+def _make_stub_fail_lookahead() -> Any:
+    async def stub(
+        strategy_path: Any, *, pairs: Any, timeframe: Any, timerange: Any
+    ) -> dict[str, Any]:
         return {
             "passed": False,
             "details": "Found a problem: forward shift in feature column rsi",
@@ -162,7 +167,7 @@ async def test_e2e_research_subgraph_passes_with_real_template_and_validator(
     # Stub the extractor (avoid LLM call) but keep the real
     # generator_node pipeline so we exercise render_template + AST
     # validator + file write.
-    async def stub_extractor(proposal, template_source, schema_cls):
+    async def stub_extractor(proposal: Any, template_source: Any, schema_cls: Any) -> BaseModel:
         return params
 
     from orchestrator.agents import generator as gen_mod
@@ -176,14 +181,17 @@ async def test_e2e_research_subgraph_passes_with_real_template_and_validator(
         lookahead_runner=_make_stub_pass_lookahead(),
         checkpointer=InMemorySaver(),
     )
-    config = {"configurable": {"thread_id": "test_e2e_happy"}}
+    config: RunnableConfig = {"configurable": {"thread_id": "test_e2e_happy"}}
     final = await graph.ainvoke(
-        {
-            "strategy_id": "test_e2e_happy",
-            "pairs": ["BTC/USDT"],
-            "timeframe": "5m",
-            "current_regime": "mid_vol_flat",
-        },
+        cast(
+            Any,
+            {
+                "strategy_id": "test_e2e_happy",
+                "pairs": ["BTC/USDT"],
+                "timeframe": "5m",
+                "current_regime": "mid_vol_flat",
+            },
+        ),
         config=config,
     )
 
@@ -216,7 +224,7 @@ async def test_e2e_research_subgraph_archives_on_lookahead_fail(
     schema_cls = load_schema(template_name)
     params = _midpoint_params(schema_cls)
 
-    async def stub_extractor(proposal, template_source, schema_cls):
+    async def stub_extractor(proposal: Any, template_source: Any, schema_cls: Any) -> BaseModel:
         return params
 
     from orchestrator.agents import generator as gen_mod
@@ -230,14 +238,17 @@ async def test_e2e_research_subgraph_archives_on_lookahead_fail(
         lookahead_runner=_make_stub_fail_lookahead(),
         checkpointer=InMemorySaver(),
     )
-    config = {"configurable": {"thread_id": "test_e2e_la_fail"}}
+    config: RunnableConfig = {"configurable": {"thread_id": "test_e2e_la_fail"}}
     final = await graph.ainvoke(
-        {
-            "strategy_id": "test_e2e_la_fail",
-            "pairs": ["BTC/USDT"],
-            "timeframe": "5m",
-            "current_regime": "mid_vol_flat",
-        },
+        cast(
+            Any,
+            {
+                "strategy_id": "test_e2e_la_fail",
+                "pairs": ["BTC/USDT"],
+                "timeframe": "5m",
+                "current_regime": "mid_vol_flat",
+            },
+        ),
         config=config,
     )
 

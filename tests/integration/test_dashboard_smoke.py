@@ -48,7 +48,7 @@ class _FakeResponse:
 
             raise httpx.HTTPStatusError(
                 f"{self.status_code}",
-                request=None,
+                request=httpx.Request("GET", "http://test"),
                 response=None,  # type: ignore[arg-type]
             )
 

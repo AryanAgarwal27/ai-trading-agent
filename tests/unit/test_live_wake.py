@@ -182,7 +182,7 @@ async def test_live_spawn_failure_does_not_register_wake(monkeypatch: pytest.Mon
     }
     result = await live_spawn(
         state,  # type: ignore[arg-type]
-        {"configurable": {"thread_id": "strategy_sid2"}},  # type: ignore[arg-type]
+        {"configurable": {"thread_id": "strategy_sid2"}},
         spawn_live_container_fn=_boom_spawn,
         registry_writer_fn=_stub_registry,
         secrets_provider=object(),  # type: ignore[arg-type]
@@ -203,7 +203,7 @@ async def test_live_archive_cancels_wake() -> None:
         return None
 
     result = await live_archive(
-        {"strategy_id": "sid1", "stage": "archived", "failure_reason": "coordinator_fail"},  # type: ignore[arg-type]
+        {"strategy_id": "sid1", "stage": "archived", "failure_reason": "coordinator_fail"},
         None,
         stop_container_fn=_noop_stop,
         unschedule_wake_fn=_spy_unschedule,
@@ -221,13 +221,13 @@ async def test_live_archive_cancels_wake() -> None:
 def test_route_after_live_wait_no_kill_goes_to_evaluate() -> None:
     """Regression guard for the NORMAL periodic live cycle: a wake with no
     kill_switch_event proceeds to live_evaluate (the reviewer fan-out)."""
-    assert _route_after_live_wait({"artifacts": {}}) == "live_evaluate"  # type: ignore[arg-type]
-    assert _route_after_live_wait({}) == "live_evaluate"  # type: ignore[arg-type]
+    assert _route_after_live_wait({"artifacts": {}}) == "live_evaluate"
+    assert _route_after_live_wait({}) == "live_evaluate"
 
 
 def test_route_after_live_wait_kill_goes_to_pause() -> None:
     assert (
-        _route_after_live_wait({"artifacts": {"kill_switch_event": {"reason": "dd"}}})  # type: ignore[arg-type]
+        _route_after_live_wait({"artifacts": {"kill_switch_event": {"reason": "dd"}}})
         == "live_pause"
     )
 

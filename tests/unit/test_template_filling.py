@@ -19,7 +19,7 @@ import ast
 import importlib.util
 import re
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import pytest
 from pydantic import BaseModel
@@ -59,7 +59,7 @@ def _load_schema(stem: str, class_name: str) -> type[BaseModel]:
     assert spec is not None and spec.loader is not None, f"Could not build module spec for {path}"
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
-    return getattr(module, class_name)
+    return cast("type[BaseModel]", getattr(module, class_name))
 
 
 def _extract_slots(source: str) -> dict[str, str]:
@@ -90,7 +90,7 @@ def _midpoint_value(field: Any) -> int | float | None:
     if field.annotation is int:
         return int((ge + le) // 2)
     if field.annotation is float:
-        return (ge + le) / 2.0
+        return cast("int | float | None", (ge + le) / 2.0)
     return None
 
 

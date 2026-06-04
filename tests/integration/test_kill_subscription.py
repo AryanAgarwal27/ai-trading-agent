@@ -87,7 +87,7 @@ class _FakeGraph:
         self.updates.append((config, values))
 
 
-def _pmessage(channel: str, data: Any) -> dict[str, Any]:
+def _pmessage(channel: str | bytes, data: Any) -> dict[str, Any]:
     return {"type": "pmessage", "channel": channel, "data": data}
 
 

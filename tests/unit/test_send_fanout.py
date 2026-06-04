@@ -26,7 +26,7 @@ That's the failure mode this test guards against.
 from __future__ import annotations
 
 import uuid
-from typing import Any
+from typing import Any, cast
 
 import pytest
 from langchain_core.runnables import RunnableConfig
@@ -217,7 +217,7 @@ def test_prepare_validation_inputs_respects_seeded_values() -> None:
         "folds": _single_fold(),
         "strategy_path": "/tmp/x.py",
     }
-    updates = prepare_validation_inputs(seeded)
+    updates = prepare_validation_inputs(cast(Any, seeded))
     assert "param_sets" not in updates
     assert "folds" not in updates
     assert "strategy_path" not in updates
@@ -308,6 +308,7 @@ def test_gate_backtest_fails_on_zero_trade_fold() -> None:
     cmd = gate_backtest(state)
 
     assert cmd.goto == "archive"
+    assert cmd.update is not None
     assert cmd.update["stage"] == "archived"
     failure_reason = cmd.update["failure_reason"]
     assert failure_reason.startswith("backtest_gate:")
@@ -335,6 +336,7 @@ def test_gate_backtest_passes_when_all_folds_meet_per_fold_min() -> None:
     }
     cmd = gate_backtest(state)
     assert cmd.goto == "plan_robustness"
+    assert cmd.update is not None
     assert cmd.update["gate_decisions"]["backtest"]["passed"] is True
     assert cmd.update["gate_decisions"]["backtest"]["failures"] == []
 

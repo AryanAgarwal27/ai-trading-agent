@@ -37,7 +37,7 @@ class _WaitState(TypedDict, total=False):
 def _build_paper_wait_test_graph(saver: Any) -> Any:
     """Graph: START → paper_wait(real interrupt) → END."""
     g: StateGraph[_WaitState, _WaitState, _WaitState, _WaitState] = StateGraph(_WaitState)
-    g.add_node("paper_wait", paper_wait)  # type: ignore[arg-type]
+    g.add_node("paper_wait", paper_wait)
     g.add_edge(START, "paper_wait")
     g.add_edge("paper_wait", END)
     return g.compile(checkpointer=saver)

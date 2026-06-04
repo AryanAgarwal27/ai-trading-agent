@@ -206,7 +206,7 @@ def _build_e2e_graph(saver: Any, rec: dict[str, Any]) -> Any:
     rb: StateGraph[StrategyState, StrategyState, StrategyState, StrategyState] = StateGraph(
         StrategyState
     )
-    rb.add_node("research_pass", _research_passthrough)
+    rb.add_node("research_pass", _research_passthrough)  # type: ignore[arg-type]
     rb.add_edge(START, "research_pass")
     rb.add_edge("research_pass", END)
     research = rb.compile()
@@ -393,7 +393,7 @@ async def test_stage_8_e2e_paper_to_live_to_killswitch_pause(
 
     # ── 3. Synthetic drawdown → kill switch (real Redis pub + sub) ────────
     redis_url = os.environ.get("REDIS_URL", "redis://127.0.0.1:6379/0")
-    redis_client = aioredis.from_url(redis_url)
+    redis_client = aioredis.from_url(redis_url)  # type: ignore[no-untyped-call]
 
     real_writer = make_kill_event_writer(graph)
     writer_captures: list[tuple[str, dict[str, Any]]] = []

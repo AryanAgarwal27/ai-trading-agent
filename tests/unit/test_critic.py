@@ -10,6 +10,8 @@ Loop-level tests live in tests/unit/test_critic_loop.py.
 
 from __future__ import annotations
 
+from typing import Any
+
 import pytest
 from langgraph.constants import END
 from pydantic import ValidationError
@@ -49,7 +51,7 @@ def test_critic_verdict_accepts_revise() -> None:
 def test_critic_verdict_rejects_bogus_verdict() -> None:
     with pytest.raises(ValidationError):
         CriticVerdict(
-            verdict="abstain",  # type: ignore[arg-type]
+            verdict="abstain",
             primary_concern="x",
             rationale="y",
             revision_guidance="z",
@@ -138,7 +140,7 @@ def test_verdict_to_state_update_preserves_existing_artifacts() -> None:
 # ─── revise_or_proceed routing tests ──────────────────────────────────
 
 
-def _state_with_critic_vote(verdict: str, *, revision_count: int = 0) -> dict:
+def _state_with_critic_vote(verdict: str, *, revision_count: int = 0) -> dict[str, Any]:
     """Build a minimal state with one critic vote of the given verdict."""
     return {
         "revision_count": revision_count,

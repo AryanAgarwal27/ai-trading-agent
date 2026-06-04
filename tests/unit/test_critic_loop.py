@@ -17,8 +17,9 @@ generator / critic nodes, asserting:
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
+from langchain_core.runnables import RunnableConfig
 from langgraph.checkpoint.memory import InMemorySaver
 
 from orchestrator.agents.critic import MAX_REVISIONS
@@ -205,14 +206,17 @@ async def test_loop_bounds_at_max_revisions_with_always_revise(tmp_path: Path) -
         lookahead_runner=_make_pass_lookahead_runner(),
         checkpointer=InMemorySaver(),
     )
-    config = {"configurable": {"thread_id": "test_loop_max"}}
+    config: RunnableConfig = {"configurable": {"thread_id": "test_loop_max"}}
     final = await graph.ainvoke(
-        {
-            "strategy_id": "test_loop_max",
-            "pairs": ["BTC/USDT"],
-            "timeframe": "5m",
-            "current_regime": "mid_vol_flat",
-        },
+        cast(
+            Any,
+            {
+                "strategy_id": "test_loop_max",
+                "pairs": ["BTC/USDT"],
+                "timeframe": "5m",
+                "current_regime": "mid_vol_flat",
+            },
+        ),
         config=config,
     )
 
@@ -243,14 +247,17 @@ async def test_loop_terminates_cleanly_when_critic_passes(tmp_path: Path) -> Non
         lookahead_runner=_make_pass_lookahead_runner(),
         checkpointer=InMemorySaver(),
     )
-    config = {"configurable": {"thread_id": "test_loop_pass_2nd"}}
+    config: RunnableConfig = {"configurable": {"thread_id": "test_loop_pass_2nd"}}
     final = await graph.ainvoke(
-        {
-            "strategy_id": "test_loop_pass_2nd",
-            "pairs": ["BTC/USDT"],
-            "timeframe": "5m",
-            "current_regime": "mid_vol_flat",
-        },
+        cast(
+            Any,
+            {
+                "strategy_id": "test_loop_pass_2nd",
+                "pairs": ["BTC/USDT"],
+                "timeframe": "5m",
+                "current_regime": "mid_vol_flat",
+            },
+        ),
         config=config,
     )
 
@@ -278,14 +285,17 @@ async def test_loop_terminates_immediately_when_critic_passes_first_call(
         lookahead_runner=_make_pass_lookahead_runner(),
         checkpointer=InMemorySaver(),
     )
-    config = {"configurable": {"thread_id": "test_loop_pass_1st"}}
+    config: RunnableConfig = {"configurable": {"thread_id": "test_loop_pass_1st"}}
     final = await graph.ainvoke(
-        {
-            "strategy_id": "test_loop_pass_1st",
-            "pairs": ["BTC/USDT"],
-            "timeframe": "5m",
-            "current_regime": "mid_vol_flat",
-        },
+        cast(
+            Any,
+            {
+                "strategy_id": "test_loop_pass_1st",
+                "pairs": ["BTC/USDT"],
+                "timeframe": "5m",
+                "current_regime": "mid_vol_flat",
+            },
+        ),
         config=config,
     )
 
@@ -309,14 +319,17 @@ async def test_generator_sees_accumulated_critic_notes(tmp_path: Path) -> None:
         lookahead_runner=_make_pass_lookahead_runner(),
         checkpointer=InMemorySaver(),
     )
-    config = {"configurable": {"thread_id": "test_critic_notes_accum"}}
+    config: RunnableConfig = {"configurable": {"thread_id": "test_critic_notes_accum"}}
     await graph.ainvoke(
-        {
-            "strategy_id": "test_critic_notes_accum",
-            "pairs": ["BTC/USDT"],
-            "timeframe": "5m",
-            "current_regime": "mid_vol_flat",
-        },
+        cast(
+            Any,
+            {
+                "strategy_id": "test_critic_notes_accum",
+                "pairs": ["BTC/USDT"],
+                "timeframe": "5m",
+                "current_regime": "mid_vol_flat",
+            },
+        ),
         config=config,
     )
 
@@ -343,14 +356,17 @@ async def test_critic_verdicts_artifact_accumulates(tmp_path: Path) -> None:
         lookahead_runner=_make_pass_lookahead_runner(),
         checkpointer=InMemorySaver(),
     )
-    config = {"configurable": {"thread_id": "test_critic_artifacts"}}
+    config: RunnableConfig = {"configurable": {"thread_id": "test_critic_artifacts"}}
     final = await graph.ainvoke(
-        {
-            "strategy_id": "test_critic_artifacts",
-            "pairs": ["BTC/USDT"],
-            "timeframe": "5m",
-            "current_regime": "mid_vol_flat",
-        },
+        cast(
+            Any,
+            {
+                "strategy_id": "test_critic_artifacts",
+                "pairs": ["BTC/USDT"],
+                "timeframe": "5m",
+                "current_regime": "mid_vol_flat",
+            },
+        ),
         config=config,
     )
 

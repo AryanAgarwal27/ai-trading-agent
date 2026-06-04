@@ -57,7 +57,7 @@ async def _run_with_published(strategy_ids: list[str]) -> list[str]:
     """Wire scheduler + subscription against real Redis, publish the given
     completions, wait out the debounce, and return the recorded run triggers."""
     redis_url = os.environ.get("REDIS_URL", "redis://127.0.0.1:6379/0")
-    redis_client = aioredis.from_url(redis_url)
+    redis_client = aioredis.from_url(redis_url)  # type: ignore[no-untyped-call]
 
     triggers: list[str] = []
 

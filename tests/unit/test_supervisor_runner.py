@@ -25,7 +25,7 @@ Covered:
 from __future__ import annotations
 
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, cast
 from unittest.mock import AsyncMock
 
 import pytest
@@ -178,7 +178,7 @@ async def test_spawn_inserts_row_kicks_producer_postcommit_logs_once() -> None:
     decision = await run_supervisor(
         graph,
         InMemoryStore(),
-        conn,
+        cast(Any, conn),
         trigger="cron",
         agent=_StubAgent(decision=_spawn_decision()),
         spawn_thread_fn=spawn_rec,
@@ -214,7 +214,7 @@ async def test_spawn_at_capacity_refused_but_logged() -> None:
     await run_supervisor(
         graph,
         InMemoryStore(),
-        conn,
+        cast(Any, conn),
         trigger="event",
         agent=_StubAgent(decision=_spawn_decision("strat_e")),
         spawn_thread_fn=spawn_rec,
@@ -254,7 +254,7 @@ async def test_retire_updates_state_registry_and_logs() -> None:
     await run_supervisor(
         graph,
         InMemoryStore(),
-        conn,
+        cast(Any, conn),
         trigger="manual",
         agent=_StubAgent(decision=decision),
         spawn_thread_fn=AsyncMock(),
@@ -299,7 +299,7 @@ async def test_failed_retire_does_not_emit_completion() -> None:
     await run_supervisor(
         graph,
         InMemoryStore(),
-        conn,
+        cast(Any, conn),
         trigger="event",
         agent=_StubAgent(decision=decision),
         spawn_thread_fn=AsyncMock(),
@@ -326,7 +326,7 @@ async def test_no_op_decision_mutates_nothing_but_logs() -> None:
     await run_supervisor(
         graph,
         InMemoryStore(),
-        conn,
+        cast(Any, conn),
         trigger="cron",
         agent=_StubAgent(decision=decision),
         spawn_thread_fn=spawn_rec,
@@ -350,7 +350,7 @@ async def test_agent_raise_falls_back_to_no_op() -> None:
     decision = await run_supervisor(
         _StubGraph(),
         InMemoryStore(),
-        conn,
+        cast(Any, conn),
         trigger="cron",
         agent=_StubAgent(raises=RuntimeError("llm 500")),  # stands in for ValidationError too
         spawn_thread_fn=AsyncMock(),
@@ -369,7 +369,7 @@ async def test_agent_malformed_output_falls_back_to_no_op() -> None:
     decision = await run_supervisor(
         _StubGraph(),
         InMemoryStore(),
-        conn,
+        cast(Any, conn),
         trigger="cron",
         agent=_StubAgent(bad_response=True),
         spawn_thread_fn=AsyncMock(),
@@ -391,7 +391,7 @@ async def test_contextvars_reset_after_run() -> None:
     await run_supervisor(
         _StubGraph(),
         InMemoryStore(),
-        conn,
+        cast(Any, conn),
         trigger="cron",
         agent=_StubAgent(decision=decision),
         spawn_thread_fn=AsyncMock(),
@@ -415,7 +415,7 @@ async def test_telemetry_payload_shape() -> None:
     await run_supervisor(
         _StubGraph(),
         InMemoryStore(),
-        conn,
+        cast(Any, conn),
         trigger="manual",
         agent=_StubAgent(decision=_spawn_decision()),
         spawn_thread_fn=AsyncMock(),
@@ -448,7 +448,7 @@ async def test_two_spawns_single_commit() -> None:
     await run_supervisor(
         _StubGraph(),
         InMemoryStore(),
-        conn,
+        cast(Any, conn),
         trigger="cron",
         agent=_StubAgent(decision=decision),
         spawn_thread_fn=spawn_rec,
@@ -484,7 +484,7 @@ async def test_dry_run_skips_writes_and_telemetry() -> None:
     result = await run_supervisor(
         graph,
         InMemoryStore(),
-        conn,
+        cast(Any, conn),
         trigger="manual",
         agent=_StubAgent(decision=decision),
         spawn_thread_fn=spawn_rec,
@@ -512,7 +512,7 @@ async def test_exception_rolls_back_and_reraises() -> None:
         await run_supervisor(
             _StubGraph(),
             InMemoryStore(),
-            conn,
+            cast(Any, conn),
             trigger="cron",
             agent=_StubAgent(decision=_spawn_decision()),
             spawn_thread_fn=AsyncMock(),

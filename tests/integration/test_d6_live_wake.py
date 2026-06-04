@@ -71,7 +71,7 @@ def _build_live_wait_test_graph(saver: Any) -> Any:
     g: StateGraph[_LiveWaitState, _LiveWaitState, _LiveWaitState, _LiveWaitState] = StateGraph(
         _LiveWaitState
     )
-    g.add_node("live_wait", live_wait)  # type: ignore[arg-type]
+    g.add_node("live_wait", live_wait)
     g.add_node("live_evaluate", live_evaluate_stub)
     g.add_node("live_pause", live_pause_stub)
     g.add_edge(START, "live_wait")

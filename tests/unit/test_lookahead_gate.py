@@ -23,7 +23,7 @@ from orchestrator.subgraphs.research import (
 # ─── helpers ───────────────────────────────────────────────────────────
 
 
-def _make_runner_returning(passed: bool, details: str = "stub"):
+def _make_runner_returning(passed: bool, details: str = "stub") -> Any:
     """Build a stub runner that returns a canned LookaheadResult."""
 
     async def stub(
@@ -197,6 +197,7 @@ async def test_lookahead_gate_preserves_existing_artifacts(tmp_path: Path) -> No
     state["artifacts"]["research_proposal"] = {"hypothesis": "h"}
     state["artifacts"]["critic_verdicts"] = [{"verdict": "pass"}]
     cmd = await gate(state)
+    assert cmd.update is not None
     artifacts = cmd.update["artifacts"]
     assert artifacts["research_proposal"] == {"hypothesis": "h"}
     assert artifacts["critic_verdicts"] == [{"verdict": "pass"}]

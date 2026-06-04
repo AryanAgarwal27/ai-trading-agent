@@ -46,7 +46,7 @@ def _make_feather(path: Path, start: date, end: date) -> None:
             "close": pa.array([1.0, 2.0]),
         }
     )
-    feather.write_feather(table, path)
+    feather.write_feather(table, path)  # type: ignore[no-untyped-call]
 
 
 def _bounds(folds: list[dict[str, str]]) -> tuple[date, date]:

@@ -162,7 +162,7 @@ async def _park_at_paper_gate(strategy_id: str, thread_id: str) -> None:
         pass
 
 
-def _filter_advanced(publish_calls: list) -> list:
+def _filter_advanced(publish_calls: list[Any]) -> list[Any]:
     """gate_pending fires during the initial park; gate_advanced fires
     on resume. Filter to the resume-side publishes only."""
     return [c for c in publish_calls if c.args[0].startswith("ai-trading-agent:gate_advanced:")]

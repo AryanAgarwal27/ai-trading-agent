@@ -84,6 +84,7 @@ async def test_supervisor_cron_job_invokes_runner(monkeypatch: pytest.MonkeyPatc
     await supervisor_cron_job(run_supervisor_fn=run_fn)
 
     run_fn.assert_awaited_once()
+    assert run_fn.await_args is not None
     assert run_fn.await_args.args[0] is fake_conn  # conn passed positionally
     assert run_fn.await_args.kwargs["trigger"] == "cron"
     fake_conn.close.assert_awaited_once()  # conn always closed

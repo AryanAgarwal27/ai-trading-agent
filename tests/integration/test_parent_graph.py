@@ -69,7 +69,7 @@ def _ctx_stub() -> Any:
 def _monitor_fixed(decision: str) -> Any:
     async def _stub(_ctx: PaperMonitorContext) -> PaperMonitorVerdict:
         return PaperMonitorVerdict(
-            decision=decision,  # type: ignore[arg-type]
+            decision=decision,
             primary_observation=f"obs-{decision}",
             rationale=f"rationale-{decision}",
             confidence=0.9,
@@ -179,7 +179,7 @@ def _build_stub_composed_graph(
     rb: StateGraph[StrategyState, StrategyState, StrategyState, StrategyState] = StateGraph(
         StrategyState
     )
-    rb.add_node("research_pass", _research_passthrough)
+    rb.add_node("research_pass", _research_passthrough)  # type: ignore[arg-type]
     rb.add_edge(START, "research_pass")
     rb.add_edge("research_pass", END)
     research = rb.compile()

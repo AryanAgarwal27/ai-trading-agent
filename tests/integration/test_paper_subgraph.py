@@ -24,10 +24,11 @@ from __future__ import annotations
 import os
 import uuid
 from datetime import UTC, datetime, timedelta
-from typing import Any
+from typing import Any, cast
 
 import psycopg
 import pytest
+from langchain_core.runnables import RunnableConfig
 from langgraph.checkpoint.memory import InMemorySaver
 
 from orchestrator.agents.monitors import PaperMonitorContext, PaperMonitorVerdict
@@ -110,7 +111,7 @@ def _ctx_stub(*, max_drawdown: float = 0.04, trades: list[dict[str, Any]] | None
 def _monitor_fixed(decision: str) -> Any:
     async def _stub(_ctx: PaperMonitorContext) -> PaperMonitorVerdict:
         return PaperMonitorVerdict(
-            decision=decision,  # type: ignore[arg-type]
+            decision=decision,
             primary_observation=f"obs-{decision}",
             rationale=f"rationale-{decision}",
             confidence=0.9,
@@ -127,7 +128,7 @@ def _monitor_sequence(decisions: list[str]) -> Any:
         decision = decisions[idx]
         calls["n"] += 1
         return PaperMonitorVerdict(
-            decision=decision,  # type: ignore[arg-type]
+            decision=decision,
             primary_observation=f"obs-{decision}",
             rationale=f"rationale-{decision}",
             confidence=0.9,
@@ -143,7 +144,7 @@ def _stop_stub(record: dict[str, Any]) -> Any:
     return _stub
 
 
-async def _parked_kind(graph: Any, config: dict[str, Any]) -> str | None:
+async def _parked_kind(graph: Any, config: RunnableConfig) -> str | None:
     snap = await graph.aget_state(config)
     for task in snap.tasks:
         for intr in getattr(task, "interrupts", ()):
@@ -173,10 +174,12 @@ async def test_full_cycle_rearm_then_advance_to_live(
         stop_container_fn=_stop_stub({}),
         checkpointer=InMemorySaver(),
     )
-    config = {"configurable": {"thread_id": thread_id}}
+    config: RunnableConfig = {"configurable": {"thread_id": thread_id}}
 
     # Run to first park.
-    async for _ in graph.astream(_minimal_paper_state(strategy_id, started), config=config):
+    async for _ in graph.astream(
+        cast(Any, _minimal_paper_state(strategy_id, started)), config=config
+    ):
         pass
     assert await _parked_kind(graph, config) == "paper_wait"
 
@@ -219,9 +222,11 @@ async def test_divergence_check_overrides_premature_advance(
         stop_container_fn=_stop_stub({}),
         checkpointer=InMemorySaver(),
     )
-    config = {"configurable": {"thread_id": thread_id}}
+    config: RunnableConfig = {"configurable": {"thread_id": thread_id}}
 
-    async for _ in graph.astream(_minimal_paper_state(strategy_id, started), config=config):
+    async for _ in graph.astream(
+        cast(Any, _minimal_paper_state(strategy_id, started)), config=config
+    ):
         pass
     assert await _parked_kind(graph, config) == "paper_wait"
 
@@ -256,9 +261,11 @@ async def test_reject_path_tears_down_and_archives(
         stop_container_fn=_stop_stub(stop_rec),
         checkpointer=InMemorySaver(),
     )
-    config = {"configurable": {"thread_id": thread_id}}
+    config: RunnableConfig = {"configurable": {"thread_id": thread_id}}
 
-    async for _ in graph.astream(_minimal_paper_state(strategy_id, started), config=config):
+    async for _ in graph.astream(
+        cast(Any, _minimal_paper_state(strategy_id, started)), config=config
+    ):
         pass
     await autoresume_for_test(graph, thread_id, {"wake": True})
     assert await _parked_kind(graph, config) == "live_gate"
@@ -296,9 +303,11 @@ async def test_kill_path_tears_down_and_archives(
         stop_container_fn=_stop_stub(stop_rec),
         checkpointer=InMemorySaver(),
     )
-    config = {"configurable": {"thread_id": thread_id}}
+    config: RunnableConfig = {"configurable": {"thread_id": thread_id}}
 
-    async for _ in graph.astream(_minimal_paper_state(strategy_id, started), config=config):
+    async for _ in graph.astream(
+        cast(Any, _minimal_paper_state(strategy_id, started)), config=config
+    ):
         pass
     await autoresume_for_test(graph, thread_id, {"wake": True})
 
@@ -329,9 +338,11 @@ async def test_hard_drawdown_overrides_to_kill(
         stop_container_fn=_stop_stub(stop_rec),
         checkpointer=InMemorySaver(),
     )
-    config = {"configurable": {"thread_id": thread_id}}
+    config: RunnableConfig = {"configurable": {"thread_id": thread_id}}
 
-    async for _ in graph.astream(_minimal_paper_state(strategy_id, started), config=config):
+    async for _ in graph.astream(
+        cast(Any, _minimal_paper_state(strategy_id, started)), config=config
+    ):
         pass
     await autoresume_for_test(graph, thread_id, {"wake": True})
 

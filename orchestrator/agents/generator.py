@@ -259,11 +259,13 @@ async def _default_params_extractor(
     # return overload only yields a dict for TypedDict/JSON schemas or
     # include_raw=True — neither holds here (schema_cls is typed type[BaseModel]),
     # so the dict branch is unreachable. Cast to the real runtime type.
+    # WARNING: this cast is valid ONLY while include_raw stays unset AND
+    # schema_cls is a BaseModel subclass. If a future change passes
+    # include_raw=True (or a TypedDict/JSON schema), the dict branch becomes
+    # LIVE again and this cast would mask it — revisit model_dump()/return below.
     params_instance = cast(
         "BaseModel",
-        await structured.ainvoke(
-            [SystemMessage(content=system), HumanMessage(content=user_msg)]
-        ),
+        await structured.ainvoke([SystemMessage(content=system), HumanMessage(content=user_msg)]),
     )
 
     # SMOKE_DEBUG=1 in env → print the extracted params for smoke-probe

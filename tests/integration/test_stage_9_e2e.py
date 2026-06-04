@@ -184,7 +184,7 @@ async def test_event_completion_path_triggers_one_run() -> None:
     exactly ONE run at trigger="event" → committed telemetry row."""
     _skip_if_no_db()
     redis_url = os.environ.get("REDIS_URL", "redis://127.0.0.1:6379/0")
-    redis_client = aioredis.from_url(redis_url)
+    redis_client = aioredis.from_url(redis_url)  # type: ignore[no-untyped-call]
 
     async with (
         AsyncPostgresSaver.from_conn_string(os.environ["LANGGRAPH_CHECKPOINT_URI"]) as saver,
@@ -295,7 +295,9 @@ async def test_spawn_up_to_capacity_refuses_overflow_and_audits_all() -> None:
                 await cur.execute(
                     "SELECT count(*) FROM strategy_registry WHERE stage != 'archived'"
                 )
-                active = (await cur.fetchone())[0]
+                active_row = await cur.fetchone()
+                assert active_row is not None
+                active = active_row[0]
             assert active == 4, f"capacity gate must cap active at 4, got {active}"
 
             # Telemetry audit (Fork-2 guard): records all THREE decisions + the

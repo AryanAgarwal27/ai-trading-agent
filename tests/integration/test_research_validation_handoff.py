@@ -21,9 +21,10 @@ from __future__ import annotations
 import tempfile
 import uuid
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import pytest
+from langchain_core.runnables import RunnableConfig
 from langgraph.checkpoint.memory import InMemorySaver
 
 from orchestrator.graph import build_per_strategy_graph
@@ -180,8 +181,8 @@ async def test_research_output_satisfies_validation_input_contract() -> None:
     )
 
     strategy_id = str(uuid.uuid4())
-    config = {"configurable": {"thread_id": f"strategy_{strategy_id}"}}
-    await graph.ainvoke(_initial_state(strategy_id), config=config)
+    config: RunnableConfig = {"configurable": {"thread_id": f"strategy_{strategy_id}"}}
+    await graph.ainvoke(cast(Any, _initial_state(strategy_id)), config=config)
 
     assert captured, (
         "research → validation handoff produced ZERO backtest Sends: "

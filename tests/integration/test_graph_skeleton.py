@@ -27,10 +27,11 @@ from __future__ import annotations
 import os
 import uuid
 from datetime import UTC, datetime
-from typing import Any
+from typing import Any, cast
 
 import psycopg
 import pytest
+from langchain_core.runnables import RunnableConfig
 from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
 from langgraph.graph import END, START, StateGraph
 from langgraph.store.postgres.aio import AsyncPostgresStore
@@ -55,7 +56,7 @@ def _build_stub_archiving_validation() -> Any:
     b: StateGraph[StrategyState, StrategyState, StrategyState, StrategyState] = StateGraph(
         StrategyState
     )
-    b.add_node("v_archive", _archive)
+    b.add_node("v_archive", _archive)  # type: ignore[arg-type]
     b.add_edge(START, "v_archive")
     b.add_edge("v_archive", END)
     return b.compile()
@@ -169,7 +170,9 @@ async def _stub_pass_critic(state: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-async def _stub_pass_lookahead(strategy_path, *, pairs, timeframe, timerange):
+async def _stub_pass_lookahead(
+    strategy_path: Any, *, pairs: Any, timeframe: Any, timerange: Any
+) -> dict[str, Any]:
     return {
         "passed": True,
         "details": "stub: no look-ahead bias",
@@ -211,9 +214,9 @@ async def test_parent_graph_persists_checkpoint_under_thread_id() -> None:
 
         strategy_id = str(uuid.uuid4())
         thread_id = f"strategy_{strategy_id}"
-        config = {"configurable": {"thread_id": thread_id}}
+        config: RunnableConfig = {"configurable": {"thread_id": thread_id}}
 
-        final_state = await graph.ainvoke(_initial_state(strategy_id), config=config)
+        final_state = await graph.ainvoke(cast(Any, _initial_state(strategy_id)), config=config)
         assert final_state["stage"] == "archived"
 
         snapshot = await graph.aget_state(config)

@@ -28,10 +28,11 @@ from __future__ import annotations
 import uuid
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
-from typing import Any
+from typing import Any, cast
 from unittest.mock import AsyncMock
 
 import pytest
+from langchain_core.runnables import RunnableConfig
 from langgraph.graph import END, START, StateGraph
 from langgraph.graph.state import CompiledStateGraph
 
@@ -112,10 +113,10 @@ async def test_paper_gate_approve_flow_advances_to_paper(
 
     async with _real_saver_app() as saver:
         graph = _build_paper_gate_only_graph(saver)
-        config = {"configurable": {"thread_id": thread_id}}
+        config: RunnableConfig = {"configurable": {"thread_id": thread_id}}
 
         # First astream parks at paper_gate's interrupt.
-        async for _ in graph.astream(_seeded_state(strategy_id), config=config):
+        async for _ in graph.astream(cast(Any, _seeded_state(strategy_id)), config=config):
             pass
 
         # Publish fired on the gate_pending channel for this thread.
@@ -155,9 +156,9 @@ async def test_paper_gate_reject_flow_archives_with_notes(
 
     async with _real_saver_app() as saver:
         graph = _build_paper_gate_only_graph(saver)
-        config = {"configurable": {"thread_id": thread_id}}
+        config: RunnableConfig = {"configurable": {"thread_id": thread_id}}
 
-        async for _ in graph.astream(_seeded_state(strategy_id), config=config):
+        async for _ in graph.astream(cast(Any, _seeded_state(strategy_id)), config=config):
             pass
 
         await autoresume_for_test(graph, thread_id, {"approved": False, "notes": "regime concerns"})
@@ -189,7 +190,10 @@ async def test_paper_gate_publishes_before_interrupt(
     # Wrap the real interrupt so the graph still actually pauses. The
     # validation module imported ``interrupt`` by name; patch THAT
     # binding, not the langgraph.types one.
-    real_interrupt = validation_mod.interrupt
+    # Deliberate: read the `interrupt` binding INSIDE the validation module
+    # (re-imported there) so the monkeypatch below patches the same name the
+    # node calls. validation does not re-export it → attr-defined; intentional.
+    real_interrupt = validation_mod.interrupt  # type: ignore[attr-defined]
 
     def recording_interrupt(payload: dict[str, Any]) -> Any:
         call_order.append("interrupt")
@@ -203,8 +207,8 @@ async def test_paper_gate_publishes_before_interrupt(
 
     async with _real_saver_app() as saver:
         graph = _build_paper_gate_only_graph(saver)
-        config = {"configurable": {"thread_id": thread_id}}
-        async for _ in graph.astream(_seeded_state(strategy_id), config=config):
+        config: RunnableConfig = {"configurable": {"thread_id": thread_id}}
+        async for _ in graph.astream(cast(Any, _seeded_state(strategy_id)), config=config):
             pass
 
     assert call_order[:2] == [
@@ -231,10 +235,10 @@ async def test_paper_gate_replays_publish_on_resume_idempotent(
 
     async with _real_saver_app() as saver:
         graph = _build_paper_gate_only_graph(saver)
-        config = {"configurable": {"thread_id": thread_id}}
+        config: RunnableConfig = {"configurable": {"thread_id": thread_id}}
 
         # First park → call #1.
-        async for _ in graph.astream(_seeded_state(strategy_id), config=config):
+        async for _ in graph.astream(cast(Any, _seeded_state(strategy_id)), config=config):
             pass
         assert publish_mock.await_count == 1
 

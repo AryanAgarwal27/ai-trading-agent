@@ -48,7 +48,7 @@ def _midpoint_params(schema_cls: type[BaseModel]) -> BaseModel:
     return schema_cls(**raw)
 
 
-def _make_stub_extractor(params_instance: BaseModel):
+def _make_stub_extractor(params_instance: BaseModel) -> Any:
     """Build a ``params_extractor`` that ignores its inputs and returns
     a pre-built Pydantic instance. Mirrors the LLM call's contract
     (same return type) without needing a real model."""
