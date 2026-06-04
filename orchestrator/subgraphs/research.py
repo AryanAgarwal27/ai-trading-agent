@@ -33,7 +33,7 @@ from __future__ import annotations
 
 from collections.abc import Awaitable, Callable
 from operator import add
-from typing import Annotated, Any, TypedDict
+from typing import TYPE_CHECKING, Annotated, Any, TypedDict
 
 from langgraph.checkpoint.base import BaseCheckpointSaver
 from langgraph.graph import END, START, StateGraph
@@ -48,6 +48,12 @@ from orchestrator.tools.lookahead import (
     _default_lookahead_runner,
 )
 from orchestrator.tools.store_queries import aget_failures, aget_wins
+
+if TYPE_CHECKING:
+    # Command is imported at runtime locally inside make_lookahead_gate (kept
+    # lean); this TYPE_CHECKING import only serves the factory's return
+    # annotation below (Stage 10b — widened to admit the Command the node emits).
+    from langgraph.types import Command
 
 CheckpointSaver = BaseCheckpointSaver[Any]
 
@@ -177,7 +183,7 @@ DEFAULT_LOOKAHEAD_TIMERANGE = "20240501-20240508"
 def make_lookahead_gate(
     *,
     lookahead_runner: LookaheadRunnerFn | None = None,
-) -> Callable[[dict[str, Any]], Awaitable[dict[str, Any]]]:
+) -> Callable[[dict[str, Any]], Awaitable[Command[Any]]]:
     """Build the ``lookahead_gate`` node bound to a (possibly-stub) runner.
 
     Per BRD §8 rule 5: "Every generated strategy is run through

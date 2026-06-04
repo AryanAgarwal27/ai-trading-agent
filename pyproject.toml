@@ -133,6 +133,10 @@ plugins = ["pydantic.mypy"]
 module = [
     "apscheduler.*",
     "freqtrade.*",
+    # streamlit_autorefresh ships no py.typed / stubs (Stage 10b — dashboard
+    # import-untyped). Config-only suppression; touches no dependency table, so
+    # the uv.lock drift guard is unaffected (no re-lock needed).
+    "streamlit_autorefresh",
 ]
 ignore_missing_imports = true
 

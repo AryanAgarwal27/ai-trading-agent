@@ -90,7 +90,12 @@ def _redis_client() -> aioredis.Redis:
     monkeypatch this to return an ``AsyncMock``.
     """
     url = os.environ.get("REDIS_URL", "redis://127.0.0.1:6379/0")
-    return aioredis.from_url(url)
+    # redis.asyncio.from_url is untyped across redis-py 5.x (Stage 10a finding,
+    # verified 5.0.8 + 5.2.1) — it returns a Redis at runtime. Targeted ignore
+    # (not a cast): no-untyped-call (call site) and no-any-return (returned Any)
+    # share the same upstream-untyped root. warn_unused_ignores flags this if a
+    # future redis types from_url.
+    return aioredis.from_url(url)  # type: ignore[no-untyped-call,no-any-return]
 
 
 async def _connect_app_db() -> psycopg.AsyncConnection:

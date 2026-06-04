@@ -41,7 +41,7 @@ import os
 import re
 from collections.abc import Awaitable, Callable
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 from pydantic import BaseModel
 
@@ -122,7 +122,10 @@ def load_schema(template_name: str) -> type[BaseModel]:
         raise RuntimeError(f"Could not build module spec for {schema_path}")
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
-    cls = getattr(module, class_name)
+    # getattr returns Any; the loaded symbol is a Pydantic schema CLASS by the
+    # template contract (BRD §8.3 — every *_schema.py defines a BaseModel
+    # subclass), so this cast is safe and restores the declared return type.
+    cls = cast("type[BaseModel]", getattr(module, class_name))
     _SCHEMA_CACHE[template_name] = cls
     return cls
 
@@ -251,8 +254,16 @@ async def _default_params_extractor(
         f"Emit the parameter set. Remember: each value must encode the "
         f"hypothesis, not the textbook midpoint."
     )
-    params_instance = await structured.ainvoke(
-        [SystemMessage(content=system), HumanMessage(content=user_msg)]
+    # with_structured_output(schema_cls) on a Pydantic schema (no include_raw)
+    # returns a BaseModel INSTANCE at runtime. langchain's broad dict|BaseModel
+    # return overload only yields a dict for TypedDict/JSON schemas or
+    # include_raw=True — neither holds here (schema_cls is typed type[BaseModel]),
+    # so the dict branch is unreachable. Cast to the real runtime type.
+    params_instance = cast(
+        "BaseModel",
+        await structured.ainvoke(
+            [SystemMessage(content=system), HumanMessage(content=user_msg)]
+        ),
     )
 
     # SMOKE_DEBUG=1 in env → print the extracted params for smoke-probe

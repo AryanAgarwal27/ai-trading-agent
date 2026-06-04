@@ -364,7 +364,9 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         # is unreachable; first publish/subscribe surfaces the failure.
         # Matches the "best-effort pubsub" semantics in
         # orchestrator/observability/events.py.
-        redis_client = aioredis.from_url(redis_url)
+        # from_url untyped across redis-py 5.x (Stage 10a; see events.py
+        # _redis_client) — returns a Redis client at runtime. Targeted ignore.
+        redis_client = aioredis.from_url(redis_url)  # type: ignore[no-untyped-call]
         stack.push_async_callback(redis_client.aclose)
 
         app.state.saver = saver
