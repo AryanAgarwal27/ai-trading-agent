@@ -43,12 +43,31 @@ dependencies = [
     "alembic==1.13.*",
     "psycopg[binary]==3.2.*",
     "sqlalchemy==2.0.*",
-    "redis==5.0.*",
+    # Stage 10a: pinned to the exact terminal 5.0.x. 5.0.8 is the LAST 5.0
+    # release (5.1+ is a minor bump off BRD §4's 5.0 line). The SPEC 2026-05-28
+    # hypothesis — "a newer redis 5.0.x types redis.asyncio.from_url and closes
+    # the events.py errors in CI" — is FALSIFIED: 5.0.8 is terminal, and
+    # from_url is untyped across redis-py 5.x (verified 5.0.8 and 5.2.1 both emit
+    # the identical no-untyped-call/no-any-return at events.py:93). The lockfile
+    # eliminates the local↔CI drift by pinning this exactly; the 2 events.py
+    # errors are a code-level cast fix in 10b, NOT a version pin.
+    "redis==5.0.8",
     "python-dotenv==1.0.*",
     # Stage 8i: validation.py hard-imports pyarrow.compute / pyarrow.feather
     # to read cached feather date ranges (walk_forward_from_cache). Previously
     # transitive via Freqtrade; pinned explicitly to remove the hidden dep.
     "pyarrow==24.*",
+    # ── Stage 10 (Observability + DR) runtime deps (added 10a, wired later) ──
+    # LangSmith tracing (10d). Already transitive via langchain-core
+    # (>=0.3.45,<1.0); pinned explicitly because we depend on it directly for
+    # trace-metadata wiring. BRD §13's illustrative "langsmith==0.1.*" is
+    # UNSATISFIABLE alongside langchain 1.3's >=0.3.45 floor, so it is pinned to
+    # the current 0.8 series (forced by the resolver, not a discretionary choice).
+    "langsmith==0.8.*",
+    # Prometheus /metrics endpoint (10f) — pin per BRD §13 Stage 10 install list.
+    "prometheus-client==0.21.*",
+    # Structured JSON logging (10c) — pin per BRD §13 Stage 10 install list.
+    "structlog==24.*",
 ]
 
 [dependency-groups]

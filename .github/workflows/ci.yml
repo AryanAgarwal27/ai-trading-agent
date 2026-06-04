@@ -12,6 +12,10 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
+# Pin uv once for every job (Stage 10a — reproducible builds from uv.lock).
+env:
+  UV_VERSION: "0.11.3"
+
 jobs:
   lint-typecheck-test:
     name: ruff + mypy + pytest unit
@@ -32,36 +36,46 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python-version }}
-          cache: pip
 
-      - name: Upgrade pip (need >=25.1 for PEP 735 --group support)
-        run: python -m pip install --upgrade "pip>=25.1"
+      - name: Setup uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          version: ${{ env.UV_VERSION }}
+          enable-cache: true
 
-      - name: Install runtime deps + project (editable)
-        run: pip install -e .
+      # Stage 10a drift guard: fail the build if pyproject.toml was edited
+      # without re-running `uv lock`. `--locked` asserts the existing uv.lock
+      # already satisfies pyproject and refuses to update it — so a stale lock
+      # is a hard error here, not a silent re-resolve.
+      - name: Assert uv.lock is in sync with pyproject (drift guard)
+        run: uv lock --locked
 
-      - name: Install dev deps (PEP 735 dependency group)
-        run: pip install --group dev
+      # Install the EXACT locked versions onto the matrix interpreter.
+      # only-system pins resolution to the setup-python install (no uv-managed
+      # Python download), so the matrix version is the one actually exercised.
+      - name: Sync locked deps (project + dev group)
+        run: uv sync --locked --group dev
+        env:
+          UV_PYTHON: ${{ matrix.python-version }}
+          UV_PYTHON_PREFERENCE: only-system
 
       - name: ruff (lint)
-        run: ruff check .
+        run: uv run ruff check .
 
       - name: ruff (format check)
-        run: ruff format --check .
+        run: uv run ruff format --check .
 
       - name: mypy (strict, orchestrator + tests)
-        # Non-blocking until Stage 10 cleanup (SPEC change-log 2026-05-28:
-        # "trust CI, deferred to Stage 10"). mypy strict reports ~102 errors
-        # across 25 files — predominantly pre-existing drift since Stage 7e
-        # (redis-untyped, LangGraph add_node generics, test type annotations,
-        # RunnableConfig casts). Surfaced as a GitHub warning, not a build
-        # failure; the proper fix (lockfile + annotations) lands in Stage 10
-        # per BRD §13. ruff lint/format + pytest remain blocking.
+        # Non-blocking until Stage 10b cleanup (SPEC change-log 2026-05-28:
+        # "trust CI, deferred to Stage 10"). With the 10a lockfile, local and
+        # CI now resolve IDENTICAL versions, so the count is stable (129 errors
+        # at 10a baseline) — the flip to blocking is 10b's milestone. ruff
+        # lint/format + pytest remain blocking.
         continue-on-error: true
-        run: mypy orchestrator tests
+        run: uv run mypy orchestrator tests
 
       - name: pytest unit (exclude integration)
-        run: pytest -m "not integration" tests/unit
+        run: uv run pytest -m "not integration" tests/unit
 
   # ── Integration job (Stage 9g, closes DEFERRED.md D-7) ────────────────
   # Runs the integration suite against REAL postgres + redis service
@@ -111,16 +125,18 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: "3.13"
-          cache: pip
 
-      - name: Upgrade pip (need >=25.1 for PEP 735 --group support)
-        run: python -m pip install --upgrade "pip>=25.1"
+      - name: Setup uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          version: ${{ env.UV_VERSION }}
+          enable-cache: true
 
-      - name: Install runtime deps + project (editable)
-        run: pip install -e .
-
-      - name: Install dev deps (PEP 735 dependency group)
-        run: pip install --group dev
+      - name: Sync locked deps (project + dev group)
+        run: uv sync --locked --group dev
+        env:
+          UV_PYTHON: "3.13"
+          UV_PYTHON_PREFERENCE: only-system
 
       - name: Alembic upgrade head
         env:
@@ -131,7 +147,7 @@ jobs:
           # ("missing = ... in connection info"). This split mirrors .env and
           # was caught by running the suite against real services in 9g.
           DATABASE_URL: postgresql+psycopg://ait:ait@localhost:5432/ai_trading_agent
-        run: alembic upgrade head
+        run: uv run alembic upgrade head
 
       - name: pytest integration (exclude @freqtrade real-spawn subset)
         env:
@@ -148,4 +164,4 @@ jobs:
           # Deliberately NOT set: AIT_RUN_REAL_SPAWN_TESTS /
           # AIT_RUN_REAL_LIVE_SPAWN_TESTS — the @freqtrade real-spawn subset
           # (6 tests) stays opt-in even in CI and is excluded by the marker below.
-        run: pytest -m "integration and not freqtrade" -v
+        run: uv run pytest -m "integration and not freqtrade" -v
