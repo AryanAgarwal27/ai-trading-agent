@@ -1,23 +1,23 @@
 """Operator-run smoke probe: real Sonnet 4.6 supervisor decision (Stage 9c).
 
-DECISION-ONLY by design — this hits the real Anthropic API with the real
-system prompt and the ACTUAL portfolio snapshot/regime/active-strategies read
-from the live app DB, prints the structured ``SupervisorDecision`` the agent
-produces, and then STOPS. It does NOT execute any action and does NOT commit
-anything — it never spawns a thread or mutates the registry. (The full execute
-+ commit path is covered by ``run_supervisor`` and its tests; this probe exists
-to let the operator eyeball the real agent's reasoning against the real
-portfolio before trusting the scheduled runner.)
+Drives the REAL production reasoning path via ``run_supervisor(dry_run=True)``
+— NOT a hand-built kickoff + direct ``agent.ainvoke`` (the original probe did
+that and bypassed the runner entirely, which is exactly why the first smoke
+showed the agent skipping read-tool calls: it was testing the wrong code path).
+With ``dry_run=True`` the runner executes sync → snapshot → regime → strategies
+→ ContextVars → agent → decision, then SKIPS all writes and ``conn.rollback()``s
+— so this exercises the exact sequence the nightly cron will run (the agent
+calls view_portfolio / get_market_regime / query_store / list_strategies as its
+protocol mandates) without mutating the DB.
 
 Run from the repo root::
 
     .venv/Scripts/python.exe scripts/smoke_supervisor.py
 
-Requires ANTHROPIC_API_KEY + DATABASE_URL + LANGGRAPH_STORE_URI in .env, and a
-migrated app DB (``alembic upgrade head``). The store read (query_store →
-failures/wins) uses the real AsyncPostgresStore so the agent reasons over real
-history; the portfolio/regime/strategies reads use a real app-DB connection.
-No checkpointer is needed — the supervisor agent is stateless-per-run.
+Requires ANTHROPIC_API_KEY + DATABASE_URL + LANGGRAPH_CHECKPOINT_URI +
+LANGGRAPH_STORE_URI in .env and a migrated app DB. Seed first with
+scripts/seed_supervisor_smoke.py; reset with scripts/clear_supervisor_smoke.py.
+Enable LANGSMITH_TRACING=true to see the read-tool call sequence in LangSmith.
 """
 
 from __future__ import annotations
@@ -25,13 +25,11 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
-# Make the project importable when invoked directly (vs as a module).
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import asyncio  # noqa: E402
 
-# Windows event-loop convention (see scripts/README.md) — MUST precede any
-# psycopg / langgraph import, including transitive ones below.
+# Windows event-loop convention — MUST precede any psycopg / langgraph import.
 if sys.platform == "win32":
     asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
 
@@ -43,82 +41,72 @@ from dotenv import load_dotenv  # noqa: E402
 
 load_dotenv()
 
+from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver  # noqa: E402
 from langgraph.store.postgres.aio import AsyncPostgresStore  # noqa: E402
 
+from orchestrator.graph import build_per_strategy_graph  # noqa: E402
 from orchestrator.observability import events  # noqa: E402
 from orchestrator.supervisor import (  # noqa: E402
-    _current_portfolio,
-    _current_regime,
-    _current_store,
-    _current_strategies,
     aget_current_regime,
     aget_portfolio_snapshot,
     alist_strategies,
-    build_supervisor_agent,
+    run_supervisor,
 )
 
 
 async def main() -> None:
-    for var in ("ANTHROPIC_API_KEY", "DATABASE_URL", "LANGGRAPH_STORE_URI"):
+    required = (
+        "ANTHROPIC_API_KEY",
+        "DATABASE_URL",
+        "LANGGRAPH_CHECKPOINT_URI",
+        "LANGGRAPH_STORE_URI",
+    )
+    for var in required:
         if not os.environ.get(var):
             print(f"[smoke_supervisor] MISSING ENV: {var} — aborting.")
             return
 
     conn = await psycopg.AsyncConnection.connect(events._libpq_dsn(os.environ["DATABASE_URL"]))
     try:
+        # The "before" view — what the portfolio looks like going in (the runner
+        # re-reads these internally; printed here so the operator can compare the
+        # input state to the agent's decision).
         snapshot = await aget_portfolio_snapshot(conn)
         regime = await aget_current_regime(conn)
         strategies = await alist_strategies(conn)
+
+        print("[smoke_supervisor] dry_run=True — production reasoning path, NO DB mutation.")
+        print(f"[smoke_supervisor] portfolio snapshot: {snapshot}")
+        print(f"[smoke_supervisor] current regime: {regime}")
+        print(f"[smoke_supervisor] active strategies: {len(strategies)}")
+        for s in strategies:
+            print(f"    - {s['strategy_id']} stage={s['stage']} age_days={s.get('age_days')}")
+        print("[smoke_supervisor] running run_supervisor(dry_run=True) — real Sonnet 4.6...")
+
+        async with (
+            AsyncPostgresSaver.from_conn_string(os.environ["LANGGRAPH_CHECKPOINT_URI"]) as saver,
+            AsyncPostgresStore.from_conn_string(os.environ["LANGGRAPH_STORE_URI"]) as store,
+        ):
+            await saver.setup()
+            await store.setup()
+            graph = build_per_strategy_graph(saver, store)
+
+            t0 = time.perf_counter()
+            decision = await run_supervisor(
+                graph=graph,
+                store=store,
+                conn=conn,
+                trigger="manual",
+                dry_run=True,
+            )
+            wall = time.perf_counter() - t0
     finally:
         await conn.close()
 
-    print("[smoke_supervisor] DECISION-ONLY — no actions executed, no DB mutation.")
-    print(f"[smoke_supervisor] portfolio snapshot: {snapshot}")
-    print(f"[smoke_supervisor] current regime: {regime}")
-    print(f"[smoke_supervisor] active strategies: {len(strategies)}")
-    for s in strategies:
-        print(f"    - {s['strategy_id']} stage={s['stage']} age_days={s.get('age_days')}")
-    print("[smoke_supervisor] invoking supervisor agent (real Sonnet 4.6)...")
-
-    from langchain_core.messages import HumanMessage
-
-    async with AsyncPostgresStore.from_conn_string(os.environ["LANGGRAPH_STORE_URI"]) as store:
-        await store.setup()
-
-        tok_store = _current_store.set(store)
-        tok_regime = _current_regime.set(regime)
-        tok_portfolio = _current_portfolio.set(snapshot)
-        tok_strategies = _current_strategies.set(strategies)
-        try:
-            agent = build_supervisor_agent()
-            kickoff = (
-                "Run the supervisor protocol now and emit a SupervisorDecision. "
-                f"Portfolio: {snapshot}. Regime: {regime}. "
-                f"Active strategies: {strategies}"
-            )
-            t0 = time.perf_counter()
-            result = await agent.ainvoke(
-                {"messages": [HumanMessage(content=kickoff)]},
-                config={"configurable": {"thread_id": "supervisor"}},
-            )
-            wall = time.perf_counter() - t0
-        finally:
-            _current_store.reset(tok_store)
-            _current_regime.reset(tok_regime)
-            _current_portfolio.reset(tok_portfolio)
-            _current_strategies.reset(tok_strategies)
-
-    decision = result.get("structured_response")
-
     print("\n" + "=" * 72)
-    print(" 9c SUPERVISOR DECISION (real Sonnet 4.6)")
+    print(" 9c SUPERVISOR DECISION (real Sonnet 4.6, via run_supervisor dry_run)")
     print("=" * 72)
     print(f"\nWall-clock: {wall:.2f} s")
-    if decision is None:
-        print("\nNO structured_response returned — agent flake. The runner would")
-        print("fall back to a no_op decision (flake=True) and still log telemetry.")
-        return
-
     print(f"\noverall_rationale: {decision.overall_rationale}")
     print(f"confidence: {decision.confidence}")
     print(f"\nactions ({len(decision.actions)}):")
@@ -132,9 +120,10 @@ async def main() -> None:
             print(f"      strategy_id={a.strategy_id}")
         print(f"      rationale: {a.rationale}")
     print("\n" + "=" * 72)
-    print(" RESULT: decision printed. Nothing executed. Check LangSmith for the")
-    print(" tool-call trace (view_portfolio / query_store / get_market_regime /")
-    print(" list_strategies) and token cost (project: ai-trading-agent).")
+    print(" RESULT: decision printed; dry_run rolled back (nothing executed/committed).")
+    print(" Check LangSmith for the tool-call trace — expect view_portfolio,")
+    print(" get_market_regime, query_store(failures), query_store(wins), and")
+    print(" list_strategies all firing before SupervisorDecision.")
     print("=" * 72)
 
 

@@ -416,6 +416,45 @@ async def test_two_spawns_single_commit() -> None:
 # ─── exception mid-run → rollback + re-raise ───────────────────────────
 
 
+async def test_dry_run_skips_writes_and_telemetry() -> None:
+    """dry_run=True: read+reason path runs, but no action execution, no
+    telemetry, no commit — rollback instead. Decision returned unchanged."""
+    conn = _FakeConn()
+    # state_values would make the retire action archive a live thread IF executed.
+    graph = _StubGraph(state_values={"stage": "paper", "strategy_id": "s_x"})
+    spawn_rec = AsyncMock()
+    audit, metrics = _audit_capture()
+
+    decision = SupervisorDecision(
+        actions=[
+            SupervisorAction(action="spawn", name="x", rationale="would spawn"),
+            SupervisorAction(action="retire", strategy_id="s_x", rationale="would retire"),
+        ],
+        overall_rationale="dry run",
+        confidence=0.6,
+    )
+
+    result = await run_supervisor(
+        graph,
+        InMemoryStore(),
+        conn,
+        trigger="manual",
+        agent=_StubAgent(decision=decision),
+        spawn_thread_fn=spawn_rec,
+        audit_writer_fn=audit,
+        dry_run=True,
+    )
+
+    assert result is decision  # the agent's decision returned unchanged
+    assert conn.commits == 0  # NO commit
+    assert conn.rollbacks == 1  # rolled back instead
+    assert metrics == []  # NO telemetry row
+    spawn_rec.assert_not_called()  # spawn action NOT executed
+    assert graph.updates == []  # retire action NOT executed (no aupdate_state)
+    assert _inserts(conn) == []  # no spawn INSERT
+    assert _updates(conn) == []  # no retire registry UPDATE
+
+
 async def test_exception_rolls_back_and_reraises() -> None:
     conn = _FakeConn()
 

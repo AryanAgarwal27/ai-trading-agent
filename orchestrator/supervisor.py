@@ -750,11 +750,19 @@ async def _default_spawn_thread_fn(graph: Any, strategy_id: str) -> None:
 
 async def _invoke_supervisor_agent(
     agent: Any,
-    snapshot: dict[str, Any],
-    regime: str,
-    strategies: list[dict[str, Any]],
+    trigger: str,
+    timestamp: str,
 ) -> SupervisorDecision | None:
     """Invoke the agent; return its SupervisorDecision, or None on flake.
+
+    The kickoff message is deliberately MINIMAL — trigger + timestamp only, NO
+    embedded snapshot/regime/strategies (9c smoke finding). The runner has
+    already resolved those into the read-tool ContextVars, so the agent fetches
+    them by CALLING view_portfolio / get_market_regime / query_store /
+    list_strategies as its protocol mandates. Embedding the data in the message
+    let the agent skip those tool calls (the data was already in front of it),
+    leaving the telemetry + LangSmith trace an unfaithful record of what it
+    actually queried. Minimal kickoff → the trace reflects real reasoning.
 
     None signals an agent flake (raised, or returned no/invalid structured
     output). The caller falls back to a no_op decision — flakes must not crash
@@ -763,10 +771,9 @@ async def _invoke_supervisor_agent(
     from langchain_core.messages import HumanMessage
 
     kickoff = (
-        "Run the supervisor protocol now and emit a SupervisorDecision.\n"
-        f"Portfolio snapshot: {json.dumps(snapshot)}\n"
-        f"Current regime: {regime}\n"
-        f"Active strategies: {json.dumps(strategies)}"
+        f"Begin supervisor protocol. Trigger: {trigger}. Run started at {timestamp}.\n\n"
+        "Survey the portfolio, query the regime + Store, and emit a "
+        "SupervisorDecision per your protocol."
     )
     try:
         result = await agent.ainvoke(
@@ -826,6 +833,7 @@ async def run_supervisor(
     agent: Any | None = None,
     spawn_thread_fn: SpawnThreadFn | None = None,
     audit_writer_fn: AuditWriterFn | None = None,
+    dry_run: bool = False,
 ) -> SupervisorDecision:
     """One end-to-end supervisor invocation (BRD §5.1, §13 row 9).
 
@@ -857,6 +865,16 @@ async def run_supervisor(
     calling the real producer — so the kicked graph run reads a COMMITTED
     registry row on its own connection (BRD §5.3), never a dirty one.
 
+    Dry run: ``dry_run=True`` executes the full READ + REASONING path (sync →
+    snapshot → regime → strategies → ContextVars → agent → decision extraction,
+    including the flake fallback) but SKIPS all writes — no action execution
+    (no spawn/retire), no telemetry row, no spawn drain — and ``conn.rollback()``
+    replaces the commit so any read-path mutations (e.g. a ``sync_registry_stage``
+    UPDATE) are unwound. Returns the SupervisorDecision unchanged. This is the
+    path the smoke probe (``scripts/smoke_supervisor.py``) drives so it tests the
+    REAL production reasoning sequence — the agent calls the read tools as its
+    protocol mandates — without mutating the DB.
+
     Seams: ``agent`` (default ``build_supervisor_agent()``), ``spawn_thread_fn``
     (default the real producer bound to ``graph``), ``audit_writer_fn`` (default
     the telemetry writer). Tests inject all three.
@@ -885,7 +903,9 @@ async def run_supervisor(
         tok_strategies = _current_strategies.set(strategies)
         try:
             run_agent = agent or build_supervisor_agent()
-            decision = await _invoke_supervisor_agent(run_agent, snapshot, regime, strategies)
+            decision = await _invoke_supervisor_agent(
+                run_agent, trigger, datetime.now(UTC).isoformat()
+            )
         finally:
             _current_store.reset(tok_store)
             _current_regime.reset(tok_regime)
@@ -899,6 +919,14 @@ async def run_supervisor(
                 overall_rationale="agent output unavailable/malformed; defaulting to no_op",
                 confidence=0.0,
             )
+
+        if dry_run:
+            # Read + reasoning path only — no writes. Roll back any read-path
+            # mutation (a sync_registry_stage UPDATE) and return the decision.
+            # The post-commit spawn drain below is skipped (queue is empty).
+            await conn.rollback()
+            logger.info("run_supervisor dry_run: decision computed; writes skipped, rolled back")
+            return decision
 
         action_results = [
             await _execute_action(action, graph, conn, _enqueue) for action in decision.actions
