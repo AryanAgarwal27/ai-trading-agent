@@ -42,6 +42,7 @@ import psycopg
 from apscheduler.jobstores.memory import MemoryJobStore
 from apscheduler.jobstores.sqlalchemy import SQLAlchemyJobStore
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from apscheduler.triggers.cron import CronTrigger
 
 from orchestrator.gates.thresholds import (
     DAILY_LOSS_LIMIT_PCT,
@@ -68,6 +69,22 @@ WAKE_JOB_PREFIX = "wake:"
 REGIME_JOB_ID = "regime_job"
 KILL_SWITCH_JOB_ID = "kill_switch_poll"
 DAILY_LOSS_JOB_ID = "daily_loss_poll"
+SUPERVISOR_CRON_JOB_ID = "supervisor_cron"
+
+# ─── Supervisor nightly cron (Stage 9d, BRD §5.1, §13 row 9) ────────────
+# The supervisor cron job CLOSES OVER the graph + store (via the
+# lifespan-built ``run_supervisor_fn`` partial), which are NOT picklable, so it
+# cannot live in the SQLAlchemyJobStore. It gets a dedicated in-memory jobstore,
+# re-registered on every startup (replace_existing). Default time 03:15 UTC —
+# a low-activity global window; overridable via SUPERVISOR_CRON_HOUR /
+# SUPERVISOR_CRON_MINUTE (the scheduler runs in UTC, so set your local-equivalent
+# UTC time). Grace matches the low-frequency wake-job grace (3600), not the
+# high-frequency poll graces (60–600): a nightly job tolerates a wider
+# on-time-but-delayed window than a 5-minute poll.
+SUPERVISOR_JOBSTORE = "supervisor_memory"
+SUPERVISOR_CRON_HOUR = 3
+SUPERVISOR_CRON_MINUTE = 15
+SUPERVISOR_CRON_GRACE_S = 3600
 
 # A missed wake (orchestrator down) within this window still fires on
 # restart; older misses are skipped and caught by the next 6h cycle.
@@ -440,6 +457,52 @@ async def daily_loss_job(
 
 
 # ════════════════════════════════════════════════════════════════════════
+# Supervisor nightly cron (Stage 9d)
+# ════════════════════════════════════════════════════════════════════════
+#
+# BRD §5.1 + §13 row 9: the supervisor runs nightly. This job is the cron
+# trigger; the event-driven trigger (on thread completion) lands in Stage 9e.
+# The graph + store the runner needs are bound at lifespan time into
+# ``run_supervisor_fn`` (a partial), so this job only needs to open a fresh
+# app-DB connection per run — the SAME per-call connection pattern as
+# kill_switch_poll_job (DB connections are not held across the idle day).
+
+# The lifespan-bound runner: ``partial(run_supervisor, graph, store)``, called
+# as ``run_supervisor_fn(conn, trigger="cron")``. Duck-typed (Awaitable[Any])
+# to keep scheduler.py decoupled from orchestrator.supervisor.
+SupervisorRunFn = Callable[..., Awaitable[Any]]
+
+
+async def supervisor_cron_job(*, run_supervisor_fn: SupervisorRunFn) -> None:
+    """Nightly supervisor invocation (BRD §5.1, §13 row 9).
+
+    Opens a fresh app-DB connection (per-call, like kill_switch_poll_job), runs
+    the supervisor at ``trigger="cron"`` via the lifespan-bound runner (graph +
+    store already bound into ``run_supervisor_fn``), logs the decision summary,
+    and closes the connection. Any exception is logged and SWALLOWED — one bad
+    nightly run must not crash the scheduler or skip subsequent nights. The
+    runner itself owns its transaction (commit/rollback); this job only manages
+    the connection lifecycle.
+    """
+    conn = await _connect_app_db()
+    try:
+        decision = await run_supervisor_fn(conn, trigger="cron")
+        actions = getattr(decision, "actions", []) or []
+        rationale = str(getattr(decision, "overall_rationale", ""))
+        logger.info(
+            "supervisor cron: %d action(s); rationale=%s",
+            len(actions),
+            rationale[:200],
+        )
+    except Exception as exc:  # noqa: BLE001 — one bad run must not kill the scheduler
+        logger.error(
+            "supervisor cron run failed: %s; swallowing (next nightly fire unaffected)", exc
+        )
+    finally:
+        await conn.close()
+
+
+# ════════════════════════════════════════════════════════════════════════
 # Scheduler construction + wiring
 # ════════════════════════════════════════════════════════════════════════
 
@@ -493,6 +556,69 @@ def register_recurring_jobs(scheduler: AsyncIOScheduler) -> None:
         replace_existing=True,
         coalesce=True,
         misfire_grace_time=120,
+    )
+
+
+def register_supervisor_cron(
+    scheduler: AsyncIOScheduler,
+    *,
+    run_supervisor_fn: SupervisorRunFn,
+    hour: int | None = None,
+    minute: int | None = None,
+) -> None:
+    """Register the nightly supervisor cron job (Stage 9d; idempotent).
+
+    Separate from :func:`register_recurring_jobs` because this job CLOSES OVER
+    the graph + store (via ``run_supervisor_fn``, the lifespan partial), which
+    are not picklable — so it lives in a dedicated **in-memory** jobstore rather
+    than the SQLAlchemyJobStore the persisted wake/interval jobs use. Called
+    from the FastAPI lifespan after the graph is built. ``replace_existing=True``
+    + the memory store make re-registration on every startup idempotent and
+    recompute the next cron fire, so a restart never replays a missed run.
+
+    Time defaults to ``SUPERVISOR_CRON_HOUR``:``SUPERVISOR_CRON_MINUTE`` (03:15
+    UTC), overridable via the matching env vars (the scheduler is UTC — set
+    your local-equivalent UTC time) or the ``hour`` / ``minute`` params (tests).
+    ``max_instances=1`` so a slow run (LLM calls of 15–25s, occasionally more)
+    never overlaps the next fire; ``coalesce=True`` collapses a backlog to one.
+    """
+    resolved_hour = (
+        hour
+        if hour is not None
+        else int(os.environ.get("SUPERVISOR_CRON_HOUR", SUPERVISOR_CRON_HOUR))
+    )
+    resolved_minute = (
+        minute
+        if minute is not None
+        else int(os.environ.get("SUPERVISOR_CRON_MINUTE", SUPERVISOR_CRON_MINUTE))
+    )
+
+    # Dedicated in-memory jobstore for the non-picklable closure job.
+    # ``add_jobstore`` raises ValueError if the alias already exists (a
+    # re-registration against the SAME scheduler instance) — guard for
+    # idempotency. The trigger inherits the scheduler's UTC timezone.
+    try:
+        scheduler.add_jobstore(MemoryJobStore(), SUPERVISOR_JOBSTORE)
+    except ValueError:
+        pass
+
+    scheduler.add_job(
+        supervisor_cron_job,
+        trigger=CronTrigger(hour=resolved_hour, minute=resolved_minute),
+        kwargs={"run_supervisor_fn": run_supervisor_fn},
+        id=SUPERVISOR_CRON_JOB_ID,
+        jobstore=SUPERVISOR_JOBSTORE,
+        replace_existing=True,
+        coalesce=True,
+        max_instances=1,
+        misfire_grace_time=SUPERVISOR_CRON_GRACE_S,
+    )
+    logger.info(
+        "registered supervisor cron job id=%s at %02d:%02d UTC (jobstore=%s)",
+        SUPERVISOR_CRON_JOB_ID,
+        resolved_hour,
+        resolved_minute,
+        SUPERVISOR_JOBSTORE,
     )
 
 

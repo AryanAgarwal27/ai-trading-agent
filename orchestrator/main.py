@@ -30,6 +30,7 @@ import os
 from collections import defaultdict
 from collections.abc import AsyncIterator
 from contextlib import AsyncExitStack, asynccontextmanager
+from functools import partial
 from secrets import compare_digest
 from typing import Any
 
@@ -65,8 +66,10 @@ from orchestrator.scheduler import (
     build_scheduler,
     make_schedule_wake_fn,
     register_recurring_jobs,
+    register_supervisor_cron,
     shutdown_scheduler,
 )
+from orchestrator.supervisor import run_supervisor
 
 load_dotenv()
 
@@ -435,6 +438,17 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         )
         app.state.kill_subscription_task = kill_task
         stack.push_async_callback(cancel_kill_subscription, kill_task)
+
+        # ── Supervisor nightly cron (Stage 9d, BRD §5.1, §13 row 9). ────
+        # Bind the runner over the FINAL app.state.graph (after the smoke
+        # overrides) + store; the cron job opens a fresh conn per run and
+        # calls this. Exposed on app.state so a future manual-trigger admin
+        # endpoint or the 9e event subscription can reuse the same bound
+        # runner without rebuilding the closure. The job lives in a dedicated
+        # in-memory jobstore (the closure isn't picklable) — see
+        # register_supervisor_cron.
+        app.state.run_supervisor_fn = partial(run_supervisor, app.state.graph, store)
+        register_supervisor_cron(scheduler, run_supervisor_fn=app.state.run_supervisor_fn)
 
         yield
 
