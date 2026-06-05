@@ -75,6 +75,7 @@ from orchestrator.observability.events import (
     publish_thread_completed,
     record_gate_audit,
 )
+from orchestrator.observability.log import get_logger
 from orchestrator.security.secrets import EnvSecretProvider, SecretProvider
 from orchestrator.subgraphs.paper import PaperState, ScheduleWakeFn
 from orchestrator.tools.compare import compare_paper_to_backtest
@@ -339,6 +340,7 @@ async def live_spawn(
     write_registry: RegistryWriterFn = registry_writer_fn or _write_live_registry
 
     strategy_id = state["strategy_id"]
+    get_logger("live_spawn").info("enter", payload={"strategy_id": strategy_id})
     pairs = state["pairs"]
     artifacts = state.get("artifacts") or {}
 
@@ -516,6 +518,7 @@ async def risk_check(
     "fail" (archive) — a threshold breach routes to pause/HITL; the hard stop
     is the out-of-band kill switch (Stage 8f), not this advisory vote.
     """
+    get_logger("risk_check").info("enter", payload={"strategy_id": state.get("strategy_id")})
     snap = state.get("live_snapshot") or {}
     max_dd = float(snap.get("max_drawdown", 0.0) or 0.0)
     daily = float(snap.get("daily_pnl_pct", 0.0) or 0.0)
@@ -557,6 +560,7 @@ def regime_check(
     may no longer hold). A missing approval regime can't be compared → continue
     at low confidence.
     """
+    get_logger("regime_check").info("enter", payload={"strategy_id": state.get("strategy_id")})
     snap = state.get("live_snapshot") or {}
     current = snap.get("current_regime")
     approval = snap.get("approval_regime")
@@ -626,6 +630,7 @@ async def performance_check(
     Stage 7 two-sample machinery), then hands it to a Sonnet agent for the
     verdict. The agent call is injectable (``review_fn``).
     """
+    get_logger("performance_check").info("enter", payload={"strategy_id": state.get("strategy_id")})
     snap = state.get("live_snapshot") or {}
     live_returns = [float(x) for x in (snap.get("live_returns") or [])]
     paper_returns = [float(x) for x in (snap.get("paper_returns") or [])]
@@ -722,6 +727,7 @@ async def live_evaluate(
     each re-fetching (metrics would shift mid-cycle, and it'd be 3× the REST
     round-trips).
     """
+    get_logger("live_evaluate").info("enter", payload={"strategy_id": state.get("strategy_id")})
     fn = build_snapshot_fn or _build_live_snapshot_from_container
     snap = await fn(state)
     return {"live_snapshot": snap}
@@ -760,6 +766,7 @@ def live_wait(state: LiveState) -> dict[str, Any]:
     proceeds to live_evaluate as normal. Bare interrupt → no side effects on
     replay.
     """
+    get_logger("live_wait").info("enter", payload={"strategy_id": state.get("strategy_id")})
     interrupt({"kind": "live_wait", "strategy_id": state.get("strategy_id")})
     return {}
 
@@ -865,6 +872,7 @@ async def live_pause(
     bump_fn = live_started_bump_fn or _default_bump_live_started_at
     write_audit = gate_audit_writer_fn or record_gate_audit
     sid = state["strategy_id"]
+    get_logger("live_pause").info("enter", payload={"strategy_id": sid})
     thread_id = _thread_id_for(config, sid) if config is not None else f"strategy_{sid}"
 
     # Best-effort halt — mirror paper_teardown's swallow-and-log; a re-stop on
@@ -993,6 +1001,7 @@ async def live_archive(
     stop_fn = stop_container_fn or stop_live_container
     unschedule_fn = unschedule_wake_fn or _noop_unschedule_wake
     sid = str(state.get("strategy_id", ""))
+    get_logger("live_archive").info("enter", payload={"strategy_id": sid})
     try:
         await stop_fn(sid)
     except Exception as exc:  # noqa: BLE001 — teardown must not strand the thread
@@ -1113,6 +1122,7 @@ def build_live_subgraph(
         return regime_check(state, config)
 
     async def _coordinator(state: LiveState, config: RunnableConfig) -> Command[Any]:
+        get_logger("coordinator").info("enter", payload={"strategy_id": state.get("strategy_id")})
         return await coordinator(
             dict(state),
             config,

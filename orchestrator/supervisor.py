@@ -77,6 +77,7 @@ from orchestrator.observability.events import (
     publish_thread_completed,
     record_telemetry,
 )
+from orchestrator.observability.log import run_context
 from orchestrator.tools.store_queries import aget_failures, aget_wins
 
 logger = logging.getLogger(__name__)
@@ -767,8 +768,14 @@ async def _default_spawn_thread_fn(graph: Any, strategy_id: str) -> None:
 
     async def _drive() -> None:
         try:
-            async for _ in graph.astream(initial_state, config=config):
-                pass
+            # Stage 10c: the initial spawn invoke is one GRAPH EXECUTION — bind a
+            # fresh execution-scoped run_id for the whole research→… run so every
+            # node it drives logs under the same id. run_id is NOT carried on
+            # initial_state (it must never be checkpointed — BRD §5.7); it lives
+            # only in structlog contextvars for this task's scope.
+            with run_context(strategy_id=strategy_id, thread_id=f"strategy_{strategy_id}"):
+                async for _ in graph.astream(initial_state, config=config):
+                    pass
         except Exception as exc:  # noqa: BLE001 — background run; surfaces via logs + archived thread
             logger.error("spawn producer: graph run failed strategy_id=%s exc=%s", strategy_id, exc)
 

@@ -44,6 +44,7 @@ from typing import Any
 from langgraph.types import Command
 
 from orchestrator.observability.events import KILL_SWITCH_CHANNEL
+from orchestrator.observability.log import run_context
 
 logger = logging.getLogger(__name__)
 
@@ -146,11 +147,15 @@ def make_kill_event_writer(graph: Any) -> KillEventWriterFn:
         # the loop or strand other threads.
         async def _direct_resume() -> None:
             try:
-                async for _ in graph.astream(
-                    Command(resume={"wake": True, "source": "kill_subscription"}),
-                    config=config,
-                ):
-                    pass
+                # Stage 10c: the kill direct-resume is one GRAPH EXECUTION — fresh
+                # execution-scoped run_id bound for its scope (mirrors /wake +
+                # /approve + the spawn invoke).
+                with run_context(strategy_id=strategy_id, thread_id=thread_id):
+                    async for _ in graph.astream(
+                        Command(resume={"wake": True, "source": "kill_subscription"}),
+                        config=config,
+                    ):
+                        pass
                 logger.info("kill direct-resume complete thread=%s (now at live_pause)", thread_id)
             except Exception as exc:  # noqa: BLE001 — fire-and-forget; recoverable via the kse row
                 logger.error(

@@ -66,6 +66,8 @@ from langchain_core.tools import tool
 from langgraph.types import Command
 from pydantic import BaseModel, ConfigDict, Field
 
+from orchestrator.observability.log import get_logger
+
 REPO_ROOT = Path(__file__).resolve().parents[2]
 TEMPLATES_DIR = REPO_ROOT / "strategy_templates"
 
@@ -449,6 +451,9 @@ def revise_or_proceed(
       - ``stage="archived"``.
       - ``failure_reason="critic_loop_exhausted: <last_guidance>"``.
     """
+    get_logger("revise_or_proceed").info(
+        "enter", payload={"revision_count": state.get("revision_count", 0)}
+    )
     votes = state.get("agent_votes") or []
     critic_vote = next(
         (v for v in reversed(votes) if v.get("agent") == "critic"),

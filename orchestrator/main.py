@@ -62,6 +62,7 @@ from orchestrator.observability.events import (
     publish_gate_advanced,
     record_gate_audit,
 )
+from orchestrator.observability.log import configure_logging, run_context
 from orchestrator.scheduler import (
     build_scheduler,
     make_schedule_live_wake_fn,
@@ -350,6 +351,14 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     sample skips this but practical operation requires it (see SPEC
     §6 change log 2026-05-27 Stage 1b entry).
     """
+    # Stage 10c (BRD §14): install the structlog processor chain ONCE at process
+    # startup, before any node runs. The orchestrator process owns every graph
+    # execution (FastAPI endpoints + APScheduler jobs + kill/supervisor
+    # subscriptions + post-commit spawn tasks all run here), so this single call
+    # configures structured logging for all of them. JSON to stdout is the prod
+    # default; AIT_LOG_CONSOLE swaps in the human renderer for local dev.
+    configure_logging()
+
     checkpoint_uri = _require_env("LANGGRAPH_CHECKPOINT_URI")
     store_uri = _require_env("LANGGRAPH_STORE_URI")
     redis_url = os.environ.get("REDIS_URL", "redis://127.0.0.1:6379/0")
@@ -643,8 +652,13 @@ async def approve_thread(
             )
 
         decision_dict = {"approved": body.approved, "notes": body.notes}
-        async for _ in graph.astream(Command(resume=decision_dict), config=config):
-            pass
+        # Stage 10c: this resume is one GRAPH EXECUTION — mint a fresh
+        # execution-scoped run_id and bind {run_id, strategy_id, thread_id} for
+        # its duration so every node it drives logs under the same execution id.
+        resume_sid = str((snapshot.values or {}).get("strategy_id") or thread_id)
+        with run_context(strategy_id=resume_sid, thread_id=thread_id):
+            async for _ in graph.astream(Command(resume=decision_dict), config=config):
+                pass
 
         post_snapshot = await graph.aget_state(config)
         next_stage = post_snapshot.values.get("stage")
@@ -775,8 +789,12 @@ async def wake_thread(
                 ),
             )
 
-        async for _ in graph.astream(Command(resume={"wake": True}), config=config):
-            pass
+        # Stage 10c: a wake-resume is one GRAPH EXECUTION — fresh run_id bound
+        # for its scope (mirrors /approve + the kill direct-resume).
+        resume_sid = str((snapshot.values or {}).get("strategy_id") or thread_id)
+        with run_context(strategy_id=resume_sid, thread_id=thread_id):
+            async for _ in graph.astream(Command(resume={"wake": True}), config=config):
+                pass
 
         post_snapshot = await graph.aget_state(config)
         next_stage = post_snapshot.values.get("stage")

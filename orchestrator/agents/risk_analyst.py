@@ -48,6 +48,8 @@ from langchain_core.tools import tool
 from langgraph.types import Command
 from pydantic import BaseModel, Field
 
+from orchestrator.observability.log import get_logger
+
 # ─── Context-local robustness summary (used by the tool) ────────────────
 # The node function sets this before invoking the agent; the tool reads
 # from here. ContextVar is per-asyncio-task so concurrent risk_analyst
@@ -233,6 +235,7 @@ async def risk_analyst_node(
       the dashboard to display (SPEC §4.1 layout requirement).
     - On reject: ``stage="archived"`` + ``failure_reason``.
     """
+    get_logger("risk_analyst").info("enter", payload={"strategy_id": state.get("strategy_id")})
     summary = json.dumps(state.get("gate_decisions", {}).get("robustness", {}))
     token = _current_robustness_summary.set(summary)
     try:

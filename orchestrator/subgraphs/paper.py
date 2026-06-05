@@ -56,6 +56,7 @@ from orchestrator.gates import thresholds
 from orchestrator.gates.hitl import build_interrupt_payload
 from orchestrator.gates.thresholds import LIVE_CAPITAL_CAP_USD, MAX_OPEN_TRADES
 from orchestrator.observability.events import publish_gate_pending, publish_thread_completed
+from orchestrator.observability.log import get_logger
 from orchestrator.state import AgentVote, StrategyState
 from orchestrator.tools.freqtrade_api import FreqtradeAPI, FreqtradeCredentials
 from orchestrator.tools.freqtrade_lifecycle import (
@@ -201,6 +202,7 @@ async def paper_spawn(
     spawn_fn: SpawnContainerFn = spawn_container_fn or spawn_paper_container
 
     strategy_id = state["strategy_id"]
+    get_logger("paper_spawn").info("enter", payload={"strategy_id": strategy_id})
     pairs = state["pairs"]
     params = state.get("params") or {}
     artifacts = state.get("artifacts") or {}
@@ -434,6 +436,7 @@ async def schedule_wake_node(
     state change. Safe to re-run (the real 7f registration is idempotent
     on job id = thread_id).
     """
+    get_logger("schedule_wake").info("enter", payload={"strategy_id": state.get("strategy_id")})
     fn = schedule_wake_fn or _noop_schedule_wake
     thread_id = _thread_id_for(config, state["strategy_id"])
     await fn(thread_id, state["strategy_id"])
@@ -459,6 +462,7 @@ def paper_wait(state: PaperState) -> dict[str, Any]:
     production (7f) APScheduler's POST /threads/{tid}/wake supplies the
     resume; in tests the wake is an explicit Command(resume=...).
     """
+    get_logger("paper_wait").info("enter", payload={"strategy_id": state.get("strategy_id")})
     interrupt({"kind": "paper_wait", "strategy_id": state.get("strategy_id")})
     return {}
 
@@ -531,6 +535,7 @@ async def paper_monitor_node(
     - ``paper_monitor_fn`` invokes the agent (default = real Haiku
       run_paper_monitor; tests pass a canned-verdict stub).
     """
+    get_logger("paper_monitor").info("enter", payload={"strategy_id": state.get("strategy_id")})
     build_ctx = build_context_fn or _build_context_from_container
     monitor_fn = paper_monitor_fn or run_paper_monitor
 
@@ -603,6 +608,7 @@ def divergence_check(
     override applied — the dashboard + audit trail show whether the
     deterministic gate intervened.
     """
+    get_logger("divergence_check").info("enter", payload={"strategy_id": state.get("strategy_id")})
     gates = state.get("gate_decisions") or {}
     pm = gates.get("paper_monitor") or {}
     monitor_decision = pm.get("decision", "rearm")
@@ -683,6 +689,7 @@ async def live_gate(state: PaperState, config: RunnableConfig) -> Command[Any]:
     row is written by the FastAPI endpoint not this node, and no
     provisioning happens here.
     """
+    get_logger("live_gate").info("enter", payload={"strategy_id": state.get("strategy_id")})
     payload = build_interrupt_payload(dict(state), "live_gate")
     thread_id = _thread_id_for(config, state.get("strategy_id", ""))
     await publish_gate_pending(thread_id, payload)
@@ -757,6 +764,7 @@ async def paper_teardown(
     """
     stop_fn = stop_container_fn or stop_paper_container
     strategy_id = state["strategy_id"]
+    get_logger("paper_teardown").info("enter", payload={"strategy_id": strategy_id})
 
     try:
         await stop_fn(strategy_id)
@@ -807,6 +815,7 @@ async def paper_teardown(
 
 def archive(state: PaperState) -> dict[str, Any]:
     """Terminal sink: stamp stage and preserve failure_reason."""
+    get_logger("archive").info("enter", payload={"failure_reason": state.get("failure_reason")})
     return {
         "stage": "archived",
         "failure_reason": state.get("failure_reason") or "paper_archived_without_reason",

@@ -67,6 +67,7 @@ from orchestrator.agents.risk_analyst import risk_analyst_node
 from orchestrator.gates import thresholds
 from orchestrator.gates.hitl import build_interrupt_payload
 from orchestrator.observability.events import publish_gate_pending
+from orchestrator.observability.log import get_logger
 from orchestrator.state import AgentVote, BacktestResult, RobustnessResult
 from orchestrator.tools.backtest_runner import (
     SHARED_DATA_DIR,
@@ -394,6 +395,7 @@ def prepare_validation_inputs(state: ValidationState) -> dict[str, Any]:
     ``param_sets`` / ``folds`` directly (the standalone
     test_validation_subgraph fixtures) is unaffected.
     """
+    get_logger("prepare_validation_inputs").info("enter", payload={"stage": state.get("stage")})
     updates: dict[str, Any] = {}
 
     # Guards key on key-ABSENCE, not falsy-value: an explicitly-empty
@@ -441,6 +443,9 @@ def plan_backtests(state: ValidationState) -> list[Send]:
 
 def _planner_passthrough(state: ValidationState) -> dict[str, Any]:
     """Source node for the conditional fan-out edge (no-op)."""
+    get_logger("plan_backtests").info(
+        "enter", payload={"param_sets": len(state.get("param_sets") or [])}
+    )
     return {}
 
 
@@ -452,6 +457,9 @@ def aggregate_results(state: ValidationState) -> dict[str, Any]:
     1 hour get pruned here so the operator never has to think about them.
     See module docstring for the cleanup-ownership contract.
     """
+    get_logger("aggregate_results").info(
+        "enter", payload={"n_results": len(state.get("backtest_results") or [])}
+    )
     results = state.get("backtest_results") or []
     by_ps: dict[str, list[BacktestResult]] = {}
     for r in results:
@@ -560,6 +568,7 @@ def gate_backtest(
     checked here because Stage 4c's single-fold runner always reports
     ``oos_sharpe=0.0``. Stage 5+ wires OOS and these checks light up.
     """
+    get_logger("gate_backtest").info("enter", payload={})
     gates = state.get("gate_decisions") or {}
     backtest_block = gates.get("backtest") or {}
     summaries = backtest_block.get("param_sets") or []
@@ -651,6 +660,7 @@ def plan_robustness(state: ValidationState) -> list[Send]:
 
 def _planner_passthrough_robustness(state: ValidationState) -> dict[str, Any]:
     """No-op source node for the robustness fan-out conditional edge."""
+    get_logger("plan_robustness").info("enter", payload={})
     return {}
 
 
@@ -666,6 +676,7 @@ def monte_carlo_worker(state: ValidationState) -> dict[str, Any]:
     distribution's 5th percentile. The result must be ≥
     ``MIN_MC_5TH_PERCENTILE_RETURN`` (= 0.0 per BRD §10) for gate pass.
     """
+    get_logger("monte_carlo_worker").info("enter", payload={})
     backtest_results = state.get("backtest_results") or []
     gates = state.get("gate_decisions") or {}
     best_id = (gates.get("backtest") or {}).get("best_param_set_id")
@@ -785,6 +796,7 @@ def regime_worker(state: ValidationState) -> dict[str, Any]:
     ``MIN_REGIMES_PASSED`` (= 2 of 3 per BRD §10) gates against the
     "regimes_passed" count.
     """
+    get_logger("regime_worker").info("enter", payload={})
     backtest_results = state.get("backtest_results") or []
     folds = state.get("folds") or []
     gates = state.get("gate_decisions") or {}
@@ -901,6 +913,7 @@ async def fee_stress_worker(state: ValidationState) -> dict[str, Any]:
     sentinel ``1.0`` degradation so the gate definitively fails them
     (the math isn't meaningful when the baseline is already losing).
     """
+    get_logger("fee_stress_worker").info("enter", payload={})
     backtest_results = state.get("backtest_results") or []
     folds = state.get("folds") or []
     gates = state.get("gate_decisions") or {}
@@ -985,6 +998,9 @@ def aggregate_robustness(state: ValidationState) -> dict[str, Any]:
     populated here, so the gate-vs-aggregator split keeps threshold
     logic out of the aggregator.
     """
+    get_logger("aggregate_robustness").info(
+        "enter", payload={"n_results": len(state.get("robustness_results") or [])}
+    )
     robustness = state.get("robustness_results") or []
     summary: dict[str, Any] = {}
     for rr in robustness:
@@ -1017,6 +1033,7 @@ def gate_robustness(state: ValidationState) -> Command[Literal["archive", "risk_
     archive without burning Opus tokens — operator's explicit design
     point in the Stage 4 handoff.
     """
+    get_logger("gate_robustness").info("enter", payload={})
     gates = state.get("gate_decisions") or {}
     robustness_block = gates.get("robustness") or {}
 
@@ -1079,6 +1096,7 @@ def gate_robustness(state: ValidationState) -> Command[Literal["archive", "risk_
 
 def archive(state: ValidationState) -> dict[str, Any]:
     """Terminal sink: stamps stage and preserves failure_reason if set."""
+    get_logger("archive").info("enter", payload={"failure_reason": state.get("failure_reason")})
     # 9e: emission deliberately omitted; cron is the backstop for funnel-internal
     # completions — see supervisor_subscription.py docstring. (Archives graph state
     # only; the registry transition is deferred to sync_registry_stage. Do NOT add
@@ -1136,6 +1154,7 @@ async def paper_gate(state: ValidationState, config: RunnableConfig) -> dict[str
     Adding any other side effect here (DB write, exchange call, file
     write) breaks the contract — push it to the next node.
     """
+    get_logger("paper_gate").info("enter", payload={"strategy_id": state.get("strategy_id")})
     payload = build_interrupt_payload(state, "paper_gate")  # type: ignore[arg-type]
 
     thread_id = (config.get("configurable") or {}).get("thread_id", "")
@@ -1243,6 +1262,15 @@ def build_validation_subgraph(
     """
 
     async def backtest_worker(payload: dict[str, Any]) -> dict[str, Any]:
+        # Stage 10c: this is a Send fan-out worker (BRD §6.3). The run_id /
+        # strategy_id / thread_id bound at the execution-entry boundary propagate
+        # here because LangGraph copies the context when it creates the Send
+        # worker task — verified by tests/unit/test_logging_propagation.py.
+        ps = payload.get("_param_set") or {}
+        fold = payload.get("_fold") or {}
+        get_logger("backtest_worker").info(
+            "enter", payload={"param_set_id": ps.get("id"), "fold_id": fold.get("fold_id")}
+        )
         result = await worker_fn(payload)
         return {"backtest_results": [result]}
 

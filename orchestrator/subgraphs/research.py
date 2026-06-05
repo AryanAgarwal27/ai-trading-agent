@@ -43,6 +43,7 @@ from langgraph.store.base import BaseStore
 from orchestrator.agents.critic import critic_node, revise_or_proceed
 from orchestrator.agents.generator import generator_node
 from orchestrator.agents.researcher import researcher_node
+from orchestrator.observability.log import get_logger
 from orchestrator.tools.lookahead import (
     LookaheadResult,
     _default_lookahead_runner,
@@ -142,6 +143,7 @@ def make_load_context(
     """
 
     async def load_context(state: ResearchState) -> dict[str, Any]:
+        get_logger("load_context").info("enter", payload={"regime": state.get("current_regime")})
         regime = state.get("current_regime") or "unknown"
         if store is None:
             failures: list[dict[str, Any]] = []
@@ -206,6 +208,9 @@ def make_lookahead_gate(
     runner = lookahead_runner or _default_lookahead_runner
 
     async def lookahead_gate(state: dict[str, Any]) -> Command[Any]:
+        get_logger("lookahead_gate").info(
+            "enter", payload={"strategy_id": state.get("strategy_id")}
+        )
         strategy_path_str = (state.get("artifacts") or {}).get("generated_strategy_path")
         if not strategy_path_str:
             raise ValueError(
@@ -283,6 +288,7 @@ def archive(state: ResearchState) -> dict[str, Any]:
     generator already set both fields on archive paths; this node is the
     routing destination, ensuring there's a single sink edge to END.
     """
+    get_logger("archive").info("enter", payload={"failure_reason": state.get("failure_reason")})
     # 9e: emission deliberately omitted; cron is the backstop for funnel-internal
     # completions — see supervisor_subscription.py docstring. (Archives graph state
     # only; the registry transition is deferred to sync_registry_stage. Do NOT add
@@ -352,12 +358,17 @@ def build_research_subgraph(
     """
 
     async def _default_researcher(state: dict[str, Any]) -> dict[str, Any]:
+        get_logger("researcher").info("enter", payload={"strategy_id": state.get("strategy_id")})
         return await researcher_node(state, store=store)
 
     async def _default_generator(state: dict[str, Any]) -> dict[str, Any]:
+        get_logger("generator").info("enter", payload={"template": state.get("template")})
         return await generator_node(state)
 
     async def _default_critic(state: dict[str, Any]) -> dict[str, Any]:
+        get_logger("critic").info(
+            "enter", payload={"revision_count": state.get("revision_count", 0)}
+        )
         return await critic_node(state)
 
     researcher = researcher_fn or _default_researcher

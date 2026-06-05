@@ -33,6 +33,7 @@ from collections.abc import Iterable
 from pathlib import Path
 from typing import Any
 
+from orchestrator.observability.log import get_logger
 from orchestrator.state import BacktestResult
 
 log = logging.getLogger(__name__)
@@ -419,6 +420,13 @@ async def _run_subprocess(cmd: list[str], timeout_s: int) -> tuple[bytes, bytes,
 
 
 def _run_subprocess_sync(cmd: list[str], timeout_s: int) -> tuple[bytes, bytes, int]:
+    # Stage 10c (BRD §14): this runs INSIDE the asyncio.to_thread worker thread.
+    # asyncio.to_thread copies the calling context (contextvars) into the thread
+    # since py3.9, so the run_id / strategy_id / thread_id bound at the
+    # execution-entry boundary propagate here even though we crossed a thread
+    # boundary. Emitting from this exact spot is what verifies that propagation
+    # (tests/unit/test_logging_propagation.py asserts this line carries run_id).
+    get_logger("backtest_runner").info("subprocess_run", payload={"timeout_s": timeout_s})
     try:
         result = subprocess.run(
             cmd,
