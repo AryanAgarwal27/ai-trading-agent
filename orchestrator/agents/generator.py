@@ -64,6 +64,16 @@ _SCHEMA_CLASS_NAMES: dict[str, str] = {
     "freqai_regressor_template": "FreqaiRegressorParams",
 }
 
+# The shipped-template registry — the SINGLE source of truth for "which templates
+# exist" (BRD §8.1). A template not in this set cannot be rendered (``render_*``
+# below raises ``KeyError`` on an unknown name), so this set IS the spawn-vocabulary
+# whitelist the supervisor validates against at the spawn boundary (D-16). Derived
+# from ``_SCHEMA_CLASS_NAMES`` so the whitelist and the schema-name map can never
+# drift apart. (Note: ``critic.py`` / ``researcher.py`` keep their own copies of
+# this list for their tool docstrings — a pre-existing duplication, out of scope
+# here; this is the canonical machine-readable definition.)
+SHIPPED_TEMPLATES: frozenset[str] = frozenset(_SCHEMA_CLASS_NAMES)
+
 
 # Matches a SLOT line: `<name>: <type> = <literal>  # SLOT: <slot_name> (...)`.
 # Same pattern as tests/unit/test_template_filling.py — kept in sync by

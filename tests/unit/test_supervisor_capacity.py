@@ -177,6 +177,78 @@ async def test_spawn_ignores_live_cap() -> None:
 
 
 # ════════════════════════════════════════════════════════════════════════
+# aspawn_strategy — spawn-vocabulary gate (D-16)
+# ════════════════════════════════════════════════════════════════════════
+#
+# The supervisor agent can hallucinate templates/pairs that do not exist (the
+# 10d real-trace proposed templates ``stat_arb`` / ``momentum`` and pair
+# ``AVAX/USDT``). The gate REJECTS such an action at the spawn boundary — no
+# registry row, no thread kick — so a hallucination never seeds an unfillable
+# row or a dataless pair. Same no-write contract as the capacity refusal.
+
+
+async def test_spawn_unknown_template_refused_no_row_no_kick() -> None:
+    """A template outside the shipped set is rejected before any write."""
+    conn, executed = _make_conn(group_by_rows=[])  # active=0 — capacity is fine
+    spawn_fn = AsyncMock()
+
+    result = await aspawn_strategy(spawn_fn, conn, template="stat_arb")
+
+    assert result["spawned"] is False
+    assert result["reason"] == "unknown_template"
+    assert result["template"] == "stat_arb"
+    assert _inserts(executed) == []  # the load-bearing assertion: no registry row
+    spawn_fn.assert_not_called()
+
+
+async def test_spawn_pair_outside_universe_refused_no_row_no_kick() -> None:
+    """A pair outside the SPEC §1 Q2 universe is rejected before any write; only
+    the offending pair is flagged (BTC/USDT is valid, AVAX/USDT is not)."""
+    conn, executed = _make_conn(group_by_rows=[])
+    spawn_fn = AsyncMock()
+
+    result = await aspawn_strategy(spawn_fn, conn, pairs=["BTC/USDT", "AVAX/USDT"])
+
+    assert result["spawned"] is False
+    assert result["reason"] == "pairs_outside_universe"
+    assert result["invalid_pairs"] == ["AVAX/USDT"]
+    assert _inserts(executed) == []
+    spawn_fn.assert_not_called()
+
+
+async def test_spawn_valid_template_and_pairs_still_spawns() -> None:
+    """A fully-valid action (shipped template + in-universe pairs) spawns
+    normally — the gate is a precise filter, not a blanket block."""
+    conn, executed = _make_conn(group_by_rows=[])
+    spawn_fn = AsyncMock()
+
+    result = await aspawn_strategy(
+        spawn_fn,
+        conn,
+        template="mean_reversion_template",
+        pairs=["BTC/USDT", "ETH/USDT"],
+    )
+
+    assert result["spawned"] is True
+    assert len(_inserts(executed)) == 1
+    spawn_fn.assert_awaited_once()
+
+
+async def test_spawn_omitted_template_and_pairs_passes_the_gate() -> None:
+    """Omitting template/pairs (the common case — researcher picks the template,
+    default universe applies) is NOT a vocabulary violation: ``None`` passes the
+    gate, so the row seeds with the 'pending' sentinel + default pairs."""
+    conn, executed = _make_conn(group_by_rows=[])
+    spawn_fn = AsyncMock()
+
+    result = await aspawn_strategy(spawn_fn, conn)  # no template, no pairs
+
+    assert result["spawned"] is True
+    assert len(_inserts(executed)) == 1
+    spawn_fn.assert_awaited_once()
+
+
+# ════════════════════════════════════════════════════════════════════════
 # aretire_strategy
 # ════════════════════════════════════════════════════════════════════════
 

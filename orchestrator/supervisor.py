@@ -74,6 +74,7 @@ from langchain_core.tools import tool
 from langgraph.store.base import BaseStore
 from pydantic import BaseModel, ConfigDict, Field
 
+from orchestrator.agents.generator import SHIPPED_TEMPLATES
 from orchestrator.gates.thresholds import MAX_CONCURRENT_STRATEGIES
 from orchestrator.observability.events import (
     _connect_app_db,
@@ -108,6 +109,12 @@ _AUDIT_SOURCE = "supervisor_decision"
 # one; the registry seed is "pending" until ``sync_registry_stage`` mirrors the
 # chosen value back per the mirror contract below (D-10, closed Stage 10f).
 _DEFAULT_PAIRS: tuple[str, ...] = ("BTC/USDT", "ETH/USDT", "SOL/USDT", "BNB/USDT")  # SPEC §1 Q2
+# The pair universe (SPEC §1 Q2) — the spawn-vocabulary whitelist for pairs,
+# derived from _DEFAULT_PAIRS so the two never drift. A spawn naming any pair
+# outside this set has no cached OHLCV / Binance whitelist entry and is rejected
+# at the spawn boundary (D-16). Single source of truth = _DEFAULT_PAIRS above;
+# the template whitelist is generator.SHIPPED_TEMPLATES (BRD §8.1).
+_PAIR_UNIVERSE: frozenset[str] = frozenset(_DEFAULT_PAIRS)
 _DEFAULT_TIMEFRAME = "5m"
 _PENDING_TEMPLATE = "pending"
 _RETIRE_REASON = "retired_by_supervisor"
@@ -543,8 +550,54 @@ async def aspawn_strategy(
     ``MAX_CONCURRENT_LIVE_STRATEGIES`` is deliberately NOT enforced here — it
     binds at the paper→live transition (D-9), not at research spawn.
 
+    **Spawn-vocabulary gate (D-16):** BEFORE the capacity read, reject a spawn
+    whose ``template`` is not a shipped template
+    (:data:`generator.SHIPPED_TEMPLATES`, BRD §8.1) or whose ``pairs`` are not
+    all inside the SPEC §1 Q2 universe (:data:`_PAIR_UNIVERSE`) — return
+    ``{"spawned": False, "reason": "unknown_template" | "pairs_outside_universe",
+    ...}`` WITHOUT inserting a row or calling ``spawn_thread_fn`` (the same
+    no-write contract as the capacity refusal). We REJECT the whole action rather
+    than clamp the offending field: a hallucinated template means the agent
+    misunderstood its option set, and silently half-executing (dropping the
+    template to ``pending``, filtering bad pairs) would seed a registry row that
+    contradicts the action's own rationale — the operator audit would then
+    misrepresent what was decided, and the slot would be spent on something the
+    agent did not intend. ``template=None`` / ``pairs=None`` are the normal
+    "researcher chooses the template / default universe applies" case and pass
+    the gate. Defense-in-depth: ``_SUPERVISOR_PROMPT`` also enumerates the valid
+    vocabulary, but this gate — not the prompt — is the guarantee.
+
     Caller owns the connection + transaction; this does NOT commit.
     """
+    if template is not None and template not in SHIPPED_TEMPLATES:
+        logger.warning(
+            "spawn refused: template=%r not in shipped templates %s "
+            "(D-16 vocabulary gate) — no registry row written",
+            template,
+            sorted(SHIPPED_TEMPLATES),
+        )
+        return {
+            "spawned": False,
+            "reason": "unknown_template",
+            "template": template,
+            "allowed_templates": sorted(SHIPPED_TEMPLATES),
+        }
+    if pairs is not None:
+        invalid_pairs = [p for p in pairs if p not in _PAIR_UNIVERSE]
+        if invalid_pairs:
+            logger.warning(
+                "spawn refused: pairs %s outside the SPEC §1 Q2 universe %s "
+                "(D-16 vocabulary gate) — no registry row written",
+                invalid_pairs,
+                sorted(_PAIR_UNIVERSE),
+            )
+            return {
+                "spawned": False,
+                "reason": "pairs_outside_universe",
+                "invalid_pairs": invalid_pairs,
+                "allowed_pairs": sorted(_PAIR_UNIVERSE),
+            }
+
     snapshot = await aget_portfolio_snapshot(conn)
     active = snapshot["active"]
     if active >= MAX_CONCURRENT_STRATEGIES:
@@ -786,6 +839,23 @@ Rules:
   regime expectation. "Same idea, hoping for a different outcome" is the
   definition of what the failure namespace was built to prevent.
 """
+
+# D-16: enumerate the REAL spawn vocabulary in the prompt so the agent stops
+# inventing templates/pairs (the 10d real-trace proposed templates `stat_arb` /
+# `momentum` and pair `AVAX/USDT`, none of which exist). This is best-effort
+# guidance that REDUCES how often the gate fires — the load-bearing guarantee is
+# aspawn_strategy's spawn-vocabulary gate, not this text. Built from the canonical
+# sets (SHIPPED_TEMPLATES / _PAIR_UNIVERSE) so the prompt can never drift from the
+# validator.
+_SUPERVISOR_PROMPT += (
+    "\nSpawn vocabulary (HARD constraint — a spawn naming anything outside these "
+    "lists is REJECTED at the spawn boundary before any row is written, wasting the "
+    "run):\n"
+    f"- template: OMIT it (preferred — the researcher chooses), or name EXACTLY one "
+    f"of: {', '.join(sorted(SHIPPED_TEMPLATES))}. Do NOT invent templates.\n"
+    f"- pairs: omit for the default universe, or use a SUBSET of: "
+    f"{', '.join(sorted(_PAIR_UNIVERSE))}. No other pairs exist.\n"
+)
 
 
 def build_supervisor_agent() -> Any:
