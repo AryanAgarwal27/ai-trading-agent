@@ -20,23 +20,17 @@
     "margin_mode": "",
     "cancel_open_orders_on_exit": false,
 
-    // BRD §11 daily loss limit (-3% rolling 24h → stopbuy).
-    // GAP: Freqtrade 2026.4 has no native `dry_run_wallet_threshold` /
-    // `daily_loss_limit` field. The canonical Freqtrade mechanism is the
-    // `protections` block below (MaxDrawdown), which works on a sliding
-    // window over recent trades — close to but not identical to a rolling
-    // 24h loss check. The orchestrator-side paper_monitor (Stage 7d+) is
-    // the authoritative enforcer of the BRD §11 layered safeguards;
-    // protections below are an in-container safety net.
-    "protections": [
-        {
-            "method": "MaxDrawdown",
-            "lookback_period_candles": 288,
-            "trade_limit": 4,
-            "stop_duration_candles": 12,
-            "max_allowed_drawdown": 0.12
-        }
-    ],
+    // BRD §11 in-container safety net: a MaxDrawdown `protections` entry.
+    // It is NOT here by design. Freqtrade 2026.4 deprecated config-level
+    // `protections` — the stable_freqai image REJECTS it at container boot
+    // ("DEPRECATED: Setting 'protections' in the configuration is
+    // deprecated") and ignores config entries even when present. The
+    // canonical (and only supported) location is the strategy's
+    // `protections` @property, so the identical MaxDrawdown net now lives on
+    // each template class in strategy_templates/ and is carried into every
+    // generated strategy. The orchestrator-side paper_monitor (Stage 7d+)
+    // plus the out-of-band APScheduler kill switch remain the authoritative
+    // enforcers of the BRD §11 layered safeguards.
 
     // pair_whitelist intentionally empty; paper_spawn fills from state.pairs.
     // SPEC §1 Q2 universe is BTC/USDT, ETH/USDT, SOL/USDT, BNB/USDT — the

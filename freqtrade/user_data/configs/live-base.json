@@ -29,18 +29,15 @@
     "margin_mode": "",
     "cancel_open_orders_on_exit": true,
 
-    // BRD §11 in-container safety net (MaxDrawdown). The out-of-band
-    // APScheduler kill switch (Stage 8f, every 5 min) is the authoritative
-    // global-drawdown / consecutive-loss enforcer; this is belt-and-braces.
-    "protections": [
-        {
-            "method": "MaxDrawdown",
-            "lookback_period_candles": 288,
-            "trade_limit": 4,
-            "stop_duration_candles": 12,
-            "max_allowed_drawdown": 0.12
-        }
-    ],
+    // BRD §11 in-container safety net (MaxDrawdown) is NOT here by design.
+    // Freqtrade 2026.4 deprecated config-level `protections` (the
+    // stable_freqai image rejects it at container boot and ignores config
+    // entries even when present); the only supported location is the
+    // strategy's `protections` @property, so the identical MaxDrawdown net
+    // lives on each template class in strategy_templates/. The out-of-band
+    // APScheduler kill switch (Stage 8f, every 5 min) remains the
+    // authoritative global-drawdown / consecutive-loss enforcer; the
+    // template-level protection is belt-and-braces.
 
     // pair_whitelist intentionally empty; render_live_config fills from
     // state.pairs. SPEC §1 Q2 universe is BTC/USDT, ETH/USDT, SOL/USDT,

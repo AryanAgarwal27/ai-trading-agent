@@ -203,8 +203,10 @@ def _deep_merge(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any
 
     Dict-typed values merge key-by-key; everything else (lists, scalars)
     is replaced wholesale. List-replacement is the right semantics for
-    Freqtrade's ``pair_whitelist`` and ``protections`` — per-strategy
-    overrides describe the *complete* desired list, not a delta.
+    Freqtrade's ``pair_whitelist`` — a per-strategy override describes the
+    *complete* desired list, not a delta. (``protections`` is no longer a
+    config key — Freqtrade 2026.4 moved it to the strategy ``protections``
+    @property; see strategy_templates/ and the configs/ base files.)
     """
     out = deepcopy(base)
     for key, val in override.items():

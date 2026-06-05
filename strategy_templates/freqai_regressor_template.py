@@ -105,6 +105,28 @@ class FreqaiRegressorTemplate(IStrategy):
     # Hard per-trade stoploss (negative fraction).
     stoploss: float = -0.05  # SLOT: stoploss (float, -0.10 to -0.02)
 
+    # ─── In-container risk protection — structural shell, NOT a slot ───────
+    # Freqtrade 2026.4 deprecated config-level ``protections`` (the
+    # stable_freqai image REJECTS it at container boot, and ignores config
+    # entries even when present); a strategy ``protections`` @property is the
+    # only supported location. Moved here verbatim from the former
+    # paper-base.json / live-base.json block — identical MaxDrawdown
+    # parameters, same behaviour, supported location (BRD §11 in-container
+    # safety net). The out-of-band APScheduler kill switch (BRD §11, §5.6)
+    # stays the authoritative global-drawdown / consecutive-loss enforcer;
+    # this is the belt-and-braces net. The LLM never edits this (BRD §8 rule 1).
+    @property
+    def protections(self) -> list[dict]:
+        return [
+            {
+                "method": "MaxDrawdown",
+                "lookback_period_candles": 288,
+                "trade_limit": 4,
+                "stop_duration_candles": 12,
+                "max_allowed_drawdown": 0.12,
+            },
+        ]
+
     # ─── FreqAI feature engineering hooks ──────────────────────────────────
 
     def feature_engineering_expand_all(
