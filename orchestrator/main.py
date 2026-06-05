@@ -68,6 +68,7 @@ from orchestrator.observability.events import (
 from orchestrator.observability.freqtrade_exporter import collect_freqtrade_metrics
 from orchestrator.observability.log import configure_logging, get_logger, run_context
 from orchestrator.observability.tracing import langsmith_project, trace_config, tracing_enabled
+from orchestrator.ops.reconcile import reconcile_on_startup
 from orchestrator.scheduler import (
     build_scheduler,
     make_schedule_live_wake_fn,
@@ -547,6 +548,22 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         )
         app.state.supervisor_subscription_task = supervisor_sub_task
         stack.push_async_callback(cancel_supervisor_subscription, supervisor_sub_task)
+
+        # ── On-startup DR reconciliation (Stage 10f, BRD §16, §17 #12). ──
+        # Now that the saver/store, the FINAL app.state.graph, and the 9f kill
+        # writer are all live, reconcile the registry against reality: scan the
+        # non-archived containers, ping each freqtrade_api_url, and for any
+        # unreachable LIVE container write a kill_switch_events row + drive the
+        # thread to live_pause via the SAME kill_event_writer_fn the Redis kill
+        # subscription uses (reuse 9f's direct-resume path — /wake would 409 a
+        # kill-written thread). A single unreachable container is the NORMAL case
+        # this handles; a DB failure is swallowed inside reconcile. Wrapped here
+        # too (belt-and-suspenders) so a reconcile error can NEVER crash startup —
+        # BRD §17 #12: reconcile must not depend on the graph being awake.
+        try:
+            await reconcile_on_startup(kill_event_writer_fn=app.state.kill_event_writer_fn)
+        except Exception:  # noqa: BLE001 — reconcile failure must not abort the lifespan
+            logger.exception("startup reconciliation failed; continuing to serve")
 
         yield
 
