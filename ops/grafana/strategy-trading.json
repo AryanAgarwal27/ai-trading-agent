@@ -1,0 +1,106 @@
+{
+  "__inputs": [
+    {
+      "name": "DS_PROMETHEUS",
+      "label": "Prometheus",
+      "description": "Prometheus datasource scraping the orchestrator /metrics endpoint (which exposes the in-orchestrator Freqtrade collector's per-container gauges).",
+      "type": "datasource",
+      "pluginId": "prometheus",
+      "pluginName": "Prometheus"
+    }
+  ],
+  "__requires": [
+    { "type": "grafana", "id": "grafana", "name": "Grafana", "version": "11.0.0" },
+    { "type": "datasource", "id": "prometheus", "name": "Prometheus", "version": "1.0.0" }
+  ],
+  "title": "ai-trading-agent — Per-Strategy Trading",
+  "uid": "ait-strategy-trading",
+  "tags": ["ai-trading-agent", "freqtrade", "BRD-14"],
+  "schemaVersion": 39,
+  "version": 1,
+  "editable": true,
+  "time": { "from": "now-24h", "to": "now" },
+  "refresh": "30s",
+  "timezone": "utc",
+  "templating": {
+    "list": [
+      {
+        "name": "strategy_id",
+        "label": "Strategy",
+        "type": "query",
+        "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+        "query": { "query": "label_values(ait_freqtrade_up, strategy_id)", "refId": "StandardVariableQuery" },
+        "refresh": 2,
+        "includeAll": true,
+        "multi": true,
+        "current": { "text": "All", "value": "$__all" }
+      }
+    ]
+  },
+  "annotations": { "list": [] },
+  "panels": [
+    {
+      "id": 1,
+      "type": "timeseries",
+      "title": "Closed-trade P&L % (per strategy)",
+      "description": "ait_freqtrade_profit_closed_percent — closed-trade profit percent from each container's /api/v1/profit (BRD §14 'per-strategy P&L').",
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 0 },
+      "fieldConfig": { "defaults": { "custom": { "drawStyle": "line", "fillOpacity": 10 }, "unit": "percent" }, "overrides": [] },
+      "options": { "legend": { "displayMode": "table", "placement": "right", "calcs": ["lastNotNull", "max", "min"] } },
+      "targets": [
+        { "refId": "A", "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }, "expr": "ait_freqtrade_profit_closed_percent{strategy_id=~\"$strategy_id\"}", "legendFormat": "{{strategy_id}}" }
+      ]
+    },
+    {
+      "id": 2,
+      "type": "timeseries",
+      "title": "Max drawdown (per strategy)",
+      "description": "ait_freqtrade_max_drawdown — max drawdown from /api/v1/profit (BRD §14 'drawdown'). The out-of-band kill switch trips at dd ≥ 12% (BRD §11) independently of this view.",
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 0 },
+      "fieldConfig": { "defaults": { "custom": { "drawStyle": "line", "fillOpacity": 10 }, "unit": "percentunit" }, "overrides": [] },
+      "options": { "legend": { "displayMode": "table", "placement": "right", "calcs": ["lastNotNull", "max"] } },
+      "targets": [
+        { "refId": "A", "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }, "expr": "ait_freqtrade_max_drawdown{strategy_id=~\"$strategy_id\"}", "legendFormat": "{{strategy_id}}" }
+      ]
+    },
+    {
+      "id": 3,
+      "type": "timeseries",
+      "title": "Open trades (per strategy)",
+      "description": "ait_freqtrade_open_trades — currently-open trades from /api/v1/status (BRD §14 'open trades').",
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 8 },
+      "fieldConfig": { "defaults": { "custom": { "drawStyle": "stepAfter", "fillOpacity": 20 }, "unit": "short" }, "overrides": [] },
+      "options": { "legend": { "displayMode": "table", "placement": "right", "calcs": ["lastNotNull", "max"] } },
+      "targets": [
+        { "refId": "A", "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }, "expr": "ait_freqtrade_open_trades{strategy_id=~\"$strategy_id\"}", "legendFormat": "{{strategy_id}}" }
+      ]
+    },
+    {
+      "id": 4,
+      "type": "state-timeline",
+      "title": "Container reachability (up/down)",
+      "description": "ait_freqtrade_up — 1 if the container's REST API answered the last scrape, else 0. A run of 0 is an unreachable container (on restart the reconciler routes a dead LIVE one to live_pause).",
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 8 },
+      "fieldConfig": { "defaults": { "unit": "short", "color": { "mode": "thresholds" }, "thresholds": { "mode": "absolute", "steps": [ { "color": "red", "value": null }, { "color": "green", "value": 1 } ] } }, "overrides": [] },
+      "options": { "legend": { "displayMode": "list", "placement": "bottom" }, "showValue": "never" },
+      "targets": [
+        { "refId": "A", "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }, "expr": "ait_freqtrade_up{strategy_id=~\"$strategy_id\"}", "legendFormat": "{{strategy_id}}" }
+      ]
+    },
+    {
+      "id": 5,
+      "type": "text",
+      "title": "Per-host CPU / memory — not wired in v1",
+      "description": "BRD §14 'per-host CPU/mem' panel placeholder.",
+      "gridPos": { "h": 5, "w": 24, "x": 0, "y": 16 },
+      "options": {
+        "mode": "markdown",
+        "content": "**Per-host CPU / memory is intentionally a placeholder in v1.** Host-level CPU/mem is node-exporter territory (`node_cpu_seconds_total`, `node_memory_*`) — the orchestrator does not export host metrics, and adding node-exporter is out of scope for the definitions-only Stage 10g deliverable. To enable: deploy `prometheus/node-exporter`, add a `node` scrape job to `ops/prometheus/prometheus.yml`, and replace this panel with `rate(node_cpu_seconds_total[5m])` / `node_memory_MemAvailable_bytes`. Tracked as Stage 11 hardening."
+      }
+    }
+  ]
+}

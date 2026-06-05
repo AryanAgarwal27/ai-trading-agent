@@ -1,0 +1,42 @@
+# Prometheus scrape config for ai-trading-agent (BRD §14, Stage 10g).
+#
+# DEFINITIONS-ONLY: this file is version-controlled and importable; v1 does NOT
+# run a Prometheus container (operator decision — see ops/observability.md and
+# the Stage 10g commit). Point a Prometheus instance at this file at deploy time.
+#
+# There is ONE scrape target: the orchestrator's FastAPI /metrics endpoint.
+# The per-container Freqtrade metrics (ait_freqtrade_*) are NOT separate targets —
+# the in-orchestrator collector (Stage 10e.2, freqtrade_exporter.py) scrapes each
+# running paper/live container on every /metrics hit and re-exposes the gauges
+# under the orchestrator's own endpoint. So scraping the orchestrator alone yields
+# both the orchestrator-level metrics and every container's profit/drawdown/open
+# trades. (A future node-exporter for host CPU/mem would add a second job here —
+# see the placeholder panel in ops/grafana/strategy-trading.json.)
+
+global:
+  # 15s balances trend resolution against load. The orchestrator's /metrics call
+  # triggers the Freqtrade collector to hit every running container SYNCHRONOUSLY
+  # (5s per-client timeout, bounded by concurrency), so the scrape interval is
+  # also how often the orchestrator polls each Freqtrade REST API for dashboard
+  # gauges. 15s is frequent enough for P&L / drawdown / open-trades trends without
+  # hammering the containers; the acute safety signal (dd ≥ 12% kill) is the
+  # out-of-band 5-min APScheduler poll (BRD §11), NOT this scrape — so a slower
+  # dashboard cadence never weakens the kill switch.
+  scrape_interval: 15s
+  scrape_timeout: 10s
+  external_labels:
+    project: ai-trading-agent
+
+scrape_configs:
+  - job_name: orchestrator
+    metrics_path: /metrics
+    static_configs:
+      # 127.0.0.1 per BRD §15 (all ports bound to loopback; remote access via
+      # WireGuard / SSH tunnel only). ORCHESTRATOR_PORT defaults to 8000
+      # (orchestrator.scheduler._orchestrator_base_url). When Prometheus runs in
+      # its own container, replace 127.0.0.1 with the orchestrator's reachable
+      # address on the deploy network (e.g. host.docker.internal or a compose
+      # service name) — see ops/observability.md.
+      - targets: ["127.0.0.1:8000"]
+        labels:
+          service: orchestrator
