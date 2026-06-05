@@ -62,7 +62,8 @@ from orchestrator.observability.events import (
     publish_gate_advanced,
     record_gate_audit,
 )
-from orchestrator.observability.log import configure_logging, run_context
+from orchestrator.observability.log import configure_logging, get_logger, run_context
+from orchestrator.observability.tracing import langsmith_project, tracing_enabled
 from orchestrator.scheduler import (
     build_scheduler,
     make_schedule_live_wake_fn,
@@ -358,6 +359,17 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # configures structured logging for all of them. JSON to stdout is the prod
     # default; AIT_LOG_CONSOLE swaps in the human renderer for local dev.
     configure_logging()
+
+    # Stage 10d (BRD §14, SPEC §1 Q4): LangSmith auto-instruments
+    # LangGraph/LangChain from the env (LANGSMITH_TRACING / LANGSMITH_API_KEY,
+    # loaded by load_dotenv — the key is never hardcoded). Log the resolved
+    # state once at startup so the operator can see whether traces will flow,
+    # without depending on a successful first trace to find out. Tracing being
+    # off is a normal, supported mode — the graph runs identically either way.
+    get_logger("startup").info(
+        "langsmith_tracing",
+        payload={"enabled": tracing_enabled(), "project": langsmith_project()},
+    )
 
     checkpoint_uri = _require_env("LANGGRAPH_CHECKPOINT_URI")
     store_uri = _require_env("LANGGRAPH_STORE_URI")
