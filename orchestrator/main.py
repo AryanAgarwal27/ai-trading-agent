@@ -43,6 +43,7 @@ from fastapi import (
     Header,
     HTTPException,
     Request,
+    Response,
     WebSocket,
     WebSocketDisconnect,
     status,
@@ -50,6 +51,7 @@ from fastapi import (
 from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
 from langgraph.store.postgres.aio import AsyncPostgresStore
 from langgraph.types import Command
+from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
 from pydantic import BaseModel, Field
 
 from orchestrator.graph import build_per_strategy_graph
@@ -550,6 +552,24 @@ app = FastAPI(title="ai-trading-agent orchestrator", lifespan=lifespan)
 @app.get("/health")
 async def health() -> dict[str, bool]:
     return {"ok": True}
+
+
+@app.get("/metrics")
+async def metrics_endpoint() -> Response:
+    """Prometheus scrape endpoint (Stage 10e, BRD §14).
+
+    Serializes the prometheus_client DEFAULT registry — the metrics defined in
+    ``orchestrator.observability.metrics`` (kill-switch fires, per-stage
+    strategy gauge, supervisor runs), registered at import time via the
+    ``orchestrator.supervisor`` + ``orchestrator.kill_subscription`` modules
+    this app already imports. No auth by design: the orchestrator binds
+    ``127.0.0.1`` only (BRD §15 — ``orchestrator.main.main()`` /
+    ``ORCHESTRATOR_HOST`` default 127.0.0.1), so the scrape endpoint is reached
+    only over the same loopback / WireGuard tunnel as the rest of the API; a
+    token on a Prometheus scrape would just be a shared secret in the scrape
+    config, not a real boundary.
+    """
+    return Response(content=generate_latest(), media_type=CONTENT_TYPE_LATEST)
 
 
 @app.get("/threads")

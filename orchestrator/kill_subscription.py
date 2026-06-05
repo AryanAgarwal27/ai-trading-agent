@@ -45,6 +45,7 @@ from langgraph.types import Command
 
 from orchestrator.observability.events import KILL_SWITCH_CHANNEL
 from orchestrator.observability.log import run_context
+from orchestrator.observability.metrics import KILL_SWITCH_FIRES
 from orchestrator.observability.tracing import trace_config
 
 logger = logging.getLogger(__name__)
@@ -213,6 +214,11 @@ async def _handle_message(message: dict[str, Any], writer: KillEventWriterFn) ->
             exc,
         )
         return
+
+    # Stage 10e (BRD §14): a well-formed kill-switch event reached the
+    # orchestrator — count the fire here, the real consume site (malformed /
+    # skipped messages returned above and do not count).
+    KILL_SWITCH_FIRES.inc()
 
     event["channel"] = channel
     try:

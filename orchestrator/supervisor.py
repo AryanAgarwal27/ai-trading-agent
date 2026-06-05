@@ -78,6 +78,7 @@ from orchestrator.observability.events import (
     record_telemetry,
 )
 from orchestrator.observability.log import run_context
+from orchestrator.observability.metrics import SUPERVISOR_RUNS, set_strategies_by_stage
 from orchestrator.observability.tracing import trace_config
 from orchestrator.tools.store_queries import aget_failures, aget_wins
 
@@ -167,6 +168,10 @@ async def aget_portfolio_snapshot(conn: psycopg.AsyncConnection) -> dict[str, An
     by_stage = {str(stage): int(count) for stage, count in rows}
     active = sum(count for stage, count in by_stage.items() if stage != _ARCHIVED_STAGE)
     live = by_stage.get("live", 0)
+    # Stage 10e (BRD §14): publish the per-stage gauge from the just-computed
+    # registry counts — this is the count-by-stage site, so the Prometheus
+    # gauge and the supervisor's own snapshot are one source of truth.
+    set_strategies_by_stage(by_stage)
     return {"by_stage": by_stage, "active": active, "live": live}
 
 
@@ -949,6 +954,10 @@ async def run_supervisor(
     :func:`orchestrator.scheduler.make_unschedule_live_wake_fn`). Tests inject
     them to stay hermetic.
     """
+    # Stage 10e (BRD §14): count this run by trigger (cron / event / manual) at
+    # the real run site — once per invocation, before any work.
+    SUPERVISOR_RUNS.labels(trigger=trigger).inc()
+
     audit = audit_writer_fn or _default_audit_writer
     publish_completion = completion_publisher_fn or publish_thread_completed
     spawn_queue: list[str] = []
