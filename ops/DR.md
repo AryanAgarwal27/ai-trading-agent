@@ -65,6 +65,16 @@ The scripts assume **bash** (Git Bash / WSL on Windows; the VPS shell on deploy)
   **inside** that container, streaming dumps to/from host files over
   `docker exec`. For the local DoD, also pass `--no-upload` (no rclone needed).
 
+> **rclone on PATH (Windows Git Bash).** To run `backup.sh` *with* the gdrive
+> upload on Windows, rclone must be on Git Bash's PATH. A `winget`-installed
+> rclone lands under
+> `~/AppData/Local/Microsoft/WinGet/Packages/...rclone.../` which Git Bash does
+> NOT pick up by default — `backup.sh` then fails with "rclone not found".
+> Extend PATH for the session before running, e.g.
+> `export PATH="$PATH:$HOME/AppData/Local/Microsoft/WinGet/Packages/$(ls ~/AppData/Local/Microsoft/WinGet/Packages | grep -i rclone)"`
+> (or add the rclone dir to PATH permanently). The Linux VPS (rclone in
+> `/usr/bin`) is unaffected. The `--no-upload` DoD path needs no rclone at all.
+
 ### Networking caveat (loopback vs container-internal port)
 
 The dev stack maps the container's `5432` to **host `127.0.0.1:5433`**
