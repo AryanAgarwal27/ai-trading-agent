@@ -37,6 +37,12 @@ from orchestrator.tools import backtest_runner
 
 class _FanState(TypedDict, total=False):
     items: list[int]
+    # Per-Send transient (the fan-out payload key). Declared on the state schema
+    # so the worker node can be typed as ``_FanState`` and satisfy add_node's
+    # overload WITHOUT a # type: ignore — a code-specific ignore here diverged
+    # local-Windows (call-overload) vs Linux-CI (arg-type) mypy. Retyping the
+    # node to the state schema removes the ignore entirely (Stage 10d CI fix).
+    _i: int
     results: Annotated[list[int], add]
 
 
@@ -67,16 +73,18 @@ async def test_send_fanout_and_to_thread_both_inherit_run_context(
     def _plan(state: _FanState) -> list[Send]:
         return [Send("worker", {"_i": i}) for i in state["items"]]
 
-    async def _worker(payload: dict[str, Any]) -> dict[str, Any]:
-        # node="backtest_worker" = the Send fan-out worker line.
-        log_mod.get_logger("backtest_worker").info("fanout", payload={"i": payload["_i"]})
+    async def _worker(state: _FanState) -> dict[str, Any]:
+        # node="backtest_worker" = the Send fan-out worker line. Typed as
+        # _FanState (the graph's state schema) so add_node accepts it without an
+        # ignore; the Send payload {"_i": i} is a partial _FanState.
+        log_mod.get_logger("backtest_worker").info("fanout", payload={"i": state["_i"]})
         # Exercise the REAL asyncio.to_thread in backtest_runner — its
         # _run_subprocess_sync emits node="backtest_runner" from the thread.
         await backtest_runner._run_subprocess(["noop"], 5)
-        return {"results": [payload["_i"]]}
+        return {"results": [state["_i"]]}
 
     builder: StateGraph[_FanState, _FanState, _FanState, _FanState] = StateGraph(_FanState)
-    builder.add_node("worker", _worker)  # type: ignore[call-overload]
+    builder.add_node("worker", _worker)
     builder.add_conditional_edges(START, _plan, ["worker"])
     builder.add_edge("worker", END)
     graph = builder.compile()
