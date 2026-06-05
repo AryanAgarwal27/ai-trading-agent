@@ -1006,6 +1006,22 @@ async def ws_events(ws: WebSocket, thread_id: str | None = None) -> None:
 # ─── Production entry point ────────────────────────────────────────────
 
 
+def _install_selector_loop_policy_on_win32() -> None:
+    """Install the ``SelectorEventLoop`` policy on Windows (no-op elsewhere).
+
+    Extracted from :func:`main` (Stage 11a / D-15) so the loop-policy install —
+    the whole point of owning the loop — is unit-testable WITHOUT creating a real
+    event loop: the earlier ``test_main_entrypoint`` that drove the real
+    ``asyncio.run`` below created+closed a loop and polluted sibling tests' loop
+    state (D-14). psycopg async requires the Selector loop on win32; uvicorn
+    would otherwise force ``ProactorEventLoop`` (Stage 10d). On Linux the
+    Selector loop is already the default, so this is a no-op and the VPS prod
+    target is unaffected.
+    """
+    if sys.platform == "win32":
+        asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+
+
 def main() -> None:
     """Launch the orchestrator, owning the event loop so psycopg async gets a
     SelectorEventLoop on Windows (Stage 10d closure; BRD §3 supports a local
@@ -1029,8 +1045,7 @@ def main() -> None:
     """
     import uvicorn
 
-    if sys.platform == "win32":
-        asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+    _install_selector_loop_policy_on_win32()
 
     host = os.environ.get("ORCHESTRATOR_HOST", "127.0.0.1")
     port = int(os.environ.get("ORCHESTRATOR_PORT", "8000"))

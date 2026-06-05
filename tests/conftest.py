@@ -18,9 +18,13 @@ from __future__ import annotations
 import asyncio
 import os
 import sys
+from collections.abc import AsyncIterator
 
 import pytest
 from dotenv import load_dotenv
+
+import orchestrator.kill_subscription as _kill_subscription
+import orchestrator.supervisor as _supervisor
 
 # Load .env once at collection time so integration tests pick up
 # DATABASE_URL / REDIS_URL / OPERATOR_TOKEN / BINANCE_PAPER_* without
@@ -51,6 +55,18 @@ os.environ["AIT_SCHEDULER_JOBSTORE"] = "memory"
 # needs a live trace. Set AFTER load_dotenv so it wins over any .env value.
 os.environ["LANGSMITH_TRACING"] = "false"
 
+# Stage 11a (D-15): make the loop policy bulletproof, NOT order-dependent. The
+# session-scoped ``event_loop_policy`` fixture below already hands pytest-asyncio
+# the Selector policy for every async test, but a test that constructs its OWN
+# loop (a stray ``asyncio.run``, or sync code reaching ``get_event_loop``) would
+# otherwise get win32's default ``ProactorEventLoop`` — which psycopg async
+# rejects (D-14; SPEC 2026-05-27 Stage 3c). Installing the policy at conftest
+# IMPORT time makes the Selector loop the default for ANY loop created during
+# the session, independent of collection order. No-op off win32 (Selector is
+# already the default there).
+if sys.platform == "win32":
+    asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+
 # Re-export topic-grouped fixtures from tests/fixtures/. The F401 is
 # the standard pytest pattern for fixture re-export from a topic
 # module — pytest discovers fixtures by name in the conftest's
@@ -64,3 +80,49 @@ def event_loop_policy() -> asyncio.AbstractEventLoopPolicy:
     if sys.platform == "win32":
         return asyncio.WindowsSelectorEventLoopPolicy()
     return asyncio.DefaultEventLoopPolicy()
+
+
+# Module-level registries of fire-and-forget ``asyncio.Task``s in product code.
+# They live at MODULE scope (so a task survives the coroutine that spawned it —
+# GC protection), which means they also OUTLIVE pytest-asyncio's per-test loop.
+_MODULE_TASK_REGISTRIES = (
+    _kill_subscription._KILL_RESUME_TASKS,
+    _supervisor._BACKGROUND_SPAWN_TASKS,
+)
+
+
+@pytest.fixture(autouse=True)
+async def _isolate_module_task_registries() -> AsyncIterator[None]:
+    """Stage 11a (D-15) — enforce per-test event-loop isolation suite-wide.
+
+    Root cause of D-13 (and the D-14 commit's test-pollution): pytest-asyncio
+    gives each test a fresh function-scoped event loop, but the module-level task
+    registries above OUTLIVE that loop. A fire-and-forget task left in a registry
+    by test A — created on A's now-closed loop — is then gathered/awaited by a
+    later test B on B's loop, raising ``RuntimeError: ... got Future ... attached
+    to a different loop``. Because pytest COLLECTION ORDER decides whether A runs
+    before B, the suite's green-ness becomes order-dependent — the
+    measurement-integrity bug D-15 names.
+
+    The teardown of an async autouse fixture runs on the SAME loop the test used
+    (verified for sync AND async tests), so here — before pytest-asyncio closes
+    that loop — we cancel and drain any tasks the test leaked, on their OWNING
+    loop, then clear the registries. After EVERY test the sets are empty, so no
+    task can ever cross into the next test's loop. Collection order can no longer
+    change pass/fail. Tests that drain their own tasks (e.g. test_live_wake's
+    ``_drain_kill_resume_tasks``) leave nothing for this to do; it is the
+    suite-wide safety net that makes the guarantee structural rather than
+    per-file.
+    """
+    yield
+    for registry in _MODULE_TASK_REGISTRIES:
+        leaked = list(registry)
+        registry.clear()
+        for task in leaked:
+            task.cancel()
+        if leaked:
+            # Drain on this (the owning) loop so nothing is left pending to leak
+            # into the next test, and no "Task was destroyed but it is pending"
+            # noise is emitted. Exceptions/cancellations are swallowed — these
+            # are leaked fire-and-forget tasks being torn down, not assertions.
+            await asyncio.gather(*leaked, return_exceptions=True)

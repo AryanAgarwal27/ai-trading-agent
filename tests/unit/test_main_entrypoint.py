@@ -3,14 +3,21 @@
 ``orchestrator.main.main()`` must install a ``SelectorEventLoop`` policy on
 Windows before serving — otherwise the lifespan's ``AsyncPostgresSaver``
 crashes under uvicorn's default ``ProactorEventLoop`` (SPEC 2026-05-27
-Stage 3c). uvicorn is stubbed here so no server actually boots; the test
-only asserts the loop-policy install, which is the whole point of owning
-the loop.
+Stage 3c). The policy install is the whole point of owning the loop.
 
-Platform-agnostic: on win32 (the operator's machine) it asserts the
-selector policy was installed; on Linux (CI) it asserts the win32 branch
-was skipped — and never references ``WindowsSelectorEventLoopPolicy``
-(which does not exist off-Windows) on that branch.
+Stage 11a (D-15): this test now exercises the EXTRACTED
+``_install_selector_loop_policy_on_win32`` helper directly, instead of driving
+``main()`` and stubbing ``asyncio.run``. The earlier version called the real
+``asyncio.run`` inside ``main()``, which created+closed an event loop and
+polluted an unrelated later test's loop state (purely as a function of pytest
+collection order) — the D-14 instance of the D-15 measurement-integrity bug.
+Testing the pure helper means this test NEVER creates a real loop, so it cannot
+pollute siblings — a structural fix that subsumes the old ``asyncio.run`` stub.
+
+Platform-agnostic: on win32 (the operator's machine) it asserts the selector
+policy was installed; on Linux (CI) it asserts the win32 branch was skipped —
+and never references ``WindowsSelectorEventLoopPolicy`` (which does not exist
+off-Windows) on that branch.
 """
 
 from __future__ import annotations
@@ -22,38 +29,17 @@ from typing import Any
 import pytest
 
 
-class _FakeServer:
-    """No-op stand-in for ``uvicorn.Server`` — ``serve`` returns immediately."""
-
-    def __init__(self, config: Any) -> None:
-        self.config = config
-
-    async def serve(self) -> None:
-        return None
-
-
-def test_main_installs_selector_loop_policy_per_platform(
+def test_install_selector_loop_policy_per_platform(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    import uvicorn
-
-    from orchestrator.main import main
+    from orchestrator.main import _install_selector_loop_policy_on_win32
 
     captured: dict[str, Any] = {}
     monkeypatch.setattr(
         asyncio, "set_event_loop_policy", lambda policy: captured.__setitem__("policy", policy)
     )
-    # Stub asyncio.run so main() never creates/closes a REAL event loop — a real
-    # asyncio.run here would close the loop and pollute loop state for later
-    # tests (the same event-loop-pollution family as D-13). ``coro.close()``
-    # disposes the un-awaited serve() coroutine cleanly (no "never awaited"
-    # warning, which filterwarnings=error would otherwise fail on).
-    monkeypatch.setattr(asyncio, "run", lambda coro: coro.close())
-    # Stub uvicorn so main() builds a fake server (no real bind).
-    monkeypatch.setattr(uvicorn, "Config", lambda *a, **k: object())
-    monkeypatch.setattr(uvicorn, "Server", _FakeServer)
 
-    main()
+    _install_selector_loop_policy_on_win32()
 
     if sys.platform == "win32":
         # The whole fix: a SelectorEventLoop policy is installed before serving.
