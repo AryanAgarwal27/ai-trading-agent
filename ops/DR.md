@@ -135,6 +135,15 @@ If `rclone.conf` is in a non-default location, point the scripts at it with
 Schedule on the VPS (BRD §16 "nightly `pg_dump`"): a cron entry, e.g.
 `15 3 * * *  cd /opt/ai-trading-agent && ./ops/backup.sh >> /var/log/ait-backup.log 2>&1`.
 
+> **The nightly schedule is a DEPLOY-TIME step (cron / systemd-timer), intentionally
+> NOT in APScheduler.** The orchestrator's APScheduler only fires in-process graph
+> work (paper/live wakes, regime, kill-switch poll, supervisor cron) — it does not
+> run host-level ops, and `backup.sh` is a standalone shell script outside the
+> Python process. So nothing in the app backs the DB up automatically: the operator
+> MUST install the cron line (or an equivalent systemd timer) on the VPS at deploy
+> time, or there is no nightly backup. This is the one operational step the app
+> deliberately does not own.
+
 ## Quarterly DR drill (BRD §16 "test restore quarterly")
 
 Run once a quarter; takes ~10 min. Record the date + result in your ops log.
