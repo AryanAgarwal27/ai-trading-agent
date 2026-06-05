@@ -82,3 +82,10 @@ logs/
 # Stage 4c integration test writes parallel-fan-out metrics here for
 # operator review; not committed.
 tests/integration/_last_*.txt
+
+# ───────────── DB backups (Stage 10h, ops/backup.sh) ─────────────
+# pg_dump artefacts land here before rclone copy to gdrive; large + may carry
+# real data. Never commit. Default AIT_BACKUP_DIR (override with --backup-dir).
+backups/
+*.dump
+*.dump.partial

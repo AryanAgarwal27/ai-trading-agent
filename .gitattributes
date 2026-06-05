@@ -1,0 +1,5 @@
+# Shell scripts MUST be LF even when checked out on Windows — Git Bash / WSL /
+# the Linux VPS all choke on a CRLF shebang (`#!/usr/bin/env bash\r`). The
+# operator authors on Windows (BRD §3) but the deploy target is Linux, so pin
+# eol=lf for every script regardless of core.autocrlf.
+*.sh text eol=lf
