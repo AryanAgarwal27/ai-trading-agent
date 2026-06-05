@@ -137,6 +137,21 @@ class ApprovalDecisionBody(BaseModel):
     notes: str = Field(default="")
 
 
+class SupervisorRunBody(BaseModel):
+    """Body of ``POST /supervisor/run`` (the manual supervisor trigger).
+
+    ``dry_run=True`` runs the full read + reasoning path (sync → snapshot →
+    regime → strategies → agent → decision) but SKIPS every write — no
+    spawn/retire, no telemetry row, ``conn.rollback()`` instead of commit
+    (the ``run_supervisor`` dry-run contract). It is the safe way to exercise
+    the trigger without mutating the portfolio. Default ``False`` matches
+    ``run_supervisor``'s own default (a manual run is a real run unless asked
+    otherwise).
+    """
+
+    dry_run: bool = Field(default=False)
+
+
 # ─── Env helpers ───────────────────────────────────────────────────────
 
 
@@ -833,6 +848,46 @@ async def wake_thread(
         next_stage = post_snapshot.values.get("stage")
 
     return {"woke": True, "next_stage": next_stage}
+
+
+# ─── POST /supervisor/run (manual trigger) ─────────────────────────────
+
+
+@app.post("/supervisor/run")
+async def run_supervisor_endpoint(
+    body: SupervisorRunBody,
+    request: Request,
+    token: str = Depends(_require_operator_token),
+) -> dict[str, Any]:
+    """Manually trigger ONE supervisor run (Stage 10d closure).
+
+    This is the on-demand trigger the 9d cron / 9e event-subscription wiring
+    references but never exposed as an endpoint — for ops + testing, and the
+    permanent Stage 10d trace-verification path: a non-dry run spawns a
+    strategy whose per-strategy graph execution carries the trace_config tags
+    + the run_id mirror (so a real LangSmith trace can be inspected on demand).
+
+    OPERATOR_TOKEN-guarded (``X-Operator-Token``), exactly like /approve and
+    /wake. Invokes the lifespan-bound ``run_supervisor_fn`` (graph + store
+    already bound) at ``trigger="manual"`` on a fresh app-DB connection — the
+    SAME per-call connection lifecycle the cron + event jobs use; the runner
+    owns its own transaction (commit on a real run, rollback on dry_run), this
+    endpoint only opens/closes the connection. ``dry_run`` (body) is forwarded
+    so the trigger can be exercised without spawning. Returns the
+    ``SupervisorDecision`` (model_dump) plus the trigger + dry_run echo.
+    """
+    run_supervisor_fn = request.app.state.run_supervisor_fn
+    conn = await _connect_app_db()
+    try:
+        decision = await run_supervisor_fn(conn, trigger="manual", dry_run=body.dry_run)
+    finally:
+        await conn.close()
+
+    return {
+        "trigger": "manual",
+        "dry_run": body.dry_run,
+        "decision": decision.model_dump(),
+    }
 
 
 # ─── WS /events ────────────────────────────────────────────────────────
