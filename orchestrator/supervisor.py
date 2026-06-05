@@ -49,10 +49,12 @@ sub-stage deliberately reverses this v1 design — see DEFERRED.md D-8).
 Consequence: D-8's unbounded-context concern is dormant by design — it cannot
 occur while the supervisor stays stateless.
 
-D-10 (registry ``template`` sync) closure is DEFERRED to 9h per operator
-sign-off; ``sync_registry_stage`` remains stage-only, and ``alist_strategies``
-exposes ``last_transition_at`` via the ``last_updated`` equivalent (the
-registry has no dedicated per-transition column — also a 9h candidate).
+D-10 (registry↔graph-state mirror contract) is CLOSED in Stage 10f:
+``sync_registry_stage`` now mirrors the full declared :data:`MIRRORED_FIELDS`
+set (``stage`` + ``template``) per the :func:`_mirror_value` overwrite-vs-skip
+rule, not stage alone. ``alist_strategies`` still exposes ``last_transition_at``
+via ``last_updated`` (the registry has no dedicated per-transition column — a
+Stage 11 candidate, out of D-10's mirror-contract scope).
 """
 
 from __future__ import annotations
@@ -63,6 +65,7 @@ import logging
 import uuid
 from collections.abc import Awaitable, Callable
 from contextvars import ContextVar
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any, Literal
 
@@ -102,7 +105,8 @@ _AUDIT_SOURCE = "supervisor_decision"
 # producer (``_default_spawn_thread_fn``) can read pairs/timeframe/template back
 # to build the initial StrategyState (the registry row IS the spawn handoff).
 # The researcher node overwrites ``template`` in graph state once it chooses
-# one; the registry seed is "pending" until then (D-10, deferred to 9h).
+# one; the registry seed is "pending" until ``sync_registry_stage`` mirrors the
+# chosen value back per the mirror contract below (D-10, closed Stage 10f).
 _DEFAULT_PAIRS: tuple[str, ...] = ("BTC/USDT", "ETH/USDT", "SOL/USDT", "BNB/USDT")  # SPEC §1 Q2
 _DEFAULT_TIMEFRAME = "5m"
 _PENDING_TEMPLATE = "pending"
@@ -231,37 +235,115 @@ async def alist_strategies(conn: psycopg.AsyncConnection) -> list[dict[str, Any]
     return out
 
 
-async def sync_registry_stage(graph: Any, conn: psycopg.AsyncConnection) -> dict[str, Any]:
-    """Reconcile ``strategy_registry.stage`` with each thread's graph state.
+# ════════════════════════════════════════════════════════════════════════
+# Registry ↔ graph-state MIRROR CONTRACT (D-10, declared ONCE here)
+# ════════════════════════════════════════════════════════════════════════
 
-    Closes the SPEC 2026-05-27 (Stage 6f) item: the registry stage does not
-    auto-update from LangGraph state, so it drifts. Reads each registry row's
-    thread state via ``graph.aget_state`` and writes back any stage that moved.
+
+@dataclass(frozen=True, slots=True)
+class MirrorField:
+    """One ``strategy_registry`` column that MIRRORS graph state.
+
+    A field is mirrored IFF the GRAPH is its source of truth — the registry
+    value is a seed placeholder the graph later derives. ``seed_sentinels`` are
+    the placeholder values that mean "not yet derived"; the overwrite-vs-skip
+    rule (:func:`_mirror_value`) overwrites the registry only once graph state
+    holds a real (truthy, non-sentinel) value that differs.
+    """
+
+    name: str
+    seed_sentinels: frozenset[str]
+
+
+# WHICH registry columns mirror graph state, and the overwrite-vs-skip rule —
+# D-10's deliverable: declared in ONE place for ALL derived fields, applied
+# generically below (not a stage-only / one-off-template patch).
+#
+#   IN (graph is the source of truth):
+#     - ``stage``    — lifecycle position; every transition happens in the graph.
+#                      No seed sentinel: every Stage value is real.
+#     - ``template`` — seeded ``"pending"`` at research-spawn; the researcher
+#                      chooses the real template in graph state later
+#                      (researcher.py). ``"pending"`` is the seed sentinel.
+#
+#   OUT (the REGISTRY is the source of truth — NOT mirrored):
+#     - ``pairs``, ``timeframe``, ``name`` — spawn INPUTS. ``aspawn_strategy``
+#       sets them from the supervisor/operator's spawn decision; they are seeded
+#       into the registry AND passed into the graph as read-only inputs. NO graph
+#       node writes them back into ``StrategyState``, so mirroring them would be
+#       a no-op at best and could clobber the operator's spawn record if a node
+#       ever rewrote them. (``freqtrade_api_url`` / ``freqtrade_userdir`` /
+#       ``live_started_at`` are written to the registry directly by the
+#       paper/live spawn nodes — they are container facts, not graph-derived
+#       mirror fields, so they are out of scope here too.)
+#
+# OVERWRITE-VS-SKIP RULE (D-10's open question — declared for ALL fields):
+#   graph state WINS for a mirrored field once it holds a REAL value — overwrite
+#   the registry iff the graph value is truthy, NOT a seed sentinel, and differs
+#   from the registry value. Otherwise SKIP — never overwrite a real registry
+#   value with an empty/seed graph value. This generalizes the stage-only
+#   behavior that shipped in 9a.
+MIRRORED_FIELDS: tuple[MirrorField, ...] = (
+    MirrorField(name="stage", seed_sentinels=frozenset()),
+    MirrorField(name="template", seed_sentinels=frozenset({_PENDING_TEMPLATE})),
+)
+
+# SELECT column list for the mirror sweep — identity columns + every mirrored
+# field, in declaration order (so row[2:] aligns with MIRRORED_FIELDS).
+_MIRROR_SELECT_COLUMNS = ", ".join(f.name for f in MIRRORED_FIELDS)
+
+
+def _mirror_value(field: MirrorField, registry_value: Any, graph_value: Any) -> bool:
+    """The declared overwrite-vs-skip rule. ``True`` ⇒ overwrite the registry.
+
+    Graph state wins once it holds a real value: truthy, not a seed sentinel,
+    and different from the current registry value. A missing/empty graph value
+    or one still equal to a seed sentinel keeps the registry as-is.
+    """
+    if not graph_value:  # None / "" / empty — the graph has not produced it yet
+        return False
+    if graph_value in field.seed_sentinels:  # still the seed placeholder
+        return False
+    return bool(graph_value != registry_value)
+
+
+async def sync_registry_stage(graph: Any, conn: psycopg.AsyncConnection) -> dict[str, Any]:
+    """Reconcile the registry's graph-derived columns with each thread's state.
+
+    Closes the SPEC 2026-05-27 (Stage 6f) item AND D-10: the registry does not
+    auto-update from LangGraph state, so its graph-derived fields drift. Reads
+    each registry row's thread state via ``graph.aget_state`` and writes back
+    every mirrored field that moved, per the :data:`MIRRORED_FIELDS` contract +
+    the :func:`_mirror_value` overwrite-vs-skip rule above.
 
     Behaviour:
-      - A thread whose graph ``state.stage`` differs from its registry ``stage``
-        is UPDATEd (``stage`` + ``last_updated = now()``).
-      - A thread already in sync is left untouched.
-      - A thread with no checkpoint, an ``aget_state`` error, or a state with no
-        ``stage`` is SKIPPED (a freshly-seeded row whose graph thread has not
-        run yet must keep its seed stage).
+      - For each row, every mirrored field (``stage``, ``template``) whose graph
+        value WINS (truthy, non-seed, differs) is written; all winners for a row
+        go in ONE UPDATE (``<col> = %s, …`` + ``last_updated = now()``).
+      - A row already in sync for every mirrored field is left untouched.
+      - A thread with no checkpoint, an ``aget_state`` error, or an empty state
+        (a freshly-seeded row whose graph thread has not run yet) is SKIPPED — it
+        keeps every seed value.
 
-    D-10 (deferred to 9h per signoff): this syncs ``stage`` ONLY — not
-    ``template`` (which stays the seeded "pending" until the researcher's choice
-    is mirrored back) nor a dedicated transition timestamp.
-
-    Caller owns ``conn`` + the transaction; this does NOT commit (the runner
-    batches sync + writes + telemetry into one commit). Returns
-    ``{"checked", "updated", "skipped"}``.
+    Name kept as ``sync_registry_stage`` for call-site stability (the runner +
+    cron + endpoint reference it); it now syncs the full mirror set, not stage
+    alone. Caller owns ``conn`` + the transaction; this does NOT commit (the
+    runner batches sync + writes + telemetry into one commit). Returns
+    ``{"checked", "updated", "skipped"}`` where ``updated`` is one change record
+    per field: ``{"strategy_id", "field", "from", "to"}``.
     """
     async with conn.cursor() as cur:
-        await cur.execute("SELECT strategy_id, thread_id, stage FROM strategy_registry")
+        await cur.execute(
+            f"SELECT strategy_id, thread_id, {_MIRROR_SELECT_COLUMNS} FROM strategy_registry"
+        )
         rows = await cur.fetchall()
 
     updated: list[dict[str, str]] = []
     skipped: list[str] = []
 
-    for strategy_id, thread_id, registry_stage in rows:
+    for row in rows:
+        strategy_id, thread_id = row[0], row[1]
+        registry_values = dict(zip((f.name for f in MIRRORED_FIELDS), row[2:], strict=True))
         config = {"configurable": {"thread_id": thread_id}}
         try:
             snapshot = await graph.aget_state(config)
@@ -275,24 +357,47 @@ async def sync_registry_stage(graph: Any, conn: psycopg.AsyncConnection) -> dict
             continue
 
         values = getattr(snapshot, "values", None) or {}
-        graph_stage = values.get("stage")
-        if not graph_stage:
+        if not values:
+            # Graph thread has not run yet — keep every seed value.
             skipped.append(str(strategy_id))
             continue
 
-        if graph_stage == registry_stage:
+        # Collect the mirrored fields whose graph value wins, in declaration
+        # order (so the UPDATE + change records are deterministic).
+        changes: list[tuple[MirrorField, Any]] = []
+        for mfield in MIRRORED_FIELDS:
+            graph_value = values.get(mfield.name)
+            if _mirror_value(mfield, registry_values[mfield.name], graph_value):
+                changes.append((mfield, graph_value))
+
+        if not changes:
             continue
 
+        set_clause = ", ".join(f"{mfield.name} = %s" for mfield, _ in changes)
+        params = tuple(new_value for _, new_value in changes) + (strategy_id,)
         async with conn.cursor() as cur:
             await cur.execute(
-                "UPDATE strategy_registry SET stage = %s, last_updated = now() "
+                f"UPDATE strategy_registry SET {set_clause}, last_updated = now() "
                 "WHERE strategy_id = %s",
-                (graph_stage, strategy_id),
+                params,
             )
-        updated.append(
-            {"strategy_id": str(strategy_id), "from": str(registry_stage), "to": str(graph_stage)}
-        )
-        logger.info("sync_registry_stage: %s %s -> %s", strategy_id, registry_stage, graph_stage)
+        for mfield, new_value in changes:
+            old_value = registry_values[mfield.name]
+            updated.append(
+                {
+                    "strategy_id": str(strategy_id),
+                    "field": mfield.name,
+                    "from": str(old_value),
+                    "to": str(new_value),
+                }
+            )
+            logger.info(
+                "sync_registry_stage: %s %s %s -> %s",
+                strategy_id,
+                mfield.name,
+                old_value,
+                new_value,
+            )
 
     return {"checked": len(rows), "updated": updated, "skipped": skipped}
 
