@@ -41,6 +41,16 @@ load_dotenv()
 # conftest, so it keeps the SQLAlchemyJobStore default.
 os.environ["AIT_SCHEDULER_JOBSTORE"] = "memory"
 
+# Stage 10d: force LangSmith tracing OFF for the whole test suite, regardless
+# of what the operator's .env (loaded above) sets. Two reasons: (1) tests must
+# never upload traces to the real LangSmith project (pollution + latency), and
+# (2) it makes the graceful-degradation contract — graph runs identically with
+# tracing off — the DEFAULT condition every graph-running test exercises. A
+# test that wants to assert trace-config behaviour does so by building the
+# config directly (test_tracing.py) or monkeypatching this back on; it never
+# needs a live trace. Set AFTER load_dotenv so it wins over any .env value.
+os.environ["LANGSMITH_TRACING"] = "false"
+
 # Re-export topic-grouped fixtures from tests/fixtures/. The F401 is
 # the standard pytest pattern for fixture re-export from a topic
 # module — pytest discovers fixtures by name in the conftest's

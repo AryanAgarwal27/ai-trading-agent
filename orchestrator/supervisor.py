@@ -78,6 +78,7 @@ from orchestrator.observability.events import (
     record_telemetry,
 )
 from orchestrator.observability.log import run_context
+from orchestrator.observability.tracing import trace_config
 from orchestrator.tools.store_queries import aget_failures, aget_wins
 
 logger = logging.getLogger(__name__)
@@ -773,8 +774,21 @@ async def _default_spawn_thread_fn(graph: Any, strategy_id: str) -> None:
             # node it drives logs under the same id. run_id is NOT carried on
             # initial_state (it must never be checkpointed — BRD §5.7); it lives
             # only in structlog contextvars for this task's scope.
-            with run_context(strategy_id=strategy_id, thread_id=f"strategy_{strategy_id}"):
-                async for _ in graph.astream(initial_state, config=config):
+            # Stage 10d: thread that SAME run_id into trace_config so the spawn's
+            # LangSmith trace shares one id with its structlog lines. Entry stage
+            # is "research" (initial_state["stage"]) — the lifecycle phase the
+            # execution begins in.
+            with run_context(
+                strategy_id=strategy_id, thread_id=f"strategy_{strategy_id}"
+            ) as run_id:
+                traced_config = trace_config(
+                    config,
+                    strategy_id=strategy_id,
+                    thread_id=f"strategy_{strategy_id}",
+                    run_id=run_id,
+                    stage="research",
+                )
+                async for _ in graph.astream(initial_state, config=traced_config):
                     pass
         except Exception as exc:  # noqa: BLE001 — background run; surfaces via logs + archived thread
             logger.error("spawn producer: graph run failed strategy_id=%s exc=%s", strategy_id, exc)

@@ -63,7 +63,7 @@ from orchestrator.observability.events import (
     record_gate_audit,
 )
 from orchestrator.observability.log import configure_logging, get_logger, run_context
-from orchestrator.observability.tracing import langsmith_project, tracing_enabled
+from orchestrator.observability.tracing import langsmith_project, trace_config, tracing_enabled
 from orchestrator.scheduler import (
     build_scheduler,
     make_schedule_live_wake_fn,
@@ -667,9 +667,20 @@ async def approve_thread(
         # Stage 10c: this resume is one GRAPH EXECUTION — mint a fresh
         # execution-scoped run_id and bind {run_id, strategy_id, thread_id} for
         # its duration so every node it drives logs under the same execution id.
+        # Stage 10d: thread that SAME run_id (the string run_context yields and
+        # binds into structlog contextvars) into trace_config so the LangSmith
+        # trace and the structlog lines share one id — not a parallel mint.
         resume_sid = str((snapshot.values or {}).get("strategy_id") or thread_id)
-        with run_context(strategy_id=resume_sid, thread_id=thread_id):
-            async for _ in graph.astream(Command(resume=decision_dict), config=config):
+        resume_stage = (snapshot.values or {}).get("stage")
+        with run_context(strategy_id=resume_sid, thread_id=thread_id) as run_id:
+            traced_config = trace_config(
+                config,
+                strategy_id=resume_sid,
+                thread_id=thread_id,
+                run_id=run_id,
+                stage=resume_stage,
+            )
+            async for _ in graph.astream(Command(resume=decision_dict), config=traced_config):
                 pass
 
         post_snapshot = await graph.aget_state(config)
@@ -802,10 +813,19 @@ async def wake_thread(
             )
 
         # Stage 10c: a wake-resume is one GRAPH EXECUTION — fresh run_id bound
-        # for its scope (mirrors /approve + the kill direct-resume).
+        # for its scope (mirrors /approve + the kill direct-resume). Stage 10d:
+        # the same run_id is threaded into trace_config (one shared id).
         resume_sid = str((snapshot.values or {}).get("strategy_id") or thread_id)
-        with run_context(strategy_id=resume_sid, thread_id=thread_id):
-            async for _ in graph.astream(Command(resume={"wake": True}), config=config):
+        resume_stage = (snapshot.values or {}).get("stage")
+        with run_context(strategy_id=resume_sid, thread_id=thread_id) as run_id:
+            traced_config = trace_config(
+                config,
+                strategy_id=resume_sid,
+                thread_id=thread_id,
+                run_id=run_id,
+                stage=resume_stage,
+            )
+            async for _ in graph.astream(Command(resume={"wake": True}), config=traced_config):
                 pass
 
         post_snapshot = await graph.aget_state(config)

@@ -45,6 +45,7 @@ from langgraph.types import Command
 
 from orchestrator.observability.events import KILL_SWITCH_CHANNEL
 from orchestrator.observability.log import run_context
+from orchestrator.observability.tracing import trace_config
 
 logger = logging.getLogger(__name__)
 
@@ -149,11 +150,20 @@ def make_kill_event_writer(graph: Any) -> KillEventWriterFn:
             try:
                 # Stage 10c: the kill direct-resume is one GRAPH EXECUTION — fresh
                 # execution-scoped run_id bound for its scope (mirrors /wake +
-                # /approve + the spawn invoke).
-                with run_context(strategy_id=strategy_id, thread_id=thread_id):
+                # /approve + the spawn invoke). Stage 10d: thread that SAME run_id
+                # into trace_config (one shared id). The thread is in the "live"
+                # stage here — the Fork-2 guard above returned unless stage=="live".
+                with run_context(strategy_id=strategy_id, thread_id=thread_id) as run_id:
+                    traced_config = trace_config(
+                        config,
+                        strategy_id=strategy_id,
+                        thread_id=thread_id,
+                        run_id=run_id,
+                        stage="live",
+                    )
                     async for _ in graph.astream(
                         Command(resume={"wake": True, "source": "kill_subscription"}),
-                        config=config,
+                        config=traced_config,
                     ):
                         pass
                 logger.info("kill direct-resume complete thread=%s (now at live_pause)", thread_id)
