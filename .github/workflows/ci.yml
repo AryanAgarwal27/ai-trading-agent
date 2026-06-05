@@ -66,12 +66,12 @@ jobs:
         run: uv run ruff format --check .
 
       - name: mypy (strict, orchestrator + tests)
-        # Non-blocking until Stage 10b cleanup (SPEC change-log 2026-05-28:
-        # "trust CI, deferred to Stage 10"). With the 10a lockfile, local and
-        # CI now resolve IDENTICAL versions, so the count is stable (129 errors
-        # at 10a baseline) — the flip to blocking is 10b's milestone. ruff
-        # lint/format + pytest remain blocking.
-        continue-on-error: true
+        # BLOCKING gate (Stage 10b.4 milestone). The Stage 7e mypy debt
+        # (130 errors / 33 files at the 10a locked baseline) was driven to 0
+        # across 10b.2 (source fixes) + 10b.3 (test fixes); the 10a uv.lock makes
+        # local and CI resolve identical versions so the count is stable. This
+        # flip closes the SPEC 2026-05-28 deferral — mypy strict is now a hard
+        # gate alongside ruff lint/format + pytest.
         run: uv run mypy orchestrator tests
 
       - name: pytest unit (exclude integration)
