@@ -48,6 +48,19 @@ Commit `pyproject.toml` **and** `uv.lock` together. CI runs `uv lock --locked` a
 
 > The bare `python` on PATH is system 3.10 without project deps (SPEC 2026-05-27). Inside an activated venv use `python`; in non-interactive/agent shells use the explicit interpreter `.venv\Scripts\python.exe -m <module>`, or prefer `uv run <tool>` which always targets the synced env.
 
+## Running the orchestrator
+
+Bring up Postgres + Redis first (`docker compose up -d`), apply the app schema (see *Resetting local infrastructure* below), then launch the FastAPI orchestrator via its entry point:
+
+```sh
+uv run python -m orchestrator.main
+# or, explicit interpreter:  .\.venv\Scripts\python.exe -m orchestrator.main
+```
+
+`orchestrator.main:main()` owns the event loop on purpose. On **Windows** it installs `WindowsSelectorEventLoopPolicy` before serving, because psycopg's async mode requires a `SelectorEventLoop` while a plain `uvicorn.run()` / `uvicorn --loop asyncio` would force a `ProactorEventLoop` and crash the lifespan's Postgres saver (SPEC 2026-05-27 Stage 3c). Do **not** launch with bare `uvicorn orchestrator.main:app` on Windows — it bypasses this. On Linux the selector loop is already the default, so `uvicorn orchestrator.main:app` also works there, but `python -m orchestrator.main` is the portable command.
+
+It binds `127.0.0.1` only (BRD §15); override host/port via `ORCHESTRATOR_HOST` / `ORCHESTRATOR_PORT` in `.env`.
+
 ## Resetting local infrastructure
 
 `docker compose down -v` wipes the named Postgres volume (`ait_postgres_data`). The init script in [db/init/01_create_databases.sql](db/init/01_create_databases.sql) re-creates the three logical DBs + pgvector on the next `docker compose up`, but the `app` schema (the five tables from BRD §5.8) is Alembic-owned and **must be re-applied manually**:

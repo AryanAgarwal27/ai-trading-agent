@@ -27,6 +27,7 @@ import asyncio
 import hashlib
 import logging
 import os
+import sys
 from collections import defaultdict
 from collections.abc import AsyncIterator
 from contextlib import AsyncExitStack, asynccontextmanager
@@ -885,3 +886,42 @@ async def ws_events(ws: WebSocket, thread_id: str | None = None) -> None:
             await pubsub.aclose()
         except Exception:
             pass
+
+
+# ─── Production entry point ────────────────────────────────────────────
+
+
+def main() -> None:
+    """Launch the orchestrator, owning the event loop so psycopg async gets a
+    SelectorEventLoop on Windows (Stage 10d closure; BRD §3 supports a local
+    machine, so a Windows-native launch is a supported config).
+
+    Why not ``uvicorn.run()`` / ``uvicorn --loop asyncio``? Both FORCE uvicorn's
+    ``ProactorEventLoop`` on win32. psycopg's async mode rejects Proactor and
+    requires ``SelectorEventLoop`` (SPEC 2026-05-27 Stage 3c), so the lifespan's
+    ``AsyncPostgresSaver.from_conn_string`` crashes under it. Setting the policy
+    and THEN calling ``uvicorn.run()`` does NOT help — uvicorn replaces the loop.
+    The fix is to OWN the loop: install the selector policy on win32, then run a
+    ``uvicorn.Server`` via ``asyncio.run`` (which honours the policy). On Linux
+    the selector loop is already the default, so the win32 branch is skipped and
+    behaviour is unchanged (the VPS prod target is unaffected).
+
+    ``tests/conftest.py`` installs the same selector policy as a fixture, which
+    is why the 87 integration tests pass — but there was no PRODUCTION launch
+    path with the equivalent until this entry point. Host/port come from
+    ``ORCHESTRATOR_HOST`` / ``ORCHESTRATOR_PORT`` (loaded by ``load_dotenv``;
+    default ``127.0.0.1:8000`` per BRD §15 loopback-only).
+    """
+    import uvicorn
+
+    if sys.platform == "win32":
+        asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+
+    host = os.environ.get("ORCHESTRATOR_HOST", "127.0.0.1")
+    port = int(os.environ.get("ORCHESTRATOR_PORT", "8000"))
+    server = uvicorn.Server(uvicorn.Config("orchestrator.main:app", host=host, port=port))
+    asyncio.run(server.serve())
+
+
+if __name__ == "__main__":
+    main()
