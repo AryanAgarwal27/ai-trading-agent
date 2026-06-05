@@ -52,6 +52,37 @@ SUPERVISOR_RUNS = Counter(
     ["trigger"],
 )
 
+# ─── Freqtrade per-container gauges (Stage 10e.2 exporter, BRD §14) ─────
+# Set by orchestrator.observability.freqtrade_exporter.collect_freqtrade_metrics
+# on each /metrics scrape, one series per running strategy (label strategy_id,
+# bounded by MAX_CONCURRENT_STRATEGIES). ``ait_freqtrade_up`` is the standard
+# exporter up/down flag (1 scraped OK, 0 unreachable) — consumers gate value
+# gauges on it, since a down container's value gauges retain their last reading.
+
+FREQTRADE_UP = Gauge(
+    "ait_freqtrade_up",
+    "1 if the strategy's Freqtrade REST API was scraped OK this cycle, else 0.",
+    ["strategy_id"],
+)
+
+FREQTRADE_PROFIT_CLOSED_PCT = Gauge(
+    "ait_freqtrade_profit_closed_percent",
+    "Closed-trade profit percent from /api/v1/profit.",
+    ["strategy_id"],
+)
+
+FREQTRADE_MAX_DRAWDOWN = Gauge(
+    "ait_freqtrade_max_drawdown",
+    "Max drawdown from /api/v1/profit.",
+    ["strategy_id"],
+)
+
+FREQTRADE_OPEN_TRADES = Gauge(
+    "ait_freqtrade_open_trades",
+    "Count of currently-open trades from /api/v1/status.",
+    ["strategy_id"],
+)
+
 # The 7 lifecycle stages (BRD §5.7). Used to set the gauge to 0 for stages with
 # no threads so a drained stage reports 0 rather than a stale last-known value.
 _STAGES: tuple[str, ...] = (

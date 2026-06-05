@@ -65,6 +65,7 @@ from orchestrator.observability.events import (
     publish_gate_advanced,
     record_gate_audit,
 )
+from orchestrator.observability.freqtrade_exporter import collect_freqtrade_metrics
 from orchestrator.observability.log import configure_logging, get_logger, run_context
 from orchestrator.observability.tracing import langsmith_project, trace_config, tracing_enabled
 from orchestrator.scheduler import (
@@ -417,6 +418,13 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         # > ~50 archived threads in memory.
         app.state.thread_locks = defaultdict(asyncio.Lock)
 
+        # Stage 10e.2: the in-orchestrator Freqtrade exporter. /metrics calls
+        # this at scrape time to refresh per-container profit/status gauges.
+        # Wired here so unit tests that hit /metrics without the lifespan simply
+        # skip it (no DB / no container scrape). It is self-degrading: per-
+        # container + DB failures are swallowed inside the collector.
+        app.state.freqtrade_collector = collect_freqtrade_metrics
+
         # ── APScheduler (Stage 7f). ────────────────────────────────────
         # Wake jobs (6h) + regime job (1h) + kill-switch poll placeholder
         # (5m). SQLAlchemyJobStore in production so a parked paper
@@ -555,7 +563,7 @@ async def health() -> dict[str, bool]:
 
 
 @app.get("/metrics")
-async def metrics_endpoint() -> Response:
+async def metrics_endpoint(request: Request) -> Response:
     """Prometheus scrape endpoint (Stage 10e, BRD §14).
 
     Serializes the prometheus_client DEFAULT registry — the metrics defined in
@@ -568,7 +576,22 @@ async def metrics_endpoint() -> Response:
     only over the same loopback / WireGuard tunnel as the rest of the API; a
     token on a Prometheus scrape would just be a shared secret in the scrape
     config, not a real boundary.
+
+    Stage 10e.2: if the lifespan wired the in-orchestrator Freqtrade exporter
+    (``app.state.freqtrade_collector``), refresh the per-container profit/status
+    gauges at scrape time first. Belt-and-braces try/except — the exporter
+    already swallows per-container + DB failures, and this guarantees even an
+    unexpected error there can NEVER break /metrics (a down container, an
+    unreachable DB, etc. still return the push metrics with a 200).
     """
+    collector = getattr(request.app.state, "freqtrade_collector", None)
+    if collector is not None:
+        try:
+            await collector()
+        except Exception as exc:  # noqa: BLE001 — a scrape failure must never break /metrics
+            logger.warning(
+                "freqtrade exporter collection failed: %s; serving push metrics only", exc
+            )
     return Response(content=generate_latest(), media_type=CONTENT_TYPE_LATEST)
 
 
