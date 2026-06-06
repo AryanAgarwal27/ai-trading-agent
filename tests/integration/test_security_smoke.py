@@ -174,3 +174,32 @@ def test_gitignore_excludes_secrets_and_local_data() -> None:
     gitignore = (_REPO_ROOT / ".gitignore").read_text(encoding="utf-8")
     for needed in (".env", "secrets/", "freqtrade/user_data/data/"):
         assert needed in gitignore, f".gitignore must exclude {needed} (BRD §15 item 9)"
+
+
+# ── §15 item 1/10: strict-msgpack checkpoint deserialization (Stage 11c F1) ──
+
+
+def test_strict_msgpack_is_in_effect() -> None:
+    """The §15/§6.6 checkpoint-RCE control is actually ON under the suite —
+    conftest forces ``LANGGRAPH_STRICT_MSGPACK`` BEFORE the langgraph import, and
+    ``orchestrator/__init__.py`` load_dotenv keeps the production path honest.
+    Asserts LangGraph's RESOLVED flag (not the env var): the F1 hole was the env
+    being set too late to be captured at langgraph import, so strict mode read
+    silently OFF while the env var still said "true"."""
+    from langgraph.checkpoint.serde._msgpack import STRICT_MSGPACK_ENABLED
+
+    assert STRICT_MSGPACK_ENABLED is True
+
+
+def test_startup_guard_refuses_when_strict_msgpack_off(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The lifespan guard ``_assert_strict_msgpack_enabled`` fails LOUDLY when
+    strict mode is not in effect, so a misconfigured / load-order-regressed deploy
+    crashes at startup instead of running with checkpoint deserialization wide
+    open (Stage 11c F1)."""
+    import langgraph.checkpoint.serde._msgpack as msgpack_mod
+
+    from orchestrator.main import _assert_strict_msgpack_enabled
+
+    monkeypatch.setattr(msgpack_mod, "STRICT_MSGPACK_ENABLED", False)
+    with pytest.raises(RuntimeError, match="LANGGRAPH_STRICT_MSGPACK"):
+        _assert_strict_msgpack_enabled()

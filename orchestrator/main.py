@@ -36,7 +36,6 @@ from secrets import compare_digest
 from typing import Any
 
 import redis.asyncio as aioredis
-from dotenv import load_dotenv
 from fastapi import (
     Depends,
     FastAPI,
@@ -85,7 +84,9 @@ from orchestrator.supervisor_subscription import (
     run_supervisor_subscription,
 )
 
-load_dotenv()
+# .env is loaded in orchestrator/__init__.py (Stage 11c F1) — BEFORE any langgraph
+# import, so LANGGRAPH_STRICT_MSGPACK (read at langgraph import time) is honoured.
+# Loading it here (after the langgraph imports above) would be too late.
 
 logger = logging.getLogger(__name__)
 
@@ -362,6 +363,32 @@ async def _require_operator_token(
 # ─── Lifespan ──────────────────────────────────────────────────────────
 
 
+def _assert_strict_msgpack_enabled() -> None:
+    """Refuse to start unless LangGraph's strict-msgpack deserialization is in
+    effect (BRD §6.6 / §15 — Stage 11c F1).
+
+    Reads LangGraph's RESOLVED flag (``_msgpack.STRICT_MSGPACK_ENABLED``), NOT the
+    env var, deliberately: the flag is captured once at langgraph IMPORT time, so
+    an env value that lands too late (e.g. ``load_dotenv`` after the import) leaves
+    strict mode silently OFF. Asserting the value actually in effect catches that
+    and any future load-order regression — the env var reading "true" is not proof
+    the protection is on. Strict mode restricts checkpoint deserialization to a
+    safe type set, blocking code execution from a compromised checkpoint DB.
+    """
+    from langgraph.checkpoint.serde._msgpack import STRICT_MSGPACK_ENABLED
+
+    if not STRICT_MSGPACK_ENABLED:
+        raise RuntimeError(
+            "LANGGRAPH_STRICT_MSGPACK is not in effect — refusing to start "
+            "(BRD §6.6/§15: strict msgpack blocks code execution from a "
+            "compromised checkpoint database). The flag is read at langgraph "
+            "import time, so it must be set in the process environment BEFORE "
+            "Python imports langgraph; a .env value is loaded by "
+            "orchestrator/__init__.py to guarantee that ordering. Set "
+            "LANGGRAPH_STRICT_MSGPACK=true (see .env.example)."
+        )
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     """Open the LangGraph saver/store, the Redis pubsub client, and
@@ -379,6 +406,12 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # configures structured logging for all of them. JSON to stdout is the prod
     # default; AIT_LOG_CONSOLE swaps in the human renderer for local dev.
     configure_logging()
+
+    # Stage 11c (F1, BRD §6.6/§15): fail loudly NOW if strict-msgpack checkpoint
+    # deserialization is not actually in effect — before opening the saver that
+    # would deserialize checkpoints. Guards against the env var being set too late
+    # to be honoured (the silent-off hole this stage closed).
+    _assert_strict_msgpack_enabled()
 
     # Stage 10d (BRD §14, SPEC §1 Q4): LangSmith auto-instruments
     # LangGraph/LangChain from the env (LANGSMITH_TRACING / LANGSMITH_API_KEY,

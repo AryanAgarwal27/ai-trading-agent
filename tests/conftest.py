@@ -23,8 +23,17 @@ from collections.abc import AsyncIterator
 import pytest
 from dotenv import load_dotenv
 
-import orchestrator.kill_subscription as _kill_subscription
-import orchestrator.supervisor as _supervisor
+# Stage 11c (F1): the suite ALWAYS exercises strict-msgpack mode (the §15
+# checkpoint-RCE control). LangGraph reads LANGGRAPH_STRICT_MSGPACK at IMPORT
+# time, so this must be set BEFORE the orchestrator imports below (importing
+# orchestrator pulls in langgraph). load_dotenv (here and in
+# orchestrator/__init__.py) does NOT override an already-set env var, so this
+# forced value wins; the lifespan's _assert_strict_msgpack_enabled then passes
+# under test. setdefault leaves a deliberate shell override in place.
+os.environ.setdefault("LANGGRAPH_STRICT_MSGPACK", "true")
+
+import orchestrator.kill_subscription as _kill_subscription  # noqa: E402
+import orchestrator.supervisor as _supervisor  # noqa: E402
 
 # Load .env once at collection time so integration tests pick up
 # DATABASE_URL / REDIS_URL / OPERATOR_TOKEN / BINANCE_PAPER_* without
