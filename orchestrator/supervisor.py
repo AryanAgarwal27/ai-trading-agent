@@ -1057,6 +1057,38 @@ async def _execute_action(
     return {"action": "no_op", "result": {"rationale": action.rationale}}
 
 
+# D-11: ONE fixed advisory-lock key serializing EVERY run_supervisor invocation
+# (cron + event + manual). The 9d cron (id="supervisor_cron") and 9e event
+# (id="supervisor_event_oneshot") runs are DISTINCT APScheduler job ids, so
+# max_instances=1 (which is PER-job-id) does NOT serialize them against each
+# other — two runs could read the capacity gate concurrently and momentarily
+# overshoot MAX_CONCURRENT_STRATEGIES by 1. pg_advisory_xact_lock is
+# TRANSACTION-scoped: acquired before sync_registry_stage, it is held for the
+# whole snapshot→reason→spawn→commit sequence and AUTO-RELEASES when this run's
+# transaction ends (commit / rollback / connection close) — crash-safe, no leaked
+# lock. A concurrent run BLOCKS on acquire, then reads capacity only AFTER the
+# holder commits, closing the read-then-write window.
+#
+# Choices (stated per the D-11 brief): xact-scoped over SESSION-scoped
+# (pg_advisory_lock) because a session lock survives a crashed run and would
+# strand the next invocation — xact auto-release on conn close is the crash-safe
+# property we want. Blocking pg_advisory_xact_lock over pg_try_* / skip because a
+# WAIT serializes without DROPPING the second run: it still reasons, on fresh
+# post-commit state, rather than no-op'ing the event/cron tick.
+_SUPERVISOR_ADVISORY_LOCK_KEY: int = 0x4149_545F_5355_5056  # "AIT_SUPV" ascii; fixed/arbitrary
+
+
+async def _acquire_supervisor_lock(conn: psycopg.AsyncConnection) -> None:
+    """Acquire the transaction-scoped advisory lock serializing run_supervisor.
+
+    Blocks until granted; auto-released when ``conn``'s transaction ends (commit /
+    rollback / close). The single serialization primitive for D-11 (and the
+    capacity read-then-write window it closes).
+    """
+    async with conn.cursor() as cur:
+        await cur.execute("SELECT pg_advisory_xact_lock(%s)", (_SUPERVISOR_ADVISORY_LOCK_KEY,))
+
+
 async def run_supervisor(
     graph: Any,
     store: BaseStore,
@@ -1148,6 +1180,11 @@ async def run_supervisor(
             await _default_spawn_thread_fn(graph, sid)
 
     try:
+        # D-11: serialize all run_supervisor invocations on ONE xact-scoped
+        # advisory lock BEFORE any read — closes the capacity read-then-write race
+        # across the distinct cron/event/manual job ids. Held until the commit /
+        # rollback below; auto-released on conn close (crash-safe).
+        await _acquire_supervisor_lock(conn)
         await sync_registry_stage(graph, conn)
         snapshot = await aget_portfolio_snapshot(conn)
         regime = await aget_current_regime(conn)

@@ -32,6 +32,7 @@ import pytest
 from langgraph.store.memory import InMemoryStore
 
 from orchestrator.supervisor import (
+    _SUPERVISOR_ADVISORY_LOCK_KEY,
     SupervisorAction,
     SupervisorDecision,
     _current_portfolio,
@@ -164,6 +165,43 @@ def _spawn_decision(name: str = "strat_a") -> SupervisorDecision:
         overall_rationale="one spawn",
         confidence=0.8,
     )
+
+
+# ─── D-11: advisory-lock serialization ─────────────────────────────────
+
+
+async def test_run_supervisor_acquires_advisory_lock_before_any_read() -> None:
+    """D-11: run_supervisor takes the xact-scoped advisory lock as its FIRST SQL —
+    before sync_registry_stage / the snapshot read — so every invocation
+    (cron/event/manual) serializes on it and the capacity gate cannot be raced
+    across the distinct APScheduler job ids."""
+    conn = _FakeConn()
+    graph = _StubGraph()
+    audit, _ = _audit_capture()
+
+    await run_supervisor(
+        graph,
+        InMemoryStore(),
+        cast(Any, conn),
+        trigger="manual",
+        agent=_StubAgent(
+            decision=SupervisorDecision(actions=[], overall_rationale="noop", confidence=0.0)
+        ),
+        audit_writer_fn=audit,
+    )
+
+    assert conn.executed, "run_supervisor issued no SQL"
+    first_sql, first_params = conn.executed[0]
+    assert "pg_advisory_xact_lock" in first_sql
+    assert first_params == (_SUPERVISOR_ADVISORY_LOCK_KEY,)
+    # The lock precedes every registry write.
+    lock_idx = next(i for i, (s, _) in enumerate(conn.executed) if "pg_advisory_xact_lock" in s)
+    write_idxs = [
+        i
+        for i, (s, _) in enumerate(conn.executed)
+        if s.strip().upper().startswith(("INSERT", "UPDATE"))
+    ]
+    assert all(lock_idx < i for i in write_idxs)
 
 
 # ─── empty portfolio + spawn ───────────────────────────────────────────
