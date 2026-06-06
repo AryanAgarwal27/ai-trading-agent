@@ -238,11 +238,15 @@ def _build_e2e_graph(saver: Any, rec: dict[str, Any]) -> Any:
     async def _paper_stop(_sid: str) -> None:
         rec["paper_stopped"] = True
 
+    async def _zero_live_count() -> int:
+        return 0  # D-9: slot free → live_gate offers approval deterministically
+
     paper = build_paper_subgraph(
         spawn_container_fn=_paper_spawn,
         paper_monitor_fn=_paper_monitor_advance,
         build_context_fn=_paper_ctx,
         stop_container_fn=_paper_stop,
+        live_count_fn=_zero_live_count,
     )
 
     # ── live subgraph leaves

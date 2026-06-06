@@ -651,7 +651,10 @@ async def list_threads(request: Request) -> list[dict[str, Any]]:
 
     Returns a list of objects:
     ``{strategy_id, thread_id, stage, last_updated, has_pending_interrupt,
-    pending_interrupt_payload}``.
+    pending_interrupt_payload, live_gate_status}``. ``live_gate_status`` is
+    ``"live_slot_occupied"`` when the thread is parked at ``paper_wait`` because
+    ``live_gate`` refused to offer approval — the live slot is full (D-9) —
+    else ``None``.
 
     ``pending_interrupt_payload`` is the dict that was passed to
     ``interrupt(...)`` inside the paused gate node (i.e. the output of
@@ -685,6 +688,7 @@ async def list_threads(request: Request) -> list[dict[str, Any]]:
         config = {"configurable": {"thread_id": thread_id}}
         has_pending = False
         pending_payload: dict[str, Any] | None = None
+        live_gate_status: str | None = None
         try:
             snapshot = await graph.aget_state(config)
             for task in snapshot.tasks:
@@ -698,6 +702,18 @@ async def list_threads(request: Request) -> list[dict[str, Any]]:
                     # wins keeps the contract simple.
                     pending_payload = interrupts[0].value
                     break
+            # D-9: surface "live slot occupied" — a paper-staged thread parked at
+            # paper_wait whose last live_gate verdict was a capacity BLOCK (the
+            # gate refused to offer approval because MAX_CONCURRENT_LIVE_STRATEGIES
+            # is full). Keyed off the parked interrupt KIND (paper_wait) + the
+            # recorded status, so a thread actually parked AT live_gate (offering
+            # approval, kind="live_gate") never reads as blocked. A strategy that
+            # was blocked then degraded to rearm shows blocked for one wake cycle
+            # until the next live_gate re-evaluates — a cosmetic, self-healing blip.
+            if (pending_payload or {}).get("kind") == "paper_wait":
+                lg = ((snapshot.values or {}).get("gate_decisions") or {}).get("live_gate") or {}
+                if lg.get("status") == "live_slot_occupied":
+                    live_gate_status = "live_slot_occupied"
         except Exception:
             # Threads with no checkpoint history (registry row but graph
             # never ran) — treat as no pending interrupt rather than
@@ -711,6 +727,7 @@ async def list_threads(request: Request) -> list[dict[str, Any]]:
                 "last_updated": last_updated.isoformat() if last_updated else None,
                 "has_pending_interrupt": has_pending,
                 "pending_interrupt_payload": pending_payload,
+                "live_gate_status": live_gate_status,
             }
         )
     return threads

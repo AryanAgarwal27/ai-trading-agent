@@ -128,7 +128,13 @@ def render_threads_list() -> None:
         cols[0].markdown(f"`{t['strategy_id']}`")
         cols[1].markdown(f"`{t.get('stage', '—')}`")
         cols[2].caption(t.get("last_updated") or "—")
-        if t.get("has_pending_interrupt"):
+        if t.get("live_gate_status") == "live_slot_occupied":
+            # D-9: parked waiting for a live slot to free — NOT an actionable HITL
+            # gate (no approve offered); the operator frees the slot by pausing /
+            # stopping the live strategy, then this thread re-offers on its next wake.
+            cols[3].markdown(":blue[**waiting** · live slot occupied]")
+            cols[4].caption("")
+        elif t.get("has_pending_interrupt"):
             kind = (t.get("pending_interrupt_payload") or {}).get("kind", "?")
             cols[3].markdown(f":orange[**pending** · `{kind}`]")
             if cols[4].button("Review", key=f"review_{t['thread_id']}"):

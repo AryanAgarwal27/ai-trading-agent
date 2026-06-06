@@ -87,6 +87,10 @@ PaperMonitorFn = Callable[[PaperMonitorContext], Awaitable[Any]]
 BuildContextFn = Callable[[Mapping[str, Any]], Awaitable[PaperMonitorContext]]
 ScheduleWakeFn = Callable[[str, str], Awaitable[None]]
 StopContainerFn = Callable[[str], Awaitable[None]]
+# D-9: () -> current live-strategy count (the capital axis, BRD §10). live_gate
+# reads it BEFORE offering HITL approval; injected so tests drive the slot-full /
+# slot-free paths hermetically. Default reads aget_portfolio_snapshot()["live"].
+LiveCountFn = Callable[[], Awaitable[int]]
 
 
 # ───────────────────────── db helpers ─────────────────────────
@@ -106,6 +110,24 @@ async def _connect_app_db() -> psycopg.AsyncConnection:
     different cadences.
     """
     return await psycopg.AsyncConnection.connect(_libpq_dsn(os.environ["DATABASE_URL"]))
+
+
+async def _default_live_count() -> int:
+    """Current ``stage="live"`` count via ``aget_portfolio_snapshot()["live"]``.
+
+    The D-9 live-cap read at ``live_gate`` (BRD §10, ``MAX_CONCURRENT_LIVE_STRATEGIES``).
+    Opens a short-lived app-DB connection and reuses the supervisor's canonical
+    snapshot so the count matches what the supervisor itself reasons on. Lazy
+    import avoids a paper→supervisor module-load edge.
+    """
+    from orchestrator.supervisor import aget_portfolio_snapshot
+
+    conn = await _connect_app_db()
+    try:
+        snapshot = await aget_portfolio_snapshot(conn)
+        return int(snapshot["live"])
+    finally:
+        await conn.close()
 
 
 def _used_ports_from_urls(urls: list[Any]) -> list[int]:
@@ -671,7 +693,12 @@ def divergence_check(
 # ════════════════════════════════════════════════════════════════════════
 
 
-async def live_gate(state: PaperState, config: RunnableConfig) -> Command[Any]:
+async def live_gate(
+    state: PaperState,
+    config: RunnableConfig,
+    *,
+    live_count_fn: LiveCountFn | None = None,
+) -> Command[Any]:
     """Second HITL gate: approve graduates to live, reject tears down.
 
     Identical publish-then-interrupt / decision-on-resume structure as
@@ -684,19 +711,59 @@ async def live_gate(state: PaperState, config: RunnableConfig) -> Command[Any]:
         parent graph / Stage 8 live subgraph picks up from here).
       - reject  → ``paper_teardown`` (stop the dry-run container) → archive.
 
+    **D-9 live-cap gate (Option c — BLOCK THE GATE, operator decision, BRD §10):**
+    BEFORE offering HITL approval, check the live-slot capacity. If
+    ``aget_portfolio_snapshot()["live"] >= MAX_CONCURRENT_LIVE_STRATEGIES`` (the
+    slot is occupied), do NOT ``interrupt`` for approval and do NOT promote —
+    record a ``"live_slot_occupied"`` status (surfaced in ``GET /threads`` +
+    dashboard) and route back to ``paper_wait``. The existing 6-hour paper wake
+    then re-runs ``paper_monitor → divergence_check → live_gate`` each wake; once
+    the operator frees the slot (pauses/stops the live strategy), a later wake
+    reaches here with a free slot and offers approval normally. NO auto-promotion
+    — the human still approves every live entry (BRD §17 #8). NOT (a) reject/
+    archive, NOT (b) auto-queue. ``live_count_fn`` is injected for hermetic tests;
+    it defaults to :func:`_default_live_count`.
+
     Idempotency: same contract as paper_gate — publish re-fires on
     replay (harmless; Redis pubsub is non-persistent), the gate_audits
     row is written by the FastAPI endpoint not this node, and no
     provisioning happens here.
     """
     get_logger("live_gate").info("enter", payload={"strategy_id": state.get("strategy_id")})
+    existing = state.get("gate_decisions") or {}
+
+    # D-9: live-slot capacity check BEFORE presenting the approve option.
+    count_fn = live_count_fn or _default_live_count
+    live_count = await count_fn()
+    if live_count >= thresholds.MAX_CONCURRENT_LIVE_STRATEGIES:
+        get_logger("live_gate").info(
+            "live_slot_occupied",
+            payload={
+                "strategy_id": state.get("strategy_id"),
+                "live_count": live_count,
+                "cap": thresholds.MAX_CONCURRENT_LIVE_STRATEGIES,
+            },
+        )
+        return Command(
+            goto="paper_wait",
+            update={
+                "gate_decisions": {
+                    **existing,
+                    "live_gate": {
+                        "status": "live_slot_occupied",
+                        "live_count": live_count,
+                        "cap": thresholds.MAX_CONCURRENT_LIVE_STRATEGIES,
+                        "by": "system",
+                    },
+                },
+            },
+        )
+
     payload = build_interrupt_payload(dict(state), "live_gate")
     thread_id = _thread_id_for(config, state.get("strategy_id", ""))
     await publish_gate_pending(thread_id, payload)
 
     decision = interrupt(payload)
-
-    existing = state.get("gate_decisions") or {}
 
     # Defensive shape validation (same as paper_gate). A malformed
     # out-of-band resume routes to teardown+archive rather than crashing.
@@ -844,6 +911,7 @@ def build_paper_subgraph(
     build_context_fn: BuildContextFn | None = None,
     schedule_wake_fn: ScheduleWakeFn | None = None,
     stop_container_fn: StopContainerFn | None = None,
+    live_count_fn: LiveCountFn | None = None,
     checkpointer: CheckpointSaver | None = None,
 ) -> CompiledStateGraph[PaperState, PaperState, PaperState, PaperState]:
     """Compile the Stage 7e paper subgraph.
@@ -890,13 +958,16 @@ def build_paper_subgraph(
     async def _paper_teardown(state: PaperState, config: RunnableConfig) -> dict[str, Any]:
         return await paper_teardown(state, stop_container_fn=stop_container_fn)
 
+    async def _live_gate(state: PaperState, config: RunnableConfig) -> Command[Any]:
+        return await live_gate(state, config, live_count_fn=live_count_fn)
+
     builder: StateGraph[PaperState, PaperState, PaperState, PaperState] = StateGraph(PaperState)
     builder.add_node("paper_spawn", _paper_spawn)
     builder.add_node("schedule_wake", _schedule_wake)
     builder.add_node("paper_wait", paper_wait)
     builder.add_node("paper_monitor", _paper_monitor)
     builder.add_node("divergence_check", divergence_check)
-    builder.add_node("live_gate", live_gate)
+    builder.add_node("live_gate", _live_gate)
     builder.add_node("paper_teardown", _paper_teardown)
     builder.add_node("archive", archive)
 

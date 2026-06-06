@@ -144,6 +144,33 @@ def _stop_stub(record: dict[str, Any]) -> Any:
     return _stub
 
 
+def _live_count_stub(count: int) -> Any:
+    """A constant LiveCountFn — the live-slot count live_gate reads (D-9)."""
+
+    async def _stub() -> int:
+        return count
+
+    return _stub
+
+
+def _live_count_sequence(counts: list[int]) -> Any:
+    """Successive live counts across live_gate invocations — models the operator
+    freeing the slot between wakes (e.g. [1, 0]: full at the first check, free at
+    the next). The last value repeats once the sequence is exhausted."""
+    it = iter(counts)
+    last = counts[-1]
+
+    async def _stub() -> int:
+        nonlocal last
+        try:
+            last = next(it)
+        except StopIteration:
+            pass
+        return last
+
+    return _stub
+
+
 async def _parked_kind(graph: Any, config: RunnableConfig) -> str | None:
     snap = await graph.aget_state(config)
     for task in snap.tasks:
@@ -172,6 +199,7 @@ async def test_full_cycle_rearm_then_advance_to_live(
         paper_monitor_fn=_monitor_sequence(["rearm", "advance"]),
         build_context_fn=_ctx_stub(),
         stop_container_fn=_stop_stub({}),
+        live_count_fn=_live_count_stub(0),  # slot free → live_gate offers approval
         checkpointer=InMemorySaver(),
     )
     config: RunnableConfig = {"configurable": {"thread_id": thread_id}}
@@ -259,6 +287,7 @@ async def test_reject_path_tears_down_and_archives(
         paper_monitor_fn=_monitor_fixed("advance"),
         build_context_fn=_ctx_stub(),
         stop_container_fn=_stop_stub(stop_rec),
+        live_count_fn=_live_count_stub(0),  # slot free → live_gate offers approval
         checkpointer=InMemorySaver(),
     )
     config: RunnableConfig = {"configurable": {"thread_id": thread_id}}
@@ -353,3 +382,103 @@ async def test_hard_drawdown_overrides_to_kill(
     assert dc["effective_decision"] == "kill"
     assert any("hard_kill" in o for o in dc["overrides"])
     assert stop_rec.get("stopped") == strategy_id
+
+
+# ─── D-9: live-cap gate (Option c — BLOCK THE GATE) ────────────────────
+
+
+async def test_live_gate_blocks_when_slot_full_no_promotion_no_interrupt(
+    cleanup_strategy_ids: list[str],
+) -> None:
+    """Slot FULL → live_gate does NOT offer approval and NEVER promotes.
+
+    With the live slot occupied (live_count >= cap) on every check, an
+    advance-ready paper-graduate parks at paper_wait — NOT at a live_gate
+    approve interrupt — each wake, the registry is never promoted to stage=live,
+    and the state carries the ``live_slot_occupied`` status the dashboard /
+    GET /threads surface. Asserts NO auto-promotion across multiple wakes.
+    """
+    strategy_id = f"pe-{uuid.uuid4().hex[:8]}"
+    cleanup_strategy_ids.append(strategy_id)
+    thread_id = f"strategy_{strategy_id}"
+    started = (datetime.now(UTC) - timedelta(days=31)).isoformat()  # elapsed >= MIN_PAPER_DAYS
+
+    graph = build_paper_subgraph(
+        spawn_container_fn=_spawn_stub(),
+        paper_monitor_fn=_monitor_fixed("advance"),  # advance-ready every wake
+        build_context_fn=_ctx_stub(),
+        stop_container_fn=_stop_stub({}),
+        live_count_fn=_live_count_stub(1),  # slot FULL (cap == 1) on every check
+        checkpointer=InMemorySaver(),
+    )
+    config: RunnableConfig = {"configurable": {"thread_id": thread_id}}
+
+    async for _ in graph.astream(
+        cast(Any, _minimal_paper_state(strategy_id, started)), config=config
+    ):
+        pass
+    assert await _parked_kind(graph, config) == "paper_wait"
+
+    # Two wakes, both advance-ready but the slot is full → both BLOCK to
+    # paper_wait. The gate is never offered; the strategy never promotes.
+    for _ in range(2):
+        await autoresume_for_test(graph, thread_id, {"wake": True})
+        assert (
+            await _parked_kind(graph, config) == "paper_wait"
+        ), "live_gate must NOT offer an approve interrupt while the live slot is full"
+        snap = await graph.aget_state(config)
+        assert snap.values["stage"] == "paper", "no promotion while the slot is full"
+        lg = snap.values["gate_decisions"]["live_gate"]
+        assert lg["status"] == "live_slot_occupied"
+        assert lg["cap"] == 1
+        # No human approval record was ever written (no gate was offered).
+        assert "live" not in snap.values["gate_decisions"]
+
+
+async def test_live_gate_reoffers_after_slot_frees(
+    cleanup_strategy_ids: list[str], hitl_autoapprove: Any
+) -> None:
+    """Slot full → park; operator frees the slot → next wake OFFERS approval.
+
+    live_count goes [1, 0]: full at the first live_gate check (block → paper_wait,
+    no promotion), free at the next (the gate offers approval normally). Only the
+    human approve then promotes to live — never automatic.
+    """
+    strategy_id = f"pe-{uuid.uuid4().hex[:8]}"
+    cleanup_strategy_ids.append(strategy_id)
+    thread_id = f"strategy_{strategy_id}"
+    started = (datetime.now(UTC) - timedelta(days=31)).isoformat()
+
+    graph = build_paper_subgraph(
+        spawn_container_fn=_spawn_stub(),
+        paper_monitor_fn=_monitor_fixed("advance"),
+        build_context_fn=_ctx_stub(),
+        stop_container_fn=_stop_stub({}),
+        live_count_fn=_live_count_sequence([1, 0]),  # full, then freed
+        checkpointer=InMemorySaver(),
+    )
+    config: RunnableConfig = {"configurable": {"thread_id": thread_id}}
+
+    async for _ in graph.astream(
+        cast(Any, _minimal_paper_state(strategy_id, started)), config=config
+    ):
+        pass
+
+    # Wake 1: slot full → BLOCK → paper_wait, no promotion.
+    await autoresume_for_test(graph, thread_id, {"wake": True})
+    assert await _parked_kind(graph, config) == "paper_wait"
+    snap = await graph.aget_state(config)
+    assert snap.values["stage"] == "paper"
+    assert snap.values["gate_decisions"]["live_gate"]["status"] == "live_slot_occupied"
+
+    # Wake 2: slot freed → live_gate OFFERS approval (parks at the HITL gate).
+    await autoresume_for_test(graph, thread_id, {"wake": True})
+    assert await _parked_kind(graph, config) == "live_gate"
+    # Still NOT promoted — the human has not approved yet (no auto-promotion).
+    assert (await graph.aget_state(config)).values["stage"] == "paper"
+
+    # The human approves → only now does it graduate to live.
+    await hitl_autoapprove(graph, thread_id)
+    final = await graph.aget_state(config)
+    assert final.values["stage"] == "live"
+    assert final.values["gate_decisions"]["live"]["approved"] is True

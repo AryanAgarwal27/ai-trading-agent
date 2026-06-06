@@ -192,11 +192,15 @@ def _build_stub_composed_graph(
     vb.add_edge("paper_gate", END)
     validation = vb.compile()
 
+    async def _zero_live_count() -> int:
+        return 0  # D-9: slot free → live_gate offers approval deterministically
+
     paper = build_paper_subgraph(
         spawn_container_fn=_spawn_stub(),
         paper_monitor_fn=_monitor_fixed(monitor_decision),
         build_context_fn=_ctx_stub(),
         stop_container_fn=_stop_stub({}),
+        live_count_fn=_zero_live_count,
     )
 
     return build_per_strategy_graph(
