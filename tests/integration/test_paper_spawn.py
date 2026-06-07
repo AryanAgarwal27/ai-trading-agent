@@ -277,3 +277,71 @@ async def test_paper_spawn_handles_port_collision(
     assert result["stage"] == "paper"
     # Sanity check the URL the node returned matches the allocated port.
     assert re.match(r"^http://127\.0\.0\.1:8102$", result["freqtrade_api_url"])
+
+
+# ─── D-1: backported seams (secrets_provider + registry_writer_fn) ─────
+
+
+async def test_paper_spawn_threads_secrets_provider_to_spawn(
+    cleanup_strategy_ids: list[str],
+) -> None:
+    """D-1: paper_spawn threads the injected secrets_provider to the spawn helper
+    (so paper creds load via secrets.py, not raw env — mirrors live_spawn)."""
+    sid = f"sp-{uuid.uuid4().hex[:8]}"
+    cleanup_strategy_ids.append(sid)
+
+    class _Provider:
+        def get(self, name: str) -> str | None:
+            return "x"
+
+    sentinel = _Provider()
+    received: dict[str, Any] = {}
+
+    async def stub_spawn(*, port: int, provider: Any = None, **_k: Any) -> str:
+        received["provider"] = provider
+        return f"http://127.0.0.1:{port}"
+
+    await paper_spawn(
+        cast(Any, _minimal_state(sid, str(DUMMY_STRATEGY))),
+        cast(Any, _empty_config()),
+        spawn_container_fn=stub_spawn,
+        secrets_provider=cast(Any, sentinel),
+    )
+    assert received["provider"] is sentinel, "paper_spawn must pass the injected provider to spawn"
+
+
+async def test_paper_spawn_uses_injected_registry_writer(
+    cleanup_strategy_ids: list[str],
+) -> None:
+    """D-1: the registry write is injectable — a stub registry_writer_fn fully
+    replaces the inline DB write (the testability win), called once before spawn
+    (stage='paper', no url) and once after (with the resolved api_url)."""
+    sid = f"sp-{uuid.uuid4().hex[:8]}"
+    cleanup_strategy_ids.append(sid)
+    writes: list[dict[str, Any]] = []
+
+    async def stub_registry(**kwargs: Any) -> None:
+        writes.append(kwargs)
+
+    async def stub_spawn(*, port: int, **_k: Any) -> str:
+        return f"http://127.0.0.1:{port}"
+
+    result = await paper_spawn(
+        cast(Any, _minimal_state(sid, str(DUMMY_STRATEGY))),
+        cast(Any, _empty_config()),
+        spawn_container_fn=stub_spawn,
+        registry_writer_fn=stub_registry,
+    )
+
+    assert result["stage"] == "paper"
+    # Two writes: initial (stage='paper', no api_url) then the post-spawn URL fill.
+    assert len(writes) == 2
+    assert writes[0]["stage"] == "paper" and writes[0].get("api_url") is None
+    assert writes[0]["strategy_id"] == sid
+    assert writes[1]["api_url"] == result["freqtrade_api_url"]
+    # The real registry row was NOT written — the seam replaced the inline write.
+    async with await psycopg.AsyncConnection.connect(_dsn()) as conn:
+        async with conn.cursor() as cur:
+            await cur.execute("SELECT 1 FROM strategy_registry WHERE strategy_id = %s", (sid,))
+            row = await cur.fetchone()
+    assert row is None, "stub registry_writer_fn should have replaced the real DB write"

@@ -45,7 +45,12 @@ from typing import Any
 import httpx
 
 from orchestrator.gates.thresholds import LIVE_CAPITAL_CAP_USD
-from orchestrator.security.secrets import SecretProvider, load_live_credentials
+from orchestrator.security.secrets import (
+    EnvSecretProvider,
+    SecretProvider,
+    load_live_credentials,
+    load_paper_credentials,
+)
 from orchestrator.tools.freqtrade_api import FreqtradeAPI, FreqtradeAPIError, FreqtradeCredentials
 
 logger = logging.getLogger(__name__)
@@ -230,17 +235,6 @@ def _substitute_placeholders(text: str, mapping: dict[str, str]) -> str:
     return text
 
 
-def _required_env(name: str) -> str:
-    """Read an env var or raise a :class:`PaperSpawnError` pointing at setup docs."""
-    val = os.environ.get(name)
-    if not val:
-        raise PaperSpawnError(
-            f"required env var {name} is not set; "
-            "see SPEC §1 Q1 and .env.example (Stage 7a) for setup"
-        )
-    return val
-
-
 def _strategy_class_name(strategy_module_path: Path) -> str:
     """Return the first ``IStrategy`` subclass name in the strategy module.
 
@@ -333,14 +327,16 @@ async def spawn_paper_container(
     stake_amount: float,
     strategy_module_path: Path,
     port: int,
+    provider: SecretProvider | None = None,
 ) -> str:
     """Boot one paper-trading Freqtrade container; return its API URL.
 
     Pipeline:
 
-    1. Validate required env (``BINANCE_PAPER_API_KEY``,
-       ``BINANCE_PAPER_API_SECRET``, ``PAPER_API_PASSWORD``). Fail fast
-       with a clear error if any are missing.
+    1. Load paper credentials via ``secrets.load_paper_credentials`` (the
+       ``provider`` seam, default env). Fail fast with ``MissingSecretError``
+       if ``BINANCE_PAPER_API_KEY`` / ``BINANCE_PAPER_API_SECRET`` /
+       ``PAPER_API_PASSWORD`` are unset.
     2. Load + JSONC-parse ``paper-base.json``.
     3. Deep-merge per-strategy overrides (whitelist, stake_amount,
        dry_run_wallet = 5 * stake_amount, bot_name, strategy class).
@@ -358,14 +354,16 @@ async def spawn_paper_container(
     ``StrategyState.freqtrade_api_url`` field is set from this return value.
 
     Raises:
-        PaperSpawnError: missing env, bad config, IO failure.
+        MissingSecretError: a required paper credential is unset.
+        PaperSpawnError: bad config, IO failure.
         PaperSpawnTimeout: container did not respond to /ping within 120s.
     """
-    # 1. Env validation — do this first so a misconfigured operator sees
-    # the error before we write anything to disk.
-    api_key = _required_env("BINANCE_PAPER_API_KEY")
-    api_secret = _required_env("BINANCE_PAPER_API_SECRET")
-    api_password = _required_env("PAPER_API_PASSWORD")
+    # 1. Load paper credentials through secrets.py (D-1 / D-18) — fail fast with a
+    # clear MissingSecretError if any are unset, before writing anything to disk.
+    # The provider seam lets paper_spawn inject a non-env backend in tests
+    # (symmetry with render_live_config → load_live_credentials).
+    creds = load_paper_credentials(provider or EnvSecretProvider())
+    api_key, api_secret, api_password = creds.key, creds.secret, creds.api_password
 
     # 2. Load base config (JSONC).
     base = _load_paper_base_config()

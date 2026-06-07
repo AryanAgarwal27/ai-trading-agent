@@ -31,6 +31,7 @@ talk to.
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 from collections.abc import Awaitable, Callable, Mapping
@@ -57,6 +58,7 @@ from orchestrator.gates.hitl import build_interrupt_payload
 from orchestrator.gates.thresholds import LIVE_CAPITAL_CAP_USD, MAX_OPEN_TRADES
 from orchestrator.observability.events import publish_gate_pending, publish_thread_completed
 from orchestrator.observability.log import get_logger
+from orchestrator.security.secrets import EnvSecretProvider, SecretProvider
 from orchestrator.state import AgentVote, StrategyState
 from orchestrator.tools.freqtrade_api import FreqtradeAPI, FreqtradeCredentials
 from orchestrator.tools.freqtrade_lifecycle import (
@@ -97,6 +99,13 @@ UnscheduleWakeFn = Callable[[str], Awaitable[None]]
 # reads it BEFORE offering HITL approval; injected so tests drive the slot-full /
 # slot-free paths hermetically. Default reads aget_portfolio_snapshot()["live"].
 LiveCountFn = Callable[[], Awaitable[int]]
+# D-1: the registry-write seam (backported from live_spawn's registry_writer_fn for
+# symmetry + DB-stubbable paper_spawn tests). Keyword-only identity + stage (+ an
+# optional api_url for the post-spawn URL fill); opens its own connection. Default:
+# _write_paper_registry. NOTE: paper's spawn-FAILURE path deliberately does NOT
+# archive the registry row (unlike live) — that pre-existing asymmetry is preserved
+# here; this seam only covers the initial + URL writes paper already performed.
+RegistryWriterFn = Callable[..., Awaitable[None]]
 
 
 # ───────────────────────── db helpers ─────────────────────────
@@ -172,44 +181,74 @@ def _thread_id_for(config: RunnableConfig, strategy_id: str) -> str:
     return f"strategy_{strategy_id}"
 
 
-async def _upsert_registry_row(
-    conn: psycopg.AsyncConnection,
-    state: StrategyState,
-    thread_id: str,
-) -> None:
-    """Upsert the strategy_registry row for ``state`` with ``stage='paper'``.
+async def _read_used_paper_ports() -> list[int]:
+    """Ports already assigned to active threads (own read-only connection).
 
-    On conflict, only ``stage`` and ``last_updated`` are touched — the
-    immutable identity fields (thread_id, name, template, pairs,
-    timeframe) are not overwritten. ``freqtrade_api_url`` is left NULL
-    here and filled by a follow-up UPDATE after spawn returns.
-
-    Idempotent: re-running the node (replay after interrupt, restart
-    after crash, smoke test re-run) leaves the registry in the same
-    state regardless of prior runs.
+    D-1: split out of paper_spawn (mirrors live_spawn's ``_read_used_ports``) so
+    the registry WRITE can move behind the ``registry_writer_fn`` seam without the
+    port read sharing its connection.
     """
-    import json as _json  # local import keeps top-level surface tidy
+    conn = await _connect_app_db()
+    try:
+        async with conn.cursor() as cur:
+            await cur.execute(
+                "SELECT freqtrade_api_url FROM strategy_registry WHERE freqtrade_api_url IS NOT NULL"
+            )
+            rows = await cur.fetchall()
+    finally:
+        await conn.close()
+    return _used_ports_from_urls([r[0] for r in rows])
 
-    async with conn.cursor() as cur:
-        await cur.execute(
-            """
-            INSERT INTO strategy_registry
-              (strategy_id, thread_id, name, template, stage, pairs,
-               timeframe, started_at, last_updated)
-            VALUES (%s, %s, %s, %s, 'paper', %s, %s, now(), now())
-            ON CONFLICT (strategy_id) DO UPDATE SET
-              stage = 'paper',
-              last_updated = now()
-            """,
-            (
-                state["strategy_id"],
-                thread_id,
-                state["name"],
-                state["template"],
-                _json.dumps(state["pairs"]),
-                state["timeframe"],
-            ),
-        )
+
+async def _write_paper_registry(
+    *,
+    strategy_id: str,
+    thread_id: str,
+    name: str,
+    template: str,
+    pairs: list[str],
+    timeframe: str,
+    stage: str = "paper",
+    api_url: str | None = None,
+) -> None:
+    """Default ``registry_writer_fn`` — upsert the paper registry row (own conn).
+
+    D-1 (backport of live_spawn's ``_write_live_registry``). Called (a) before
+    spawn with ``stage='paper'`` + ``api_url=None``, and (b) after spawn with the
+    resolved ``api_url``. On conflict only ``stage`` + ``freqtrade_api_url``
+    (COALESCE-preserving) + ``last_updated`` are touched — the immutable identity
+    fields are not overwritten, matching the prior inline ``_upsert_registry_row``
+    behaviour exactly. Idempotent across replay / re-spawn.
+    """
+    conn = await _connect_app_db()
+    try:
+        async with conn.cursor() as cur:
+            await cur.execute(
+                """
+                INSERT INTO strategy_registry
+                  (strategy_id, thread_id, name, template, stage, pairs,
+                   timeframe, freqtrade_api_url, started_at, last_updated)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, now(), now())
+                ON CONFLICT (strategy_id) DO UPDATE SET
+                  stage = EXCLUDED.stage,
+                  freqtrade_api_url = COALESCE(
+                      EXCLUDED.freqtrade_api_url, strategy_registry.freqtrade_api_url),
+                  last_updated = now()
+                """,
+                (
+                    strategy_id,
+                    thread_id,
+                    name,
+                    template,
+                    stage,
+                    json.dumps(pairs),
+                    timeframe,
+                    api_url,
+                ),
+            )
+        await conn.commit()
+    finally:
+        await conn.close()
 
 
 # ───────────────────────── node ─────────────────────────
@@ -220,14 +259,25 @@ async def paper_spawn(
     config: RunnableConfig,
     *,
     spawn_container_fn: SpawnContainerFn | None = None,
+    secrets_provider: SecretProvider | None = None,
+    registry_writer_fn: RegistryWriterFn | None = None,
 ) -> dict[str, Any]:
     """First node in the paper subgraph — see module docstring for contract.
 
     Returns a state-update dict (LangGraph node convention). Never
     raises on spawn failure; failures route to ``stage="archived"``
     with a descriptive ``failure_reason``.
+
+    D-1 seams (backported from live_spawn for symmetry + testability): the
+    ``secrets_provider`` is threaded to the spawn helper so paper exchange
+    credentials load through ``secrets.py`` (``load_paper_credentials``) rather
+    than raw env (closing the paper half of D-18), and ``registry_writer_fn``
+    makes the registry write injectable/stubbable. Both default to their real
+    implementations, so production behaviour is unchanged.
     """
     spawn_fn: SpawnContainerFn = spawn_container_fn or spawn_paper_container
+    provider: SecretProvider = secrets_provider or EnvSecretProvider()
+    write_registry: RegistryWriterFn = registry_writer_fn or _write_paper_registry
 
     strategy_id = state["strategy_id"]
     get_logger("paper_spawn").info("enter", payload={"strategy_id": strategy_id})
@@ -258,23 +308,21 @@ async def paper_spawn(
     strategy_path = Path(strategy_path_str)
 
     thread_id = _thread_id_for(config, strategy_id)
+    identity = {
+        "strategy_id": strategy_id,
+        "thread_id": thread_id,
+        "name": state["name"],
+        "template": state["template"],
+        "pairs": pairs,
+        "timeframe": state["timeframe"],
+    }
 
-    # 2 + 3: query used ports, allocate, upsert row BEFORE spawn.
-    conn = await _connect_app_db()
-    try:
-        async with conn.cursor() as cur:
-            await cur.execute(
-                "SELECT freqtrade_api_url FROM strategy_registry "
-                "WHERE freqtrade_api_url IS NOT NULL"
-            )
-            rows = await cur.fetchall()
-        used = _used_ports_from_urls([r[0] for r in rows])
-        port = next_free_paper_port(used)
-
-        await _upsert_registry_row(conn, state, thread_id)
-        await conn.commit()
-    finally:
-        await conn.close()
+    # 2 + 3: allocate a port, then upsert the registry row (stage='paper') BEFORE
+    # spawn — the orphan-container-prevention contract. The write goes through the
+    # injectable registry_writer_fn (D-1); the port read is its own connection.
+    used = await _read_used_paper_ports()
+    port = next_free_paper_port(used)
+    await write_registry(**identity, stage="paper")
 
     logger.info(
         "paper_spawn allocated port=%d strategy_id=%s thread_id=%s",
@@ -283,7 +331,9 @@ async def paper_spawn(
         thread_id,
     )
 
-    # 4. Call spawn — both branches archive cleanly, neither raises.
+    # 4. Call spawn — both branches archive cleanly, neither raises. The
+    # secrets_provider (D-1) is threaded so the helper loads paper creds via
+    # secrets.py (load_paper_credentials), not raw env.
     try:
         api_url = await spawn_fn(
             strategy_id=strategy_id,
@@ -291,6 +341,7 @@ async def paper_spawn(
             stake_amount=stake_amount,
             strategy_module_path=strategy_path,
             port=port,
+            provider=provider,
         )
     except PaperSpawnTimeout as exc:
         logger.error(
@@ -317,18 +368,8 @@ async def paper_spawn(
             "failure_reason": f"paper_spawn_failed: {type_name}: {str(exc)[:200]}",
         }
 
-    # 5. UPDATE registry with the URL.
-    conn = await _connect_app_db()
-    try:
-        async with conn.cursor() as cur:
-            await cur.execute(
-                "UPDATE strategy_registry SET freqtrade_api_url = %s, "
-                "last_updated = now() WHERE strategy_id = %s",
-                (api_url, strategy_id),
-            )
-        await conn.commit()
-    finally:
-        await conn.close()
+    # 5. Fill the registry row with the resolved URL (via the same seam).
+    await write_registry(**identity, stage="paper", api_url=api_url)
 
     # 6. State update — paper_started_at is the 30-day clock anchor
     # SPEC §6 (d6736ba) locked. divergence_check enforces
@@ -920,6 +961,8 @@ def _route_after_spawn(state: PaperState) -> Literal["schedule_wake", "archive"]
 def build_paper_subgraph(
     *,
     spawn_container_fn: SpawnContainerFn | None = None,
+    secrets_provider: SecretProvider | None = None,
+    registry_writer_fn: RegistryWriterFn | None = None,
     paper_monitor_fn: PaperMonitorFn | None = None,
     build_context_fn: BuildContextFn | None = None,
     schedule_wake_fn: ScheduleWakeFn | None = None,
@@ -956,6 +999,8 @@ def build_paper_subgraph(
             state,  # type: ignore[arg-type]
             config,
             spawn_container_fn=spawn_container_fn,
+            secrets_provider=secrets_provider,
+            registry_writer_fn=registry_writer_fn,
         )
 
     async def _schedule_wake(state: PaperState, config: RunnableConfig) -> dict[str, Any]:
