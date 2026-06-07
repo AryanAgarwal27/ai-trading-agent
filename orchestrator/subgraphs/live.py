@@ -38,6 +38,7 @@ possible follow-up; this commit does not touch paper.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
@@ -314,6 +315,51 @@ async def _default_bump_live_started_at(strategy_id: str) -> None:
         await conn.commit()
     finally:
         await conn.close()
+
+
+# D-5 durable retry (Stage 11e). The bump un-suppresses the kill switch for a
+# resumed strategy (guard: ``kse.fired_at > sr.live_started_at``). A FAILED bump
+# leaves the guard SUPPRESSED — a real safety hole (the resumed strategy could
+# breach the drawdown floor and the kill switch would not re-fire). Retry a
+# transient DB blip a bounded number of times with exponential backoff so the
+# common transient case keeps the hole closed; on ultimate failure the caller
+# fails SAFE (refuses to resume) rather than resuming with the guard off.
+_BUMP_RETRY_ATTEMPTS = 3
+_BUMP_RETRY_BASE_DELAY_S = 0.2
+
+
+async def _bump_live_started_with_retry(bump_fn: LiveStartedBumpFn, strategy_id: str) -> bool:
+    """Call ``bump_fn`` with bounded exponential-backoff retry.
+
+    Returns ``True`` once it succeeds, ``False`` (does NOT raise) when every
+    attempt fails — so ``live_pause`` can take the fail-safe branch (refuse to
+    resume trading rather than resume with the kill switch suppressed, D-5).
+    """
+    for attempt in range(1, _BUMP_RETRY_ATTEMPTS + 1):
+        try:
+            await bump_fn(strategy_id)
+            return True
+        except Exception as exc:  # noqa: BLE001 — transient DB blip; retry, then fail safe
+            if attempt == _BUMP_RETRY_ATTEMPTS:
+                logger.error(
+                    "live_started_at bump FAILED after %d attempts strategy_id=%s exc=%s "
+                    "(kill guard would stay suppressed — refusing to resume, D-5)",
+                    _BUMP_RETRY_ATTEMPTS,
+                    strategy_id,
+                    exc,
+                )
+                return False
+            delay = _BUMP_RETRY_BASE_DELAY_S * (2 ** (attempt - 1))
+            logger.warning(
+                "live_started_at bump attempt %d/%d failed strategy_id=%s exc=%s; retrying in %.2fs",
+                attempt,
+                _BUMP_RETRY_ATTEMPTS,
+                strategy_id,
+                exc,
+                delay,
+            )
+            await asyncio.sleep(delay)
+    return False  # pragma: no cover — loop either returns True or False above
 
 
 # ════════════════════════════════════════════════════════════════════════
@@ -912,27 +958,50 @@ async def live_pause(
     )
 
     if approved:
-        # D-5 Option A: resume trading + bump the kill-switch idempotency
-        # anchor + clear the kill-switch event. Both side effects are
-        # best-effort (a /start or bump failure must not strand the operator's
-        # approve decision), but logged loud — a failed bump leaves the kill
-        # guard suppressed for the restarted strategy (the D-5 hole, mitigated
-        # by the loud log until a durable retry lands).
+        # D-5 (durable retry, Stage 11e): bump the kill-switch idempotency anchor
+        # BEFORE resuming trading, so the kill guard is un-suppressed before the
+        # container can place a new order. Retry a transient DB blip with backoff
+        # (the common case → the hole stays closed). The ORDER matters: bump
+        # first, /start second.
+        bumped = await _bump_live_started_with_retry(bump_fn, sid)
+        if not bumped:
+            # FAIL-SAFE (D-5 ultimate-failure decision): the bump exhausted its
+            # retries, so the kill guard would stay SUPPRESSED for a resumed
+            # strategy. We CLOSE THE HOLE rather than not-strand: do NOT /start
+            # (the strategy stays HALTED — no live trading without kill-switch
+            # protection) and do NOT clear kill_switch_event, so the next
+            # live_wait wake routes back to live_pause and RE-PROMPTS the operator
+            # (who re-approves once the DB recovers). Not silent — logged loud (in
+            # the retry helper) AND recorded in the gate decision (resumed=False,
+            # bump_failed=True). A safely-halted strategy the operator re-approves
+            # beats live trading with the kill switch off (uncaught capital loss).
+            logger.error(
+                "live_pause approve NOT resumed strategy_id=%s — live_started_at bump "
+                "failed; strategy stays halted, re-prompts on next wake (D-5 fail-safe)",
+                sid,
+            )
+            return Command(
+                goto="live_wait",
+                update={
+                    "gate_decisions": {
+                        **existing,
+                        "live_pause": {
+                            "approved": True,
+                            "notes": notes,
+                            "by": "human",
+                            "resumed": False,
+                            "bump_failed": True,
+                        },
+                    },
+                },
+            )
+        # Bump succeeded → the kill guard is un-suppressed → safe to resume.
+        # /start is best-effort (a start failure leaves the container halted —
+        # safe; it must not strand the operator's approve decision).
         try:
             await start_fn(state)
         except Exception as exc:  # noqa: BLE001 — a start failure must not strand HITL
             logger.error("live_pause /start failed strategy_id=%s exc=%s", sid, exc)
-        # Best-effort: a DB-write failure here re-opens D-5's hole for THIS approve
-        # but won't strand the operator. Durable retry is a Stage-11 hardening item.
-        try:
-            await bump_fn(sid)
-        except Exception as exc:  # noqa: BLE001 — a bump failure must not strand HITL
-            logger.error(
-                "live_pause live_started_at bump failed strategy_id=%s exc=%s "
-                "(kill guard may stay suppressed for this continue — D-5)",
-                sid,
-                exc,
-            )
         # Clear the kill-switch event so the next live_wait wake proceeds to
         # live_evaluate rather than looping straight back to live_pause.
         cleared_artifacts = dict(state.get("artifacts") or {})

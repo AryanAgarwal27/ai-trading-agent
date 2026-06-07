@@ -789,6 +789,97 @@ async def test_kill_guard_unsuppresses_after_live_started_bump(
     assert await _kill_already_fired(sid) is False
 
 
+# ─── D-5 durable retry on the live_started_at bump (Stage 11e) ──────────
+
+
+async def test_live_pause_approve_bump_retries_then_succeeds(
+    cleanup_strategy_ids: list[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """D-5 retry: a TRANSIENT bump failure is retried with backoff; once it
+    succeeds, trading resumes (/start) and the kill event clears — the hole stays
+    closed without operator intervention."""
+    monkeypatch.setattr("orchestrator.subgraphs.live._BUMP_RETRY_BASE_DELAY_S", 0.0)
+    sid = f"live-{uuid.uuid4().hex[:8]}"
+    cleanup_strategy_ids.append(sid)
+    calls = {"bump": 0, "started": False}
+
+    async def _start(_state: Any) -> None:
+        calls["started"] = True
+
+    async def _bump_flaky(_sid: str) -> None:
+        calls["bump"] += 1
+        if calls["bump"] < 3:  # fail attempts 1 + 2, succeed on the 3rd
+            raise RuntimeError("transient DB blip")
+
+    graph = _make_graph(
+        captured={"snapshot": _CONTINUE_SNAP},
+        start_trading_fn=_start,
+        live_started_bump_fn=_bump_flaky,
+    )
+    cfg = _cfg(sid)
+
+    await _drain(graph, _initial_state(sid), cfg)
+    await _inject_kill_event(graph, cfg, _KILL_EVENT)
+    await _drain(graph, Command(resume={"wake": True}), cfg)  # parks at live_pause (kill)
+    await _drain(graph, Command(resume={"approved": True, "notes": "ok"}), cfg)
+
+    assert calls["bump"] == 3, "bump must be retried until it succeeds"
+    assert calls["started"] is True, "trading resumes only AFTER the bump succeeded"
+    snap = await graph.aget_state(cfg)
+    assert snap.values["artifacts"].get("kill_switch_event") is None, "resumed → kill event cleared"
+
+
+async def test_live_pause_approve_bump_exhausts_retries_fails_safe(
+    cleanup_strategy_ids: list[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """D-5 fail-safe: if the bump EXHAUSTS its retries, the strategy does NOT
+    resume (no /start — the kill guard would stay suppressed), the kill event is
+    NOT cleared (so the next wake re-prompts at live_pause), and the gate decision
+    records bump_failed. Closing the hole beats resuming with the kill switch off."""
+    monkeypatch.setattr("orchestrator.subgraphs.live._BUMP_RETRY_BASE_DELAY_S", 0.0)
+    sid = f"live-{uuid.uuid4().hex[:8]}"
+    cleanup_strategy_ids.append(sid)
+    calls = {"bump": 0, "started": False}
+
+    async def _start(_state: Any) -> None:
+        calls["started"] = True
+
+    async def _bump_always_fails(_sid: str) -> None:
+        calls["bump"] += 1
+        raise RuntimeError("DB down")
+
+    graph = _make_graph(
+        captured={"snapshot": _CONTINUE_SNAP},
+        start_trading_fn=_start,
+        live_started_bump_fn=_bump_always_fails,
+    )
+    cfg = _cfg(sid)
+
+    await _drain(graph, _initial_state(sid), cfg)
+    await _inject_kill_event(graph, cfg, _KILL_EVENT)
+    await _drain(graph, Command(resume={"wake": True}), cfg)  # parks at live_pause (kill)
+    await _drain(graph, Command(resume={"approved": True, "notes": "ok"}), cfg)
+
+    # Fail-safe: all retries exhausted, trading NOT resumed.
+    assert calls["bump"] == 3, "all bump attempts exhausted"
+    assert calls["started"] is False, "must NOT /start when the kill guard can't be un-suppressed"
+    snap = await graph.aget_state(cfg)
+    assert (
+        snap.values["artifacts"].get("kill_switch_event") is not None
+    ), "kill event must persist so the next wake re-prompts (fail-safe)"
+    lp = snap.values["gate_decisions"]["live_pause"]
+    assert (
+        lp["resumed"] is False and lp["bump_failed"] is True
+    ), "fail-safe recorded in gate decision"
+
+    # And it RE-PROMPTS: the next wake routes back to live_pause (kill event intact).
+    await _drain(graph, Command(resume={"wake": True}), cfg)
+    payload = await _interrupt_payload(graph, cfg)
+    assert (
+        payload is not None and payload["kind"] == "live_pause_review"
+    ), "next wake must re-prompt live_pause, not resume"
+
+
 def test_build_live_subgraph_compiles_with_defaults() -> None:
     """All-defaults build compiles (don't run — defaults touch Docker/DB)."""
     graph = build_live_subgraph()
