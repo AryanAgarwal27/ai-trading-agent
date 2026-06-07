@@ -51,11 +51,9 @@ from orchestrator.gates.thresholds import (
     KILL_SWITCH_DRAWDOWN,
 )
 from orchestrator.observability.events import publish_kill, record_kill_switch_event
-
-# _trailing_losses is private in paper.py; reused here (3rd call site). Tracked
-# as DEFERRED.md D-4 (promote to a util in a later refactor commit).
-from orchestrator.subgraphs.paper import ScheduleWakeFn, _trailing_losses
+from orchestrator.subgraphs.paper import ScheduleWakeFn
 from orchestrator.tools.freqtrade_api import FreqtradeAPI, FreqtradeAPIError, FreqtradeCredentials
+from orchestrator.tools.freqtrade_metrics import trailing_losses
 
 logger = logging.getLogger(__name__)
 
@@ -373,7 +371,7 @@ async def kill_switch_poll_job(
                 profit = profit_resp if isinstance(profit_resp, dict) else {}
                 trades = trades_resp.get("trades", []) if isinstance(trades_resp, dict) else []
                 max_dd = float(profit.get("max_drawdown", 0.0) or 0.0)
-                consecutive = _trailing_losses(trades)
+                consecutive = trailing_losses(trades)
                 reason = _kill_reason(max_dd, consecutive)
                 if reason is None:
                     continue

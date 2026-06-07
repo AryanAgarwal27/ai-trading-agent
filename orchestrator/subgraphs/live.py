@@ -86,6 +86,7 @@ from orchestrator.tools.freqtrade_lifecycle import (
     spawn_live_container,
     stop_live_container,
 )
+from orchestrator.tools.freqtrade_metrics import trailing_losses
 
 # Reviewer LLM seams (8e wires the real agents; tests + 8d pass stubs).
 RationaleFn = Callable[[dict[str, Any]], Awaitable[str]]
@@ -648,22 +649,6 @@ async def performance_check(
 # ════════════════════════════════════════════════════════════════════════
 
 
-def _trailing_losses(trades: list[dict[str, Any]]) -> int:
-    """Count the trailing run of losing closed trades (mirror paper.py)."""
-    count = 0
-    for t in reversed(trades):
-        if not isinstance(t, dict):
-            break
-        pr = t.get("profit_ratio")
-        if pr is None:
-            break
-        if float(pr) < 0:
-            count += 1
-        else:
-            break
-    return count
-
-
 # ─── live_evaluate: fetch the snapshot, then fan out to the reviewers ───
 
 
@@ -704,7 +689,7 @@ async def _build_live_snapshot_from_container(state: Mapping[str, Any]) -> dict[
     base["max_drawdown"] = float(profit.get("max_drawdown", 0.0) or 0.0)
     # Approximation (cumulative, not rolling-24h) — see docstring.
     base["daily_pnl_pct"] = float(profit.get("profit_closed_percent", 0.0) or 0.0) / 100.0
-    base["consecutive_losses"] = _trailing_losses(trades)
+    base["consecutive_losses"] = trailing_losses(trades)
     base["live_returns"] = [
         float(t["profit_ratio"])
         for t in trades

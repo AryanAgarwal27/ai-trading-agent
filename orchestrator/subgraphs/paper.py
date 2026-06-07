@@ -66,6 +66,7 @@ from orchestrator.tools.freqtrade_lifecycle import (
     spawn_paper_container,
     stop_paper_container,
 )
+from orchestrator.tools.freqtrade_metrics import trailing_losses
 
 logger = logging.getLogger(__name__)
 
@@ -414,26 +415,6 @@ def _elapsed_paper_days(state: Mapping[str, Any]) -> float:
     return (datetime.now(UTC) - started_dt).total_seconds() / 86400.0
 
 
-def _trailing_losses(trades: list[dict[str, Any]]) -> int:
-    """Count the trailing run of losing closed trades (most-recent-first).
-
-    Freqtrade ``/trades`` returns trades oldest-first, so we walk in
-    reverse. A non-dict or missing ``profit_ratio`` ends the run.
-    """
-    count = 0
-    for t in reversed(trades):
-        if not isinstance(t, dict):
-            break
-        pr = t.get("profit_ratio")
-        if pr is None:
-            break
-        if float(pr) < 0:
-            count += 1
-        else:
-            break
-    return count
-
-
 # ════════════════════════════════════════════════════════════════════════
 # schedule_wake (Stage 7e — APScheduler wiring lands in 7f)
 # ════════════════════════════════════════════════════════════════════════
@@ -576,7 +557,7 @@ async def paper_monitor_node(
 
     profit = ctx.profit if isinstance(ctx.profit, dict) else {}
     max_dd = float(profit.get("max_drawdown", 0.0) or 0.0)
-    consecutive_losses = _trailing_losses(ctx.trades)
+    consecutive_losses = trailing_losses(ctx.trades)
 
     existing = state.get("gate_decisions") or {}
     return {
