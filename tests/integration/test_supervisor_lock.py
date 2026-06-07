@@ -56,6 +56,24 @@ async def _try_lock(conn: psycopg.AsyncConnection) -> bool:
     return bool(row[0])
 
 
+async def _poll_until_acquired(conn: psycopg.AsyncConnection, *, attempts: int = 100) -> bool:
+    """Poll ``pg_try_advisory_xact_lock`` until it succeeds (or give up).
+
+    The xact lock releases when the backend processes the HOLDER's disconnect,
+    which lags the client-side ``await conn.close()`` by a server-side cleanup
+    tick — so an IMMEDIATE try after close() can still see the lock held. Polling
+    (up to attempts × 50ms) tests "released on close" without that race, while a
+    timeout still flags a genuine leak. Tries in conn's single open transaction;
+    ``pg_try_advisory_xact_lock`` may be called repeatedly there — False until
+    free, then True.
+    """
+    for _ in range(attempts):
+        if await _try_lock(conn):
+            return True
+        await asyncio.sleep(0.05)
+    return False
+
+
 async def test_advisory_lock_is_exclusive_and_releases_on_conn_close() -> None:
     """conn1 holds the xact lock → conn2 cannot acquire it; close conn1 → the lock
     auto-releases (xact-scoped) → conn2 acquires it. The crash-safety property:
@@ -75,8 +93,9 @@ async def test_advisory_lock_is_exclusive_and_releases_on_conn_close() -> None:
         # conn1 closes → its transaction ends → the xact lock releases.
         await conn1.close()
 
-        # conn2 can now take it (same txn; the prior try did not acquire).
-        assert await _try_lock(conn2) is True
+        # conn2 can now take it — once the backend has finished releasing the
+        # closed holder's lock (poll to avoid the close-cleanup race).
+        assert await _poll_until_acquired(conn2), "lock not released after holder conn close"
     finally:
         await conn2.rollback()
         if not conn1.closed:
