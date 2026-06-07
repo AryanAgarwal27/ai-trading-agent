@@ -87,6 +87,11 @@ PaperMonitorFn = Callable[[PaperMonitorContext], Awaitable[Any]]
 BuildContextFn = Callable[[Mapping[str, Any]], Awaitable[PaperMonitorContext]]
 ScheduleWakeFn = Callable[[str, str], Awaitable[None]]
 StopContainerFn = Callable[[str], Awaitable[None]]
+# D-12: (strategy_id) -> cancel that thread's recurring paper wake job at archive
+# (mirrors live's UnscheduleWakeFn / 9f). Default no-op so the graph builds
+# without a scheduler (tests / standalone); production injects
+# orchestrator.scheduler.make_unschedule_wake_fn.
+UnscheduleWakeFn = Callable[[str], Awaitable[None]]
 # D-9: () -> current live-strategy count (the capital axis, BRD §10). live_gate
 # reads it BEFORE offering HITL approval; injected so tests drive the slot-full /
 # slot-free paths hermetically. Default reads aget_portfolio_snapshot()["live"].
@@ -443,6 +448,11 @@ async def _noop_schedule_wake(thread_id: str, strategy_id: str) -> None:
     parks at paper_wait and is driven by an explicit Command(resume=...)
     (the test wake, or 7f's scheduler call in production).
     """
+    return None
+
+
+async def _noop_unschedule_wake(strategy_id: str) -> None:
+    """Default unschedule_wake (D-12): no scheduler wired (tests / standalone)."""
     return None
 
 
@@ -880,9 +890,31 @@ async def paper_teardown(
 # ════════════════════════════════════════════════════════════════════════
 
 
-def archive(state: PaperState) -> dict[str, Any]:
-    """Terminal sink: stamp stage and preserve failure_reason."""
+async def archive(
+    state: PaperState,
+    *,
+    unschedule_wake_fn: UnscheduleWakeFn | None = None,
+) -> dict[str, Any]:
+    """Terminal sink: stamp stage, preserve failure_reason, cancel the wake job.
+
+    D-12 (mirrors 9f's live_archive): the terminal sink for BOTH paper archive
+    paths — the kill/reject path (divergence_check / live_gate → paper_teardown →
+    archive) AND the paper_spawn-failure path (_route_after_spawn → archive,
+    bypassing paper_teardown). Cancelling the recurring 6h wake job HERE covers
+    every archive flow in one place, so an archived paper thread's wake doesn't
+    fire forever and harmlessly 409 against /wake. Best-effort like live_archive:
+    a cleanup failure logs but never strands the archive (a missed cancel only
+    costs harmless 409s on the next fire); and the cancel is idempotent — the
+    spawn-failure path never scheduled a wake, so removing a non-existent job is a
+    swallowed no-op (see scheduler.make_unschedule_wake_fn).
+    """
     get_logger("archive").info("enter", payload={"failure_reason": state.get("failure_reason")})
+    unschedule_fn = unschedule_wake_fn or _noop_unschedule_wake
+    sid = str(state.get("strategy_id", ""))
+    try:
+        await unschedule_fn(sid)
+    except Exception as exc:  # noqa: BLE001 — cleanup must not strand the archive
+        logger.error("paper archive unschedule_wake failed strategy_id=%s exc=%s", sid, exc)
     return {
         "stage": "archived",
         "failure_reason": state.get("failure_reason") or "paper_archived_without_reason",
@@ -910,6 +942,7 @@ def build_paper_subgraph(
     paper_monitor_fn: PaperMonitorFn | None = None,
     build_context_fn: BuildContextFn | None = None,
     schedule_wake_fn: ScheduleWakeFn | None = None,
+    unschedule_wake_fn: UnscheduleWakeFn | None = None,
     stop_container_fn: StopContainerFn | None = None,
     live_count_fn: LiveCountFn | None = None,
     checkpointer: CheckpointSaver | None = None,
@@ -961,6 +994,9 @@ def build_paper_subgraph(
     async def _live_gate(state: PaperState, config: RunnableConfig) -> Command[Any]:
         return await live_gate(state, config, live_count_fn=live_count_fn)
 
+    async def _archive(state: PaperState, config: RunnableConfig) -> dict[str, Any]:
+        return await archive(state, unschedule_wake_fn=unschedule_wake_fn)
+
     builder: StateGraph[PaperState, PaperState, PaperState, PaperState] = StateGraph(PaperState)
     builder.add_node("paper_spawn", _paper_spawn)
     builder.add_node("schedule_wake", _schedule_wake)
@@ -969,7 +1005,7 @@ def build_paper_subgraph(
     builder.add_node("divergence_check", divergence_check)
     builder.add_node("live_gate", _live_gate)
     builder.add_node("paper_teardown", _paper_teardown)
-    builder.add_node("archive", archive)
+    builder.add_node("archive", _archive)
 
     builder.add_edge(START, "paper_spawn")
     builder.add_conditional_edges("paper_spawn", _route_after_spawn, ["schedule_wake", "archive"])

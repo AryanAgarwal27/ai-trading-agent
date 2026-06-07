@@ -73,6 +73,7 @@ from orchestrator.scheduler import (
     make_schedule_live_wake_fn,
     make_schedule_wake_fn,
     make_unschedule_live_wake_fn,
+    make_unschedule_wake_fn,
     register_recurring_jobs,
     register_supervisor_cron,
     shutdown_scheduler,
@@ -472,6 +473,9 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         stack.push_async_callback(shutdown_scheduler, scheduler)
         app.state.scheduler = scheduler
         app.state.schedule_wake_fn = make_schedule_wake_fn(scheduler)
+        # D-12: cancel a paper thread's recurring wake job at archive (mirrors the
+        # live cleanup below) so an archived paper thread's 6h wake stops firing.
+        app.state.unschedule_wake_fn = make_unschedule_wake_fn(scheduler)
         # 9f (D-6 periodic live-wake): the live analog of schedule_wake_fn +
         # its cleanup. schedule registers live_wake:<sid> at live_spawn (6h,
         # kind="live_wait"); unschedule cancels it at live_archive + supervisor
@@ -488,6 +492,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             saver,
             store,
             schedule_wake_fn=app.state.schedule_wake_fn,
+            unschedule_wake_fn=app.state.unschedule_wake_fn,
             schedule_live_wake_fn=app.state.schedule_live_wake_fn,
             unschedule_live_wake_fn=app.state.unschedule_live_wake_fn,
         )

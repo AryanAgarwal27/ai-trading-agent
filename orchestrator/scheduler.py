@@ -747,6 +747,31 @@ def make_unschedule_live_wake_fn(scheduler: AsyncIOScheduler) -> UnscheduleWakeF
     return unschedule_live_wake
 
 
+def make_unschedule_wake_fn(scheduler: AsyncIOScheduler) -> UnscheduleWakeFn:
+    """Return the PAPER-wake cleanup fn (D-12) — cancels ``wake:<thread_id>``.
+
+    Symmetric to :func:`make_unschedule_live_wake_fn`. Called at the paper
+    ``archive`` terminal node (the sink for both the kill/reject teardown path and
+    the spawn-failure path) so an archived paper thread's recurring wake job is
+    removed rather than left to fire every 6h and harmlessly 409. The paper wake
+    job (:func:`make_schedule_wake_fn`) is keyed on ``thread_id``, which is
+    ``strategy_<strategy_id>`` by the spawn convention (``aspawn_strategy``), so
+    the job id is reconstructed from the strategy_id. Idempotent: removing a
+    non-existent job (the spawn-failure path never scheduled one, or it was
+    already removed / replayed away) is a swallowed no-op.
+    """
+
+    async def unschedule_wake(strategy_id: str) -> None:
+        job_id = f"{WAKE_JOB_PREFIX}strategy_{strategy_id}"
+        try:
+            scheduler.remove_job(job_id)
+            logger.info("unscheduled paper wake job strategy_id=%s", strategy_id)
+        except JobLookupError:
+            logger.debug("unschedule_wake: no job %s (already gone)", job_id)
+
+    return unschedule_wake
+
+
 async def shutdown_scheduler(scheduler: AsyncIOScheduler) -> None:
     """Stop the scheduler without blocking on in-flight jobs.
 

@@ -482,3 +482,87 @@ async def test_live_gate_reoffers_after_slot_frees(
     final = await graph.aget_state(config)
     assert final.values["stage"] == "live"
     assert final.values["gate_decisions"]["live"]["approved"] is True
+
+
+# ─── D-12: paper wake-job cleanup at every archive site ────────────────
+
+
+async def test_unschedule_wake_called_on_kill_teardown_archive(
+    cleanup_strategy_ids: list[str],
+) -> None:
+    """D-12: the kill path (paper_monitor → divergence_check → paper_teardown →
+    archive) cancels the recurring wake job at the terminal archive node."""
+    strategy_id = f"pe-{uuid.uuid4().hex[:8]}"
+    cleanup_strategy_ids.append(strategy_id)
+    thread_id = f"strategy_{strategy_id}"
+    started = (datetime.now(UTC) - timedelta(days=10)).isoformat()
+
+    unscheduled: list[str] = []
+
+    async def _spy_unschedule(sid: str) -> None:
+        unscheduled.append(sid)
+
+    graph = build_paper_subgraph(
+        spawn_container_fn=_spawn_stub(),
+        paper_monitor_fn=_monitor_fixed("kill"),
+        build_context_fn=_ctx_stub(),
+        stop_container_fn=_stop_stub({}),
+        unschedule_wake_fn=_spy_unschedule,
+        checkpointer=InMemorySaver(),
+    )
+    config: RunnableConfig = {"configurable": {"thread_id": thread_id}}
+
+    async for _ in graph.astream(
+        cast(Any, _minimal_paper_state(strategy_id, started)), config=config
+    ):
+        pass
+    await autoresume_for_test(
+        graph, thread_id, {"wake": True}
+    )  # → monitor(kill) → teardown → archive
+
+    final = await graph.aget_state(config)
+    assert final.values["stage"] == "archived"
+    assert unscheduled == [
+        strategy_id
+    ], "archive must cancel the wake job on the kill/teardown path"
+
+
+async def test_unschedule_wake_called_on_spawn_failure_archive(
+    cleanup_strategy_ids: list[str],
+) -> None:
+    """D-12: the paper_spawn-failure → archive path (bypasses paper_teardown) also
+    cancels the wake job. Idempotent: no wake was ever scheduled here, so the real
+    unschedule would be a no-op — but the call site must still fire so the
+    contract holds at EVERY archive site."""
+    strategy_id = f"pe-{uuid.uuid4().hex[:8]}"
+    cleanup_strategy_ids.append(strategy_id)
+    thread_id = f"strategy_{strategy_id}"
+
+    unscheduled: list[str] = []
+
+    async def _spy_unschedule(sid: str) -> None:
+        unscheduled.append(sid)
+
+    graph = build_paper_subgraph(
+        spawn_container_fn=_spawn_stub(),
+        paper_monitor_fn=_monitor_fixed("rearm"),
+        build_context_fn=_ctx_stub(),
+        stop_container_fn=_stop_stub({}),
+        unschedule_wake_fn=_spy_unschedule,
+        checkpointer=InMemorySaver(),
+    )
+    config: RunnableConfig = {"configurable": {"thread_id": thread_id}}
+
+    # No generated_strategy_path → paper_spawn returns stage="archived" → routes
+    # straight to archive (bypassing schedule_wake AND paper_teardown).
+    state = _minimal_paper_state(strategy_id, None)
+    state["artifacts"] = {}
+    async for _ in graph.astream(cast(Any, state), config=config):
+        pass
+
+    final = await graph.aget_state(config)
+    assert final.values["stage"] == "archived"
+    assert final.values["failure_reason"].startswith("paper_spawn_missing_strategy_path")
+    assert unscheduled == [
+        strategy_id
+    ], "archive must cancel the wake job on the spawn-failure path"

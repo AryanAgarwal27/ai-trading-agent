@@ -19,6 +19,7 @@ from orchestrator.scheduler import (
     _fire_wake,
     build_scheduler,
     make_schedule_wake_fn,
+    make_unschedule_wake_fn,
     register_recurring_jobs,
     shutdown_scheduler,
 )
@@ -53,6 +54,27 @@ async def test_schedule_wake_fn_replaces_existing_on_respawn() -> None:
 
         wake_jobs = [j for j in scheduler.get_jobs() if j.id == "wake:strategy_t1"]
         assert len(wake_jobs) == 1
+    finally:
+        await shutdown_scheduler(scheduler)
+
+
+async def test_unschedule_wake_fn_removes_job_and_is_idempotent() -> None:
+    """D-12: make_unschedule_wake_fn cancels the paper wake job
+    (wake:strategy_<sid>, keyed off thread_id == strategy_<sid>) and a missing
+    job is a swallowed no-op (the spawn-failure path / already-removed case)."""
+    scheduler = build_scheduler()
+    scheduler.start(paused=True)
+    try:
+        schedule = make_schedule_wake_fn(scheduler, base_url="http://127.0.0.1:8000")
+        await schedule("strategy_t1", "t1")
+        assert scheduler.get_job("wake:strategy_t1") is not None
+
+        unschedule = make_unschedule_wake_fn(scheduler)
+        await unschedule("t1")  # strategy_id → removes wake:strategy_t1
+        assert scheduler.get_job("wake:strategy_t1") is None
+
+        # Idempotent: cancelling an already-gone job does not raise.
+        await unschedule("t1")
     finally:
         await shutdown_scheduler(scheduler)
 

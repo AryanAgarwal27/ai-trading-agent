@@ -163,6 +163,7 @@ def build_per_strategy_graph(
     build_context_fn: BuildContextFn | None = None,
     spawn_container_fn: SpawnContainerFn | None = None,
     schedule_wake_fn: ScheduleWakeFn | None = None,
+    unschedule_wake_fn: UnscheduleWakeFn | None = None,
     stop_container_fn: StopContainerFn | None = None,
     # ── Live subgraph seams (Stage 8g). Separate from the paper seams above
     # (e.g. live_registry_writer_fn ≠ paper's inline registry write) so the
@@ -230,6 +231,7 @@ def build_per_strategy_graph(
         paper_monitor_fn=paper_monitor_fn,
         build_context_fn=build_context_fn,
         schedule_wake_fn=schedule_wake_fn,
+        unschedule_wake_fn=unschedule_wake_fn,
         stop_container_fn=stop_container_fn,
         checkpointer=None,  # nested under the parent's saver
     )
