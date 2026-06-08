@@ -1039,6 +1039,26 @@ async def run_supervisor_endpoint(
 _MANUAL_INJECT_TASKS: set[asyncio.Task[None]] = set()
 
 
+def _find_stderr_tail(exc: BaseException) -> str:
+    """Walk the exception chain for a ``BacktestError``-style ``stderr_tail``.
+
+    A backtest failure inside a Send fan-out can reach the background driver
+    wrapped (LangGraph may re-raise it inside another exception), so the
+    ``BacktestError`` carrying Freqtrade's real stderr may be a ``__cause__`` /
+    ``__context__`` rather than the top exception. Duck-typed on the attribute so
+    no import coupling to backtest_runner. Returns ``""`` when none is found.
+    """
+    seen: set[int] = set()
+    current: BaseException | None = exc
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        tail = getattr(current, "stderr_tail", None)
+        if isinstance(tail, str) and tail.strip():
+            return tail
+        current = current.__cause__ or current.__context__
+    return ""
+
+
 @app.post("/strategies/validate")
 async def validate_strategy_manual(
     body: ManualValidateBody,
@@ -1185,8 +1205,19 @@ async def validate_strategy_manual(
                     async for _ in graph.astream(None, config=traced_config):
                         pass
             except Exception as exc:  # noqa: BLE001 — background run; surfaces via logs + archived thread
+                # Surface the REAL cause in the orchestrator log, not just a short
+                # line: str(exc) (a BacktestError now embeds its stderr tail —
+                # commit 918fad3), the stderr tail explicitly (even if the
+                # BacktestError is wrapped), and the full traceback (exc_info).
+                # Without this a FreqAI backtest failure was invisible without
+                # hunting through worker dirs.
+                stderr_tail = _find_stderr_tail(exc)
                 logger.error(
-                    "manual-inject: graph run failed strategy_id=%s exc=%s", strategy_id, exc
+                    "manual-inject: graph run failed strategy_id=%s: %s%s",
+                    strategy_id,
+                    exc,
+                    f"\n--- backtest stderr tail ---\n{stderr_tail}" if stderr_tail else "",
+                    exc_info=True,
                 )
 
         task = asyncio.create_task(_drive())
