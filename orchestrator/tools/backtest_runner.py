@@ -176,11 +176,19 @@ async def run_backtest(
     stdout_bytes, stderr_bytes, returncode = await _run_subprocess(cmd, timeout_s)
 
     if returncode != 0:
+        stderr_tail = _tail(stderr_bytes)
+        stdout_tail = _tail(stdout_bytes)
+        # Surface Freqtrade's REAL error in the message (not just an unread
+        # attribute): str(exc) is what the logged failure_reason / manual-inject
+        # _drive() log shows, so the exit code alone made every backtest failure
+        # undebuggable. Mirrors orchestrator/tools/lookahead.py. Freqtrade writes
+        # its ERROR/traceback to stderr; fall back to stdout when stderr is empty.
+        diagnostic = stderr_tail.strip() or stdout_tail.strip() or "(no stderr/stdout captured)"
         raise BacktestError(
-            f"freqtrade backtesting exited with code {returncode}",
+            f"freqtrade backtesting exited with code {returncode}; stderr tail: {diagnostic}",
             returncode=returncode,
-            stderr_tail=_tail(stderr_bytes),
-            stdout_tail=_tail(stdout_bytes),
+            stderr_tail=stderr_tail,
+            stdout_tail=stdout_tail,
             worker_dir=worker_dir,
         )
 
