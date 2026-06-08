@@ -56,6 +56,9 @@ def _healthy_summary(**overrides: Any) -> dict[str, Any]:
         "fold_count": 6,
         "sharpe_is": 2.0,
         "min_sharpe_per_fold": 0.5,
+        # All 6 folds positive → clears MIN_POSITIVE_FOLDS (4 of 6), the
+        # cross-fold consistency gate added by the SPEC §6 2026-06-08 re-tune.
+        "is_sharpe_per_fold": [2.0, 2.0, 2.0, 2.0, 2.0, 2.0],
         "profit_factor": 2.0,
         "max_dd": 0.05,
         "trades": 300,
@@ -339,6 +342,100 @@ def test_gate_backtest_passes_when_all_folds_meet_per_fold_min() -> None:
     assert cmd.update is not None
     assert cmd.update["gate_decisions"]["backtest"]["passed"] is True
     assert cmd.update["gate_decisions"]["backtest"]["failures"] == []
+
+
+# ─── Cross-fold consistency gate (SPEC §6 2026-06-08 re-tune) ───────────
+
+
+def test_aggregate_results_persists_is_sharpe_per_fold_ordered() -> None:
+    """aggregate_results writes per-fold Sharpe in fold order — the input the
+    MIN_POSITIVE_FOLDS consistency gate counts positives over.
+    """
+    pairs: list[tuple[str, float]] = [
+        ("fold_3", 0.9),
+        ("fold_1", -0.4),
+        ("fold_2", 1.1),
+    ]
+    results = [
+        _bt_result(param_set_id="ps_1", fold_id=fid, trades=50, is_sharpe=s) for fid, s in pairs
+    ]
+    update = aggregate_results({"backtest_results": results, "gate_decisions": {}})
+    summary = update["gate_decisions"]["backtest"]["param_sets"][0]
+    # Sorted fold_1, fold_2, fold_3 → -0.4, 1.1, 0.9.
+    assert summary["is_sharpe_per_fold"] == [-0.4, 1.1, 0.9]
+
+
+def test_gate_backtest_fails_on_inconsistent_folds() -> None:
+    """A strategy whose mean Sharpe clears MIN_SHARPE_IS but is positive in
+    only 3/6 folds archives on the consistency rule — the Deflated-Sharpe
+    "lucky average" trap the 2026-06-08 re-tune closes.
+    """
+    state: ValidationState = {
+        "gate_decisions": {
+            "backtest": {
+                "param_sets": [
+                    _healthy_summary(
+                        sharpe_is=1.0,  # mean clears MIN_SHARPE_IS=0.5
+                        # only 3 of 6 folds positive → fails MIN_POSITIVE_FOLDS=4
+                        is_sharpe_per_fold=[3.0, 2.0, 1.0, -0.5, -0.5, -0.5],
+                    )
+                ],
+                "best_param_set_id": "ps_1",
+            }
+        }
+    }
+    cmd = gate_backtest(state)
+    assert cmd.goto == "archive"
+    assert cmd.update is not None
+    assert cmd.update["stage"] == "archived"
+    failure_reason = cmd.update["failure_reason"]
+    assert failure_reason.startswith("backtest_gate:")
+    assert "inconsistent_folds" in failure_reason
+    assert "positive_folds=3" in failure_reason
+    assert f"MIN_POSITIVE_FOLDS={thresholds.MIN_POSITIVE_FOLDS}" in failure_reason
+    failures = cmd.update["gate_decisions"]["backtest"]["failures"]
+    assert any("inconsistent_folds" in f for f in failures)
+
+
+def test_gate_backtest_passes_with_four_of_six_positive_folds() -> None:
+    """Exactly MIN_POSITIVE_FOLDS (4 of 6) positive → consistency met, gate
+    passes (the other IS thresholds are cleared by _healthy_summary).
+    """
+    state: ValidationState = {
+        "gate_decisions": {
+            "backtest": {
+                "param_sets": [
+                    _healthy_summary(
+                        sharpe_is=1.0,
+                        is_sharpe_per_fold=[2.0, 1.0, 0.5, 0.1, -0.3, -0.8],  # 4 positive
+                    )
+                ],
+                "best_param_set_id": "ps_1",
+            }
+        }
+    }
+    cmd = gate_backtest(state)
+    assert cmd.goto == "plan_robustness"
+    assert cmd.update is not None
+    assert cmd.update["gate_decisions"]["backtest"]["passed"] is True
+    assert cmd.update["gate_decisions"]["backtest"]["failures"] == []
+
+
+def test_gate_backtest_skips_consistency_when_per_fold_sharpe_absent() -> None:
+    """Defensive: a summary lacking is_sharpe_per_fold (old payload) skips the
+    consistency check rather than archiving spuriously — mirrors the
+    trades_per_fold back-compat guard. The mean MIN_SHARPE_IS still applies.
+    """
+    state: ValidationState = {
+        "gate_decisions": {
+            "backtest": {
+                "param_sets": [_healthy_summary(is_sharpe_per_fold=None)],
+                "best_param_set_id": "ps_1",
+            }
+        }
+    }
+    cmd = gate_backtest(state)
+    assert cmd.goto == "plan_robustness"
 
 
 def test_gate_backtest_handles_missing_trades_per_fold_field() -> None:

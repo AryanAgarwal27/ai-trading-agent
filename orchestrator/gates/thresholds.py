@@ -5,9 +5,20 @@ paper, and live subgraphs reads from this module. If you find yourself
 copying a literal value into a node, stop and import it from here instead —
 the BRD calls this out by name as a non-negotiable rule.
 
-Values below are verbatim from BRD §10. SPEC.md §2 confirms no v1 overrides;
-re-tuning happens here (and only here) per BRD §10's "do not put thresholds
-anywhere else" rule, after the first 10 strategies complete a lifecycle.
+Values are BRD §10 defaults EXCEPT the backtest hard gate, which carries the
+2026-06-08 research-grounded re-tune recorded in SPEC §2 (threshold overrides)
+and SPEC §6 (change-log). BRD §10 explicitly delegates this: "These values are
+operator-tunable in SPEC.md ... Re-tune after the first 10 strategies have
+completed a lifecycle." ~10 strategies ran, ALL failed (backtest Sharpes −8 to
+−105), so the gate was re-tuned to a realistic, honest bar. Re-tuning still
+happens here (and only here) per BRD §10's "do not put thresholds anywhere
+else" rule.
+
+The re-tuned symbols are ``MIN_SHARPE_IS`` (1.5 → 0.5), ``MIN_PROFIT_FACTOR_IS``
+(1.5 → 1.2), and the NEW cross-fold ``MIN_POSITIVE_FOLDS`` (4 of 6). See the
+SPEC §6 2026-06-08 entry for the full rationale + research citation (Bailey &
+López de Prado Deflated Sharpe; honest walk-forward Sharpes cluster ~0.33–1.2;
+buy-and-hold benchmark; 4/6-fold consistency over a lucky average).
 
 Layout mirrors BRD §10's section ordering so a grep for a threshold name
 finds the BRD prose and this module side-by-side.
@@ -32,14 +43,52 @@ evidence."""
 MIN_OOS_TRADES: int = 30
 """Minimum total OOS trades across all folds. Below this, OOS Sharpe is noise."""
 
-MIN_SHARPE_IS: float = 1.5
-"""IS Sharpe floor. Below this the strategy isn't worth the OOS check."""
+MIN_SHARPE_IS: float = 0.5
+"""IS Sharpe floor. **Re-tuned 1.5 → 0.5 on 2026-06-08 (SPEC §2/§6).**
 
-MIN_PROFIT_FACTOR_IS: float = 1.5
-"""IS profit factor floor (gross wins / gross losses)."""
+The original 1.5 was the wrong headline goal: the attached research (long-only
+spot, 4 majors, 5m/1h) found Sharpe ≥ 1.5 across 6 OOS folds *improbable* and a
+likely selection-bias artifact under the Deflated Sharpe Ratio (Bailey & López
+de Prado, JPM 2014) given only 6×7 = 42 days OOS. Honest walk-forward Sharpes
+cluster ~0.33–1.2 (rigorous frameworks ~0.33; market-neutral funds 0.8–1.2;
+Bitcoin buy-and-hold ~0.96 per Fidelity 2020–early-2024). 0.5 sits at the low
+end of that honest band — it screens out the breakeven/negative strategies the
+first ~10 runs produced (Sharpe −8 to −105) without demanding the improbable."""
+
+MIN_PROFIT_FACTOR_IS: float = 1.2
+"""IS profit factor floor (gross wins / gross losses). **Re-tuned 1.5 → 1.2 on
+2026-06-08 (SPEC §2/§6).** Directly from the research's recommended bar
+("profit factor > 1.2 ... consistent across folds"): 1.2 means gross wins
+exceed gross losses by 20%, clearing the ~0.15–0.2% Binance round-trip fee with
+margin, without demanding the rich 1.5 that the honest 5m universe rarely
+sustains. Matches ``MIN_OOS_PROFIT_FACTOR`` (also 1.2)."""
 
 MAX_DRAWDOWN_IS: float = 0.20
-"""Max IS drawdown as positive fraction. 0.20 = 20%."""
+"""Max IS drawdown as positive fraction. 0.20 = 20%. (Unchanged by the
+2026-06-08 re-tune — a drawdown ceiling is a risk limit, not a performance
+bar.)"""
+
+# ─── Cross-fold consistency (added 2026-06-08, SPEC §2/§6) ──────────────
+# The single most important lever the research flagged: a passing AVERAGE is
+# not a passing strategy. A high mean Sharpe dragged up by one lucky fold is
+# the Deflated-Sharpe selection-bias trap. Consistency across independent
+# walk-forward OOS windows is the real signal — so the IS hard gate now
+# requires the strategy to make money in a MAJORITY of folds, not on average.
+
+MIN_POSITIVE_FOLDS: int = 4
+"""Minimum walk-forward folds (of the BRD §5.4 anchored 6-fold plan) whose
+per-fold Sharpe is > 0. **New on 2026-06-08 (SPEC §2/§6).**
+
+The research stressed: "Require consistency across all 6 folds, not a high
+average dragged up by one lucky window," and set the advancement bar at
+"positive in ≥ 4/6 folds." 4/6 = the strategy made money in two-thirds of the
+independent OOS windows — evidence of a repeatable edge rather than a single
+fortunate slice that inflates the mean (the Deflated-Sharpe failure mode).
+Enforced in ``gate_backtest`` against each fold's realized walk-forward Sharpe
+(per-fold ``is_sharpe``; the backtest runs on each fold's OOS test window, so
+this IS the out-of-sample per-fold Sharpe — ``oos_sharpe`` stays 0.0 by the
+backtest_runner contract). A degraded cache that fits < 4 folds therefore
+fails this gate by design: too little evidence to establish consistency."""
 
 # ─── OOS / walk-forward gate ────────────────────────────────────────────
 

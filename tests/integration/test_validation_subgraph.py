@@ -232,8 +232,10 @@ async def test_five_parallel_real_freqtrade_workers_aggregate_and_gate(
 
     # ─── Stage 4d: Command-based routing assertion ────────────────
     # gate_backtest now returns Command(goto="archive"|"plan_robustness").
-    # The negative-Sharpe baseline fails MIN_TRADES_IS + MIN_SHARPE_IS +
-    # MIN_PROFIT_FACTOR_IS, so the graph routes to archive. Final state
+    # The negative-Sharpe baseline fails MIN_SHARPE_IS + MIN_PROFIT_FACTOR_IS +
+    # MIN_POSITIVE_FOLDS (no positive folds), so the graph routes to archive.
+    # (SPEC §6 2026-06-08 re-tune lowered the bars but a losing baseline still
+    # fails them.) Final state
     # MUST have stage="archived" and a failure_reason starting with
     # "backtest_gate:" listing each violated threshold.
     if not backtest_block["passed"]:
@@ -353,9 +355,10 @@ async def test_full_pipeline_runs_robustness_when_gate_backtest_passes(
             pair=real["pair"],
             timeframe=real["timeframe"],
             fold_id=real["fold_id"],
-            is_sharpe=2.0,  # inflated; passes MIN_SHARPE_IS=1.5
+            is_sharpe=2.0,  # inflated; passes MIN_SHARPE_IS=0.5 (SPEC §6 re-tune)
+            # All folds = 2.0 → every fold positive, clears MIN_POSITIVE_FOLDS=4.
             oos_sharpe=0.0,
-            profit_factor=2.0,  # passes MIN_PROFIT_FACTOR_IS=1.5
+            profit_factor=2.0,  # passes MIN_PROFIT_FACTOR_IS=1.2 (SPEC §6 re-tune)
             max_dd=0.05,  # passes MAX_DRAWDOWN_IS=0.20
             trades=200,  # passes MIN_TRADES_IS=150 (cumulative across folds)
             raw_zip_path=real["raw_zip_path"],

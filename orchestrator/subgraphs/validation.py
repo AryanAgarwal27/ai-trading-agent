@@ -497,6 +497,11 @@ def aggregate_results(state: ValidationState) -> dict[str, Any]:
                 "fold_count": len(rs),
                 "sharpe_is": sharpe_is_mean,
                 "min_sharpe_per_fold": min(is_sharpes) if is_sharpes else 0.0,
+                # Per-fold Sharpe list (fold 1..N order) for the cross-fold
+                # consistency gate (MIN_POSITIVE_FOLDS, SPEC §6 2026-06-08).
+                # The mean above can clear MIN_SHARPE_IS on one lucky fold; the
+                # gate counts how many folds were actually positive.
+                "is_sharpe_per_fold": is_sharpes,
                 "profit_factor": statistics.fmean(profit_factors) if profit_factors else 0.0,
                 "max_dd": max(max_dds) if max_dds else 0.0,
                 # Aggregate kept for back-compat; per-fold list added so a
@@ -564,9 +569,25 @@ def gate_backtest(
     ``failure_reason`` listing each violated threshold. BRD §6.4 specifies
     ``Command(goto, update)`` for this kind of conditional routing.
 
-    OOS thresholds (``MIN_OOS_TRADES``, ``MIN_OOS_RATIO``, …) are not
-    checked here because Stage 4c's single-fold runner always reports
-    ``oos_sharpe=0.0``. Stage 5+ wires OOS and these checks light up.
+    Checks, against the best param set's summary:
+      - ``MIN_TRADES_IS`` (aggregate trade count),
+      - ``MIN_TRADES_PER_FOLD`` (no silent zero-trade fold),
+      - ``MIN_SHARPE_IS`` (mean per-fold Sharpe ≥ floor),
+      - ``MIN_PROFIT_FACTOR_IS`` (mean profit factor ≥ floor),
+      - ``MAX_DRAWDOWN_IS`` (drawdown ceiling),
+      - ``MIN_POSITIVE_FOLDS`` (cross-fold consistency — SPEC §6 2026-06-08).
+
+    The consistency check is the research-grounded re-tune's headline: a mean
+    Sharpe that clears ``MIN_SHARPE_IS`` on the strength of one lucky fold is
+    the Deflated-Sharpe selection-bias trap (Bailey & López de Prado). Each
+    fold's per-fold ``is_sharpe`` IS its realized walk-forward OOS Sharpe (the
+    worker runs on the fold's OOS test window; ``oos_sharpe`` stays 0.0 per the
+    backtest_runner contract), so counting folds with ``is_sharpe > 0`` is the
+    honest cross-window consistency signal.
+
+    The remaining unwired OOS thresholds (``MIN_OOS_RATIO``,
+    ``MIN_OOS_SHARPE_PER_FOLD``, …) still depend on a distinct OOS Sharpe the
+    single-fold runner does not yet produce; Stage 5+ lights those up.
     """
     get_logger("gate_backtest").info("enter", payload={})
     gates = state.get("gate_decisions") or {}
@@ -619,6 +640,22 @@ def gate_backtest(
         failures.append(
             f"max_dd={best['max_dd']:.3f} > MAX_DRAWDOWN_IS={thresholds.MAX_DRAWDOWN_IS}"
         )
+    # Cross-fold consistency (SPEC §6 2026-06-08 re-tune). A passing AVERAGE
+    # is not a passing strategy: a mean Sharpe dragged over MIN_SHARPE_IS by
+    # one lucky fold is the Deflated-Sharpe selection-bias trap (Bailey &
+    # López de Prado). Require the strategy to be POSITIVE in ≥
+    # MIN_POSITIVE_FOLDS of the walk-forward folds. Guarded on presence to
+    # mirror the trades_per_fold check above (an old summary lacking the
+    # field skips this; every fresh aggregate_results run populates it).
+    sharpe_per_fold = best.get("is_sharpe_per_fold") or []
+    if sharpe_per_fold:
+        positive_folds = sum(1 for s in sharpe_per_fold if s > 0.0)
+        if positive_folds < thresholds.MIN_POSITIVE_FOLDS:
+            failures.append(
+                f"inconsistent_folds: positive_folds={positive_folds} < "
+                f"MIN_POSITIVE_FOLDS={thresholds.MIN_POSITIVE_FOLDS}; "
+                f"per_fold_sharpe={[round(s, 3) for s in sharpe_per_fold]}"
+            )
 
     update_passed: dict[str, Any] = {
         "gate_decisions": {

@@ -31,17 +31,23 @@ ORCHESTRATOR_ROOT = REPO_ROOT / "orchestrator"
 THRESHOLDS_FILE = ORCHESTRATOR_ROOT / "gates" / "thresholds.py"
 
 
-# Verbatim BRD §10 expected values. Sourced from BRD.md §10 in the same
-# commit that authored thresholds.py — if BRD §10 changes, both this test
-# AND thresholds.py must change in lockstep, per SPEC §4.4 rule 3.
+# BRD §10 defaults, AS OVERRIDDEN by SPEC §2/§6. BRD §10 explicitly delegates
+# the backtest-gate values to SPEC ("operator-tunable in SPEC.md ... Re-tune
+# after the first 10 strategies"), so the runtime source of truth (thresholds.py)
+# carries the SPEC override and this table tracks it. The 2026-06-08 re-tune
+# (SPEC §6) changed MIN_SHARPE_IS 1.5→0.5, MIN_PROFIT_FACTOR_IS 1.5→1.2, and
+# added MIN_POSITIVE_FOLDS=4. If a value changes again, the SPEC §6 change-log,
+# thresholds.py, and this table move in lockstep (SPEC §4.4 rule 3).
 EXPECTED: dict[str, int | float] = {
-    # Backtest hard gate (in-sample)
+    # Backtest hard gate (in-sample) — SPEC §6 2026-06-08 re-tune applied.
     "MIN_TRADES_IS": 150,
     "MIN_TRADES_PER_FOLD": 5,
     "MIN_OOS_TRADES": 30,
-    "MIN_SHARPE_IS": 1.5,
-    "MIN_PROFIT_FACTOR_IS": 1.5,
+    "MIN_SHARPE_IS": 0.5,
+    "MIN_PROFIT_FACTOR_IS": 1.2,
     "MAX_DRAWDOWN_IS": 0.20,
+    # Cross-fold consistency (added 2026-06-08, SPEC §2/§6)
+    "MIN_POSITIVE_FOLDS": 4,
     # OOS / walk-forward gate
     "MIN_OOS_RATIO": 0.6,
     "MIN_OOS_SHARPE_PER_FOLD": 0.0,
