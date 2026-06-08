@@ -58,6 +58,7 @@ from orchestrator.tools.regime import classify_regime, insert_regime_log
 
 REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 STRATEGY_PATH = REPO_ROOT / "strategy_templates" / "mean_reversion_template.py"
+FREQAI_REGRESSOR_PATH = REPO_ROOT / "strategy_templates" / "freqai_regressor_template.py"
 CACHED_BTC_5M = SHARED_DATA_DIR / "binance" / "BTC_USDT-5m.feather"
 
 # Operator-tuned via .env; falls back to the sqlalchemy-style URL stripped of
@@ -139,6 +140,65 @@ async def test_backtest_runner_produces_trades_on_cached_btc() -> None:
     # inspect the artifacts. This matches the docstring of cleanup_worker.
     worker_dir = Path(result["raw_zip_path"]).parent.parent
     cleanup_worker(worker_dir)
+
+
+@pytest.mark.integration
+@pytest.mark.freqtrade
+@pytest.mark.asyncio
+async def test_freqai_backtest_trains_and_completes(capsys: pytest.CaptureFixture[str]) -> None:
+    """A FreqAI strategy completes train → backtest → gate (BRD §21.3 acceptance).
+
+    Regression test for the exit-2 bug: ``_build_backtest_config`` emitted no
+    ``freqai`` block and ``_build_docker_cmd`` no ``--freqaimodel``, so Freqtrade
+    refused a FreqAI strategy with "freqAI is not enabled" (exit 2). The
+    freqai-config seam now injects both, so ``run_backtest`` on the regressor
+    template trains a LightGBM model and returns a real ``BacktestResult`` — no
+    exception, finite metrics. A negative Sharpe / few trades is a STRATEGY
+    outcome, not a setup error, so we assert completion + metric shape, not
+    profitability.
+
+    Uses a 1-month window deep inside the 730-day cache so FreqAI's
+    ``train_period_days=30`` runway (auto-loaded before ``--timerange``) sits
+    entirely on cached data — confirming the BRD §21.3 secondary window concern
+    is satisfied by the anchored walk-forward (no per-fold runway shortfall).
+    """
+    _skip_if_missing_prereqs()
+
+    # A 30-day window ~6 months back: safely mid-cache, with >>30 days of history
+    # before it for FreqAI training, and clear of the freshest (possibly partial)
+    # candles at the cache's recent end.
+    today = datetime.now(UTC).date()
+    start = today.fromordinal(today.toordinal() - 200)
+    end = today.fromordinal(today.toordinal() - 170)
+    timerange = f"{start.strftime('%Y%m%d')}-{end.strftime('%Y%m%d')}"
+
+    result = await run_backtest(
+        FREQAI_REGRESSOR_PATH,
+        pairs=["BTC/USDT"],
+        timeframe="5m",
+        timerange=timerange,
+        fold_id="freqai-smoke",
+        param_set_id="defaults",
+        timeout_s=900,
+    )
+
+    # Completion + metric shape (NOT profitability — a losing FreqAI strategy is a
+    # valid gauntlet outcome). Reaching here at all means FreqAI was enabled,
+    # trained, and backtested — the exit-2 fix.
+    assert result["fold_id"] == "freqai-smoke"
+    assert result["pair"] == "BTC/USDT"
+    assert isinstance(result["trades"], int) and result["trades"] >= 0
+    assert isinstance(result["is_sharpe"], float)
+    assert result["raw_zip_path"] and Path(result["raw_zip_path"]).exists()
+
+    print(
+        f"\nFreqAI backtest {timerange}: trades={result['trades']} "
+        f"sharpe={result['is_sharpe']:.3f} pf={result['profit_factor']:.3f} "
+        f"max_dd={result['max_dd']:.3f}"
+    )
+    capsys.readouterr()
+
+    cleanup_worker(Path(result["raw_zip_path"]).parent.parent)
 
 
 @pytest.mark.integration

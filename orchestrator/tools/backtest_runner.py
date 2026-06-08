@@ -35,6 +35,12 @@ from typing import Any
 
 from orchestrator.observability.log import get_logger
 from orchestrator.state import BacktestResult
+from orchestrator.tools.freqai_config import (
+    build_freqai_config,
+    extract_class_int,
+    extract_freqai_pins,
+    freqai_model_for,
+)
 
 log = logging.getLogger(__name__)
 
@@ -149,12 +155,37 @@ async def run_backtest(
 
     strategy_class = _extract_strategy_class_name(strategy_path)
 
+    # FreqAI detection (BRD §7.3/§21.3): a strategy exposing a ``freqai_config``
+    # class attribute calls ``self.freqai.start(...)`` and Freqtrade refuses to
+    # run it ("freqAI is not enabled") unless the runtime config carries an
+    # ``enabled`` freqai block + the model is named on the CLI. Build both from
+    # the strategy's §7.3 pins via the shared builder; non-FreqAI strategies leave
+    # both None and the config/cmd are byte-identical to the Stage 3/4 form.
+    freqai_pins = extract_freqai_pins(strategy_path)
+    freqai_block: dict[str, Any] | None = None
+    freqai_model: str | None = None
+    if freqai_pins is not None:
+        label_period = extract_class_int(strategy_path, "label_period_candles")
+        if label_period is None:
+            raise BacktestError(
+                f"FreqAI strategy {strategy_path.name} exposes freqai_config but no "
+                "label_period_candles class attribute; cannot build the freqai config",
+            )
+        freqai_block = build_freqai_config(
+            freqai_pins,
+            timeframe=timeframe,
+            label_period_candles=label_period,
+            identifier=strategy_class,
+        )
+        freqai_model = freqai_model_for(strategy_class)
+
     config = _build_backtest_config(
         strategy_class=strategy_class,
         pairs=pairs,
         timeframe=timeframe,
         stake_amount=stake_amount,
         max_open_trades=max_open_trades,
+        freqai=freqai_block,
     )
     config_path = worker_dir / "config.json"
     config_path.write_text(json.dumps(config, indent=2))
@@ -164,6 +195,7 @@ async def run_backtest(
         timerange=timerange,
         strategy_class=strategy_class,
         fee=fee,
+        freqai_model=freqai_model,
     )
 
     log.info(
@@ -311,6 +343,7 @@ def _build_backtest_config(
     timeframe: str,
     stake_amount: float,
     max_open_trades: int,
+    freqai: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Construct the minimum Freqtrade config to backtest.
 
@@ -319,8 +352,14 @@ def _build_backtest_config(
     introduce config-paper.json and config-live.json under
     ``user_data/configs/`` for the long-lived spawns; this backtest config
     is per-worker and deliberately ephemeral.
+
+    ``freqai`` is the runtime ``freqai`` block (from
+    :func:`orchestrator.tools.freqai_config.build_freqai_config`) and is injected
+    ONLY for FreqAI strategies (BRD §7.3/§21.3). For a non-FreqAI strategy it is
+    ``None`` and the returned config is byte-identical to the Stage 3/4 form —
+    a FreqAI strategy without it errors "freqAI is not enabled" (exit 2).
     """
-    return {
+    config: dict[str, Any] = {
         "max_open_trades": max_open_trades,
         "stake_currency": "USDT",
         "stake_amount": stake_amount,
@@ -355,6 +394,9 @@ def _build_backtest_config(
         "dataformat_ohlcv": "feather",
         "strategy": strategy_class,
     }
+    if freqai is not None:
+        config["freqai"] = freqai
+    return config
 
 
 def _build_docker_cmd(
@@ -363,6 +405,7 @@ def _build_docker_cmd(
     timerange: str,
     strategy_class: str,
     fee: float | None = None,
+    freqai_model: str | None = None,
 ) -> list[str]:
     """Compose the ``docker run`` argv per the bind-mount invariant.
 
@@ -406,6 +449,11 @@ def _build_docker_cmd(
     ]
     if fee is not None:
         cmd.extend(["--fee", str(fee)])
+    # FreqAI strategies need the model class on the CLI (BRD §21.3). Freqtrade
+    # selects LightGBMRegressor / LightGBMClassifier here; the freqai config block
+    # (in config.json) carries everything else. Omitted for non-FreqAI strategies.
+    if freqai_model is not None:
+        cmd.extend(["--freqaimodel", freqai_model])
     return cmd
 
 
