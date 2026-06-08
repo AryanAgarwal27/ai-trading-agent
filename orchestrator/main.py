@@ -25,12 +25,15 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import json
 import logging
 import os
 import sys
+import uuid
 from collections import defaultdict
 from collections.abc import AsyncIterator
 from contextlib import AsyncExitStack, asynccontextmanager
+from datetime import UTC, datetime
 from functools import partial
 from secrets import compare_digest
 from typing import Any
@@ -51,8 +54,10 @@ from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
 from langgraph.store.postgres.aio import AsyncPostgresStore
 from langgraph.types import Command
 from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
+from orchestrator.agents.generator import load_schema, render_and_validate
+from orchestrator.gates.spawn_vocab import check_spawn_vocabulary
 from orchestrator.graph import build_per_strategy_graph
 from orchestrator.kill_subscription import (
     cancel_kill_subscription,
@@ -78,7 +83,8 @@ from orchestrator.scheduler import (
     register_supervisor_cron,
     shutdown_scheduler,
 )
-from orchestrator.supervisor import run_supervisor
+from orchestrator.security.ast_validator import ASTValidationError
+from orchestrator.supervisor import _insert_registry_row, run_supervisor
 from orchestrator.supervisor_subscription import (
     cancel_supervisor_subscription,
     make_schedule_supervisor_run,
@@ -156,6 +162,28 @@ class SupervisorRunBody(BaseModel):
     """
 
     dry_run: bool = Field(default=False)
+
+
+class ManualValidateBody(BaseModel):
+    """Body of ``POST /strategies/validate`` (Stage 12 Feature 1, BRD §21.2).
+
+    A complete, operator-supplied strategy definition that runs straight through
+    the validation gauntlet — no researcher / generator / critic LLM calls. The
+    ``params`` are validated against the template's co-located Pydantic schema
+    (``load_schema``), the SAME hard constraint the generator's structured output
+    enforces (BRD §8 rule 3 / §1.1 rule 1) — so a hand-supplied param set cannot
+    smuggle a value the LLM path couldn't.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    template: str = Field(description="A shipped template name (∈ SHIPPED_TEMPLATES).")
+    params: dict[str, Any] = Field(
+        description="Concrete SLOT values; validated by load_schema(template).",
+    )
+    pairs: list[str] = Field(description="Trading pairs; a non-empty subset of PAIR_UNIVERSE.")
+    timeframe: str = Field(description="Freqtrade timeframe, e.g. '5m'.")
+    name: str | None = Field(default=None, description="Optional human label.")
 
 
 # ─── Env helpers ───────────────────────────────────────────────────────
@@ -1003,6 +1031,169 @@ async def run_supervisor_endpoint(
         "dry_run": body.dry_run,
         "decision": decision.model_dump(),
     }
+
+
+# ─── POST /strategies/validate (manual strategy injection) ─────────────
+# Background manual-injection graph runs — held so the fire-and-forget validation
+# task is not GC'd mid-run (mirrors supervisor._BACKGROUND_SPAWN_TASKS).
+_MANUAL_INJECT_TASKS: set[asyncio.Task[None]] = set()
+
+
+@app.post("/strategies/validate")
+async def validate_strategy_manual(
+    body: ManualValidateBody,
+    request: Request,
+    token: str = Depends(_require_operator_token),
+) -> dict[str, Any]:
+    """Manually inject a strategy straight into the validation gauntlet (Feature 1).
+
+    BRD §21.2: accept a complete strategy definition (template + explicit params +
+    pairs/timeframe) and run it through the EXISTING validation subgraph —
+    ``prepare_validation_inputs → backtests → gate_backtest → robustness →
+    risk_analyst → paper_gate``, then the paper subgraph on approve — with ZERO
+    researcher / generator / critic LLM calls. This is NOT a gauntlet or HITL
+    bypass: the strategy hits the same BRD §10 gates, the same ``paper_gate``
+    interrupt (resumed via ``POST /threads/{tid}/approve``), and the same 30-day
+    paper clock as an LLM-path strategy.
+
+    Validation order (ALL before any write — a rejection writes NO registry row,
+    BRD §21.1.1/.3):
+
+      1. ``template ∈ SHIPPED_TEMPLATES`` then ``pairs ⊆ PAIR_UNIVERSE`` — the
+         shared D-16 spawn-vocabulary guard
+         (:func:`orchestrator.gates.spawn_vocab.check_spawn_vocabulary`). 422 on
+         a violation (``unknown_template`` / ``pairs_outside_universe``), plus a
+         422 for an empty pair list.
+      2. ``load_schema(template)(**params)`` — 422 + the Pydantic error on a
+         missing slot or out-of-range value (BRD §1.1 rule 1 for manual params).
+      3. ``render_and_validate`` (deterministic, no LLM) writes
+         ``_generated/<sid>.py`` and runs the AST allowlist. 422 if it
+         (defensively) fails — impossible for a shipped template + schema-valid
+         params, but the check stays.
+
+    Then: insert a ``stage="validation"`` registry row
+    (:func:`orchestrator.supervisor._insert_registry_row`), seed the parent graph
+    ``as_node="research_subgraph"`` so its router (``_route_after_research``)
+    advances the non-archived state into the validation subgraph (BRD §21.1.5),
+    and drive the run in a backgrounded ``astream(None)`` wrapped in
+    ``run_context`` + ``trace_config`` (one ``run_id``; BRD §21.1.8). Returns
+    immediately with ``{strategy_id, thread_id, stage}``; the operator watches
+    ``GET /threads`` and approves at ``paper_gate``.
+
+    Token-gated (``X-Operator-Token``) exactly like /approve, /wake, /supervisor/run.
+    """
+    # ── 1. Spawn-vocabulary (shared D-16 guard) — template + pairs. ──
+    if not body.pairs:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail={
+                "reason": "empty_pairs",
+                "message": "pairs must be a non-empty subset of the universe",
+            },
+        )
+    vocab_error = check_spawn_vocabulary(body.template, body.pairs)
+    if vocab_error is not None:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail={"reason": vocab_error.reason, **vocab_error.detail},
+        )
+
+    # ── 2. Param schema — the same hard constraint the generator enforces. ──
+    # template ∈ SHIPPED_TEMPLATES was just confirmed, so load_schema cannot KeyError.
+    schema_cls = load_schema(body.template)
+    try:
+        validated = schema_cls(**body.params)
+    except ValidationError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail={"reason": "params_schema_invalid", "errors": json.loads(exc.json())},
+        ) from exc
+    params = validated.model_dump()
+
+    # ── 3. Deterministic render + AST allowlist (no LLM). ──
+    strategy_id = uuid.uuid4().hex
+    thread_id = f"strategy_{strategy_id}"
+    try:
+        strategy_path = render_and_validate(strategy_id, body.template, params)
+    except ASTValidationError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail={"reason": "ast_validation_failed", "violations": list(exc.violations)},
+        ) from exc
+
+    resolved_name = body.name or f"strategy_{strategy_id[:8]}"
+
+    # ── 4. Registry row (stage="validation") — shared seam; endpoint owns commit. ──
+    conn = await _connect_app_db()
+    try:
+        await _insert_registry_row(
+            conn,
+            strategy_id=strategy_id,
+            thread_id=thread_id,
+            name=resolved_name,
+            template=body.template,
+            pairs=body.pairs,
+            timeframe=body.timeframe,
+            stage="validation",
+        )
+        await conn.commit()
+    finally:
+        await conn.close()
+
+    # ── 5. Seed the parent graph at validation + drive it backgrounded. ──
+    graph = request.app.state.graph
+    thread_locks: defaultdict[str, asyncio.Lock] = request.app.state.thread_locks
+    config = {"configurable": {"thread_id": thread_id}}
+    now_iso = datetime.now(UTC).isoformat()
+    # Seed only real StrategyState channels (BRD §5.7). ``strategy_path`` is NOT a
+    # parent channel — the validation subgraph derives it from
+    # ``artifacts.generated_strategy_path`` in prepare_validation_inputs, exactly
+    # as the research→validation handoff does (the generator sets the same artifact).
+    seed_state: dict[str, Any] = {
+        "strategy_id": strategy_id,
+        "name": resolved_name,
+        "template": body.template,
+        "params": params,
+        "pairs": body.pairs,
+        "timeframe": body.timeframe,
+        # Non-archived → _route_after_research advances to validation_subgraph (BRD §21.1.5).
+        "stage": "validation",
+        "started_at": now_iso,
+        "last_updated": now_iso,
+        "artifacts": {"generated_strategy_path": str(strategy_path)},
+    }
+
+    async with thread_locks[thread_id]:
+        # Seed as_node="research_subgraph": the checkpoint records this as research's
+        # output, so resuming with astream(None) makes the parent router advance the
+        # (non-archived) state straight into validation_subgraph — research is skipped,
+        # the whole downstream gauntlet + HITL path is reused unchanged (BRD §21.1.5).
+        await graph.aupdate_state(config, seed_state, as_node="research_subgraph")
+
+        async def _drive() -> None:
+            try:
+                # One graph execution → one run_id shared by structlog + LangSmith
+                # (BRD §21.1.8), mirroring the spawn / approve / wake paths.
+                with run_context(strategy_id=strategy_id, thread_id=thread_id) as run_id:
+                    traced_config = trace_config(
+                        config,
+                        strategy_id=strategy_id,
+                        thread_id=thread_id,
+                        run_id=run_id,
+                        stage="validation",
+                    )
+                    async for _ in graph.astream(None, config=traced_config):
+                        pass
+            except Exception as exc:  # noqa: BLE001 — background run; surfaces via logs + archived thread
+                logger.error(
+                    "manual-inject: graph run failed strategy_id=%s exc=%s", strategy_id, exc
+                )
+
+        task = asyncio.create_task(_drive())
+        _MANUAL_INJECT_TASKS.add(task)
+        task.add_done_callback(_MANUAL_INJECT_TASKS.discard)
+
+    return {"strategy_id": strategy_id, "thread_id": thread_id, "stage": "validation"}
 
 
 # ─── WS /events ────────────────────────────────────────────────────────
