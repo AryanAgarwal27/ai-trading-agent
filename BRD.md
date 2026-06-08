@@ -797,6 +797,7 @@ At 4–6 strategies per quarter through the full pipeline: **~$100–$200/quarte
 | 9 | Supervisor | runs nightly + on every thread completion; spawns up to capacity; logs decisions |
 | 10 | Observability + DR | LangSmith on; Prometheus scraping Freqtrade APIs; nightly `pg_dump` to off-box; reconciliation script on orchestrator startup |
 | 11 | Hardening | AST validator, structured output, daily loss limit, concentration enforcement, secrets review, port audit |
+| 12 | Manual validation, direct FreqAI, operator UI | see **§21** for the full spec. A hand-supplied strategy (template + explicit params + pairs/timeframe) runs the existing validation gauntlet with **zero researcher/generator/critic LLM calls**; a FreqAI template completes train → backtest → gate (or surfaces a clear FreqAI setup error); the operator can drive every action in the OPERATOR_RUNBOOK from a web UI instead of PowerShell/curl. Decouples strategy CREATION from VALIDATION. |
 
 ### Stage 0 — Spec + tooling
 
@@ -999,6 +1000,18 @@ pip install "langsmith==0.1.*" "prometheus-client==0.21.*" "structlog==24.*"
 
 **DoD:** every checklist item in §15 ticked.
 
+### Stage 12 — Manual validation, direct FreqAI, and operator UI
+
+**Goal:** decouple strategy CREATION from VALIDATION (operator finding: the
+LLM template-fill path produces only losing strategies and burns the 30k-tok/min
+Anthropic tier relearning that, while the validation gauntlet is the system's
+real value). Add an operator UI over the existing API. **Full spec in §21.**
+This stage is SPEC-first per SPEC §4.4 rule 3 — the §21 text lands as a docs
+commit before any implementation.
+
+**DoD:** the three §21 acceptance-criteria blocks (Feature 1 manual injection,
+Feature 2 direct FreqAI spawn, Feature 3 operator UI) are met.
+
 ---
 
 ## 14. Observability
@@ -1098,3 +1111,361 @@ For long-running tests (real Freqtrade backtests over weeks of data), dispatch v
 When in doubt about a LangGraph primitive, prefer the documented v1 agentic pattern (`Send`, `Command`, `interrupt()`, `create_agent`, subgraphs, Store) over sequential edges. Sequential is a fallback, not the default.
 
 Every stage ends with: `git add -A && git commit -m "stage N: <summary>" && git tag stage-N-complete && git push --tags`.
+
+---
+
+## 21. Stage 12 — Manual validation, direct FreqAI spawn, and operator UI
+
+> **Status: SPEC ONLY.** This section is the contract we build Stage 12 from.
+> It introduces NO code. Per SPEC §4.4 rule 3 it lands as a standalone docs
+> commit; implementation lands in later commits, each gated on this spec.
+>
+> **Numbering note:** the operator brief suggested "§19", but §19 (Subagents)
+> and §20 (Where to start) already exist — this section is §21 to avoid
+> renumbering and breaking cross-references.
+
+### 21.0 Motivation (operator findings from the first real runs)
+
+The build is complete and tagged (`stage-0`…`stage-11-complete`); running it
+surfaced a clear split (recorded in `OPERATOR_RUNBOOK.md` §6):
+
+- The **validation gauntlet works perfectly** — 6-fold walk-forward + the
+  backtest/robustness gates correctly reject bad strategies. That is the
+  system's real value.
+- The **LLM creation path is the bottleneck**: ~6 strategies spawned, **0
+  passed**; the completed `mean_reversion` runs all had badly negative Sharpe,
+  and **both FreqAI runs never completed** (died on the 30k-tok/min Anthropic
+  429, never reaching a backtest). Re-running the researcher→generator→critic
+  chain re-spends tokens to relearn the same losing lesson.
+
+Stage 12 therefore **decouples strategy CREATION from VALIDATION**: let the
+operator feed a strategy straight into the proven gauntlet (Feature 1), force a
+specific template so FreqAI can finally be exercised (Feature 2), and drive it
+all from a UI instead of PowerShell/curl (Feature 3). None of this changes the
+gauntlet, the gates (BRD §10), or the HITL contract (§1.1 rule 3) — only how a
+strategy ENTERS the pipeline.
+
+**What does not change (non-negotiables still hold):** §1.1 rule 1 (templates +
+Pydantic-validated param slots only — manual params are validated against the
+SAME schema), rule 2 (only Freqtrade trades), rule 3 (paper_gate / live_gate are
+real `interrupt()` gates — manual-injected strategies stop at them like any
+other), rules 4–7. Manual injection is a CREATION shortcut, not a gauntlet or
+HITL bypass.
+
+### 21.1 Shared design notes (apply to all three features)
+
+These are reused seams the features build on; the spec calls them out once here.
+
+1. **D-16 spawn-vocabulary guards (reuse, do not re-derive).** Template validity
+   = membership in `orchestrator.agents.generator.SHIPPED_TEMPLATES`
+   (`{mean_reversion_template, freqai_classifier_template,
+   freqai_regressor_template}`, BRD §8.1). Pair validity = subset of
+   `orchestrator.supervisor._PAIR_UNIVERSE` (the SPEC §1 Q2 universe). These are
+   exactly the checks `aspawn_strategy` runs (orchestrator/supervisor.py, D-16).
+   Stage 12 should **factor the two guards into one shared validator** (e.g.
+   `orchestrator/gates/spawn_vocab.py`) that both `aspawn_strategy` and the new
+   manual-inject endpoint call, so there is one definition, not two. Same
+   no-write contract on rejection: reject the whole request, write no registry
+   row (mirrors the `aspawn_strategy` refusal contract).
+
+2. **Deterministic render path (reuse the generator MINUS the LLM).**
+   `generator_node` (orchestrator/agents/generator.py) is already split: the
+   only LLM call is `_default_params_extractor` (Sonnet structured output that
+   FILLS the params); everything after it is deterministic —
+   `render_template(source, params)` → write `_generated/<sid>.py` →
+   `validate_strategy_source()` (AST allowlist). Stage 12 should **factor that
+   deterministic tail into a shared helper** (e.g.
+   `render_and_validate(strategy_id, template, params) -> path`) that
+   `generator_node` and the manual-inject path both call. Manual injection runs
+   this helper with operator-supplied params and **never constructs the
+   extractor**, so it makes zero generator LLM calls.
+
+3. **Param schema is the hard constraint either way.** The generator validates
+   LLM output against `load_schema(template)` (the co-located Pydantic
+   `Field(ge=, le=)` schema, BRD §8 rule 3). Manual injection validates the
+   OPERATOR's params the same way: `load_schema(template)(**params)` — a missing
+   slot or out-of-range value raises and the request is rejected (HTTP 422) with
+   the Pydantic error. This is §1.1 rule 1 holding for hand-supplied params.
+
+4. **Registry insert (reuse).** `aspawn_strategy` already INSERTs the
+   `strategy_registry` row (identity + template + pairs + timeframe + stage).
+   Factor a shared `_insert_registry_row(...)` so the manual paths reuse it; the
+   only difference is the seeded `stage` (manual injection seeds `validation`,
+   not `research`) and that `template` is the real chosen template, never the
+   `pending` sentinel.
+
+5. **Entering the parent graph at the validation stage (the load-bearing
+   mechanism).** The parent per-strategy graph (orchestrator/graph.py) is
+   `START → research_subgraph → validation_subgraph → paper_subgraph →
+   live_subgraph`, with `_route_after_research(state)` returning `"validation"`
+   for any non-archived state. To run a strategy through validation onward
+   WITHOUT executing research, seed the checkpoint as if research had just
+   produced its output and resume:
+
+   ```
+   # (spec pseudocode — NOT to implement in this commit)
+   config = {"configurable": {"thread_id": f"strategy_{sid}"}}
+   await graph.aupdate_state(config, seed_state, as_node="research_subgraph")
+   async for _ in graph.astream(None, config=traced_config):  # backgrounded
+       ...
+   ```
+
+   `seed_state` carries everything the validation subgraph reads:
+   `strategy_id, name, template, params, pairs, timeframe`, `strategy_path` +
+   `artifacts["generated_strategy_path"]` (so `prepare_validation_inputs` /
+   `backtest_worker` find the rendered file — orchestrator/subgraphs/validation.py),
+   `stage` left non-archived, `started_at`/`last_updated`, `artifacts={…}`.
+   Because `_route_after_research` then routes to `validation_subgraph`, the run
+   **reuses the entire downstream path** — validation → `paper_gate` (HITL) →
+   paper subgraph → `live_gate` (HITL) → live — identical gates and gauntlet.
+   Within the validation subgraph the first node executed is
+   `prepare_validation_inputs`; the conceptual entry point is the edge
+   `research_subgraph → validation_subgraph`.
+
+   *Fallback if `as_node=` seeding proves fragile:* add an injection-only
+   conditional entry (`START → validation_subgraph` when an `injected=True` flag
+   is set in the initial state), guarded so the production research path is
+   untouched. Recommend the `as_node` seed first (no graph-topology change).
+
+6. **Backgrounding + return shape.** Validation runs 6 folds × backtests
+   (minutes) plus robustness; the spawn must be a fire-and-forget asyncio task
+   exactly like `_default_spawn_thread_fn` (orchestrator/supervisor.py). The new
+   endpoints return immediately with `{strategy_id, thread_id, stage}`; the
+   operator then watches `GET /threads` and approves `paper_gate` via the
+   existing `POST /threads/{tid}/approve`.
+
+7. **Auth (reuse).** Every new write endpoint is guarded by the existing
+   `_require_operator_token` dependency (`X-Operator-Token`, SPEC §6 2026-05-27),
+   identical to `/approve`, `/wake`, `/supervisor/run`, and takes the same
+   per-thread `asyncio.Lock` for resume/race safety.
+
+8. **Observability (reuse).** Each manual run is one graph execution — wrap it in
+   `run_context(...)` + `trace_config(...)` (Stage 10c/10d) like the existing
+   spawn/approve/wake paths so its structlog lines and LangSmith trace share one
+   `run_id`. No new telemetry table.
+
+---
+
+### 21.2 Feature 1 — Manual strategy injection
+
+**Goal.** Let the operator submit a complete strategy definition (template +
+explicit params + pairs/timeframe) and run it straight through the EXISTING
+validation subgraph (`prepare_validation_inputs → plan_backtests → backtest_worker
+×folds → aggregate_results → gate_backtest → plan_robustness → … → risk_analyst
+→ paper_gate`, then the paper subgraph on approve), **bypassing the LLM
+researcher + generator + critic entirely**. Cheapest way to test a hypothesis the
+operator already has, and to re-run a strategy without re-spending creation
+tokens.
+
+**Design.**
+
+- **New endpoint:** `POST /strategies/validate` (token-gated). Body:
+  ```jsonc
+  {
+    "template":  "mean_reversion_template",      // ∈ SHIPPED_TEMPLATES
+    "params":    { "rsi_buy_threshold": 22, ... }, // validated by load_schema(template)
+    "pairs":     ["BTC/USDT", "ETH/USDT"],        // ⊆ _PAIR_UNIVERSE
+    "timeframe": "5m",
+    "name":      "manual-bb-stretched"            // optional label
+  }
+  ```
+- **Validation order (all before any write — §21.1.1/.3):**
+  1. `template ∈ SHIPPED_TEMPLATES` (D-16) — else 422 `unknown_template`.
+  2. `pairs ⊆ _PAIR_UNIVERSE` (D-16) — else 422 `pairs_outside_universe`.
+  3. `load_schema(template)(**params)` — else 422 with the Pydantic validation
+     error (missing slot / out-of-range value). This is §1.1 rule 1 for manual
+     params.
+- **Render (no LLM):** call the shared `render_and_validate(strategy_id,
+  template, params)` (§21.1.2) → writes `strategy_templates/_generated/<sid>.py`
+  and runs the AST allowlist. An AST failure → 422 (should be impossible for a
+  shipped template + schema-valid params, but the check stays — defense in depth).
+- **Registry row:** `_insert_registry_row(...)` with `stage="validation"`,
+  `template=<real template>`, the request's pairs/timeframe.
+- **Enter the graph at validation:** seed `as_node="research_subgraph"` and
+  `astream(None)` backgrounded (§21.1.5/.6). Enters at the
+  `research_subgraph → validation_subgraph` edge; first node executed is
+  `prepare_validation_inputs`.
+- **Reused, unchanged:** the whole validation subgraph + its BRD §10 gates, the
+  `paper_gate` `interrupt()` and `POST /threads/{tid}/approve` resume, and the
+  paper/live subgraphs on approval.
+
+**Token cost (precise — do not claim zero).** Researcher (~$0.20), generator
+(~$0.04), and critic (~$0.70) — the bulk of the per-strategy LLM cost and the
+*repeated-relearning* cost — are all skipped. The **one** LLM call left in the
+path is the single `risk_analyst` Opus verdict at the end of validation (~$0.17,
+BRD §12). For a true zero-LLM run (e.g. a pure gate-tuning sweep) the operator
+may optionally inject a deterministic `risk_analyst_fn` stub via the existing
+`build_validation_subgraph` seam; the DEFAULT keeps the real Opus verdict so the
+paper_gate card still shows a rationale (SPEC §4.1).
+
+**Acceptance criteria.**
+1. A hand-supplied param set for a shipped template runs the full 6-fold
+   walk-forward backtest + `gate_backtest` + robustness + `risk_analyst` +
+   `paper_gate` with **zero researcher/generator/critic LLM calls** (verify via
+   the LangSmith trace / structlog: no `researcher`/`generator`/`critic` node
+   events for the thread).
+2. On `paper_gate` approve, the thread spawns paper exactly as an LLM-path
+   strategy does (same `paper_spawn`, same 30-day clock).
+3. An unknown template or an out-of-universe pair is rejected at the endpoint
+   (D-16) with **no registry row written**; schema-invalid params return 422
+   with the Pydantic error and no row.
+
+---
+
+### 21.3 Feature 2 — Direct FreqAI spawn
+
+**Goal.** Spawn a strategy on a SPECIFIC template (`freqai_regressor_template` /
+`freqai_classifier_template`) directly, **bypassing the supervisor/researcher
+template choice**, so the operator can finally test whether FreqAI trains and
+runs — it has never completed (always died on the rate limit or the researcher
+picked `mean_reversion` instead).
+
+**Key fact that shapes the design.** FreqAI model training happens *inside*
+`freqtrade backtesting` (the `backtest_worker` subprocess trains per-pair models
+when the template enables FreqAI). So FreqAI is exercised by the **validation
+backtest**, regardless of whether research ran. Two paths expose it:
+
+- **Path A — FreqAI via Feature 1 (recommended FIRST FreqAI smoke).** Submit a
+  FreqAI template + a hand-supplied param set to `POST /strategies/validate`
+  (Feature 1). Zero LLM, no rate-limit exposure (directly fixes the "died on the
+  429" failure), and it runs the FreqAI training inside the very first backtest
+  fold. This is the cheapest answer to "does FreqAI train at all."
+
+- **Path B — forced-template research spawn.** When the operator wants the
+  researcher to FILL the FreqAI params (hypothesis-grounded) but not to CHOOSE
+  the template: `POST /strategies/spawn` with `{template: "freqai_regressor_template",
+  force_template: true, pairs?, timeframe?}`. Mechanism: reuse
+  `aspawn_strategy(template=…)` (which already D-16-validates the template and
+  seeds the registry row), and add a `force_template` flag carried into the
+  initial `StrategyState` that `researcher_node` honors — the researcher still
+  proposes hypothesis + `suggested_param_ranges`, but its `template_name` degree
+  of freedom is **pinned** to the operator's choice before `generator` runs (a
+  small new seam: today `ResearchProposal.template_name` is the only template
+  source). Cost: normal research LLM cost, but the template is guaranteed.
+
+  Recommend exposing both via the UI; default the operator to Path A for the
+  first FreqAI proof-of-life, Path B when they want LLM-filled FreqAI params.
+
+**Design check — wire/verify the FreqAI backtest path.** Because no FreqAI run
+has ever completed, the spec must confirm (not assume) that the validation
+backtest actually runs Freqtrade with FreqAI enabled:
+- the FreqAI Docker image (`freqtradeorg/freqtrade:stable_freqai`, BRD §4) is the
+  one the `backtest_runner` subprocess uses;
+- the rendered config carries a `freqai_config` block with the BRD §7.3 pins
+  (`train_period_days`, `backtest_period_days`, `live_retrain_hours`,
+  `expiration_hours`, `feature_parameters.DI_threshold`,
+  outlier rejection) — these are required, no defaults;
+- the walk-forward window (`prepare_validation_inputs` / `walk_forward_from_cache`)
+  leaves enough history for FreqAI's `train_period_days` + `backtest_period_days`
+  ahead of the first OOS fold (a FreqAI model needs a training window the pure-TA
+  template does not). If the current planner's window is too short for FreqAI,
+  that is a concrete sub-item to fix in Stage 12 implementation.
+A genuine FreqAI setup error (missing `freqai_config`, image mismatch, training
+failure) must land in the thread's `failure_reason` / logs as a CLEAR message —
+not a silent hang and not a generic 429.
+
+**Acceptance criteria.**
+1. A FreqAI strategy (regressor or classifier), spawned with its template pinned
+   (Path A or B), **completes the full gauntlet train → backtest → gate** and
+   reports its per-fold metrics (Sharpe / profit factor / drawdown) into
+   `gate_decisions["backtest"]` — whether it passes or fails the gate.
+2. **OR** it surfaces a CLEAR FreqAI setup error (model training failure / missing
+   `freqai_config` / image mismatch) in `failure_reason` and the structlog/
+   LangSmith trace — distinguishable from a rate-limit death.
+3. The template the operator named is the template that actually ran (verify the
+   rendered `_generated/<sid>.py` is the FreqAI template, not `mean_reversion`).
+
+---
+
+### 21.4 Feature 3 — Operator frontend (UI) over the existing API
+
+**FIRST: what the existing dashboard already does** (`dashboard/app.py`, the
+Stage 6 Streamlit dashboard — inspected for this spec). **Do not re-spec UI for
+anything in this list.**
+
+- Streamlit app; polls a SINGLE endpoint `GET /threads` (which embeds each
+  thread's pending interrupt payload). Token in `OPERATOR_TOKEN` env.
+- **Threads LIST view** (`render_threads_list`): a table of every registry row —
+  columns `strategy_id`, `stage`, `last updated`, `HITL`. Threads with a pending
+  interrupt sort to the top with a **Review** button; surfaces
+  `"waiting · live slot occupied"` (D-9). Autorefresh on (5 s) so new HITL events
+  appear without a manual refresh.
+- **HITL CARD views** (the operator's approve/reject surface, SPEC §4.1 layout —
+  rationale prominent, metrics collapsible):
+  - `paper_gate` card — `risk_analyst` rationale + verdict/confidence chips +
+    collapsible backtest/robustness metrics.
+  - `live_gate` card — `paper_monitor` rationale + paper-vs-backtest metrics.
+  - `live_pause_review` card — coordinator path (coordinator rationale + the
+    three reviewer-vote chips) and the kill-switch path (distinct red
+    `kill_switch_card`, acknowledge-only).
+  - All approve/reject go through `_render_approve_reject_form` → `POST
+    /threads/{tid}/approve` with notes + `X-Operator-Token`.
+
+So the dashboard **already covers**: the live thread table (stage + HITL state)
+and the approve/reject HITL controls at all three gates. The §4.1 rationale
+layout is done.
+
+**What it does NOT cover (the F3 gap):**
+- No way to **trigger a supervisor run** (no button → `POST /supervisor/run`).
+- No **manual-inject** form (Feature 1).
+- No **direct FreqAI spawn** form (Feature 2).
+- No **metrics columns** (Sharpe / drawdown) in the thread table — metrics exist
+  ONLY inside the gate cards' collapsible JSON (read from the interrupt payload),
+  never as a sortable at-a-glance column, and never sourced from `/metrics` or
+  `telemetry`.
+- No operator-initiated **pause/stop** (v1 has no such endpoint — see below).
+- No **wake** button (APScheduler drives `/wake`; that is correct — leave it).
+
+**Recommendation: EXTEND the existing Streamlit dashboard. Do NOT build a new
+frontend.** Rationale:
+- It already implements the hardest part — the SPEC §4.1 HITL card rendering
+  (incl. the kill-switch variant), the single-poll `/threads` data model, and the
+  token-gated approve flow — all tested.
+- Streamlit 1.40+ is the BRD §4-pinned UI; this is a single-operator,
+  loopback/WireGuard deployment (BRD §15) that does not warrant an SPA.
+- A second frontend would duplicate the HITL surface for zero operator benefit
+  and double the maintenance / auth surface.
+
+**New UI surfaces to add (all driving existing or Feature-1/2 endpoints):**
+
+| UI element | Drives | Exists vs new |
+|---|---|---|
+| "Run supervisor" button (+ `dry_run` toggle) | `POST /supervisor/run` | endpoint EXISTS; UI NEW |
+| "Manual inject" form: template dropdown (`SHIPPED_TEMPLATES`), params (schema-driven fields from `load_schema`, or a JSON textarea for v1), pairs multiselect (`_PAIR_UNIVERSE`), timeframe | `POST /strategies/validate` (Feature 1) | endpoint NEW (F1); UI NEW |
+| "Direct FreqAI spawn" form: template dropdown limited to `freqai_*`, Path A (params) or Path B (`force_template`) | `POST /strategies/validate` (Path A) / `POST /strategies/spawn` (Path B) (Feature 2) | endpoint NEW (F2); UI NEW |
+| Thread-table **Sharpe + max-drawdown** columns | enriched `GET /threads` (see below) | data source NEW; UI NEW |
+| Approve / reject at every gate | `POST /threads/{tid}/approve` | EXISTS — keep |
+
+**The one genuinely-new backend bit for F3 — metrics in the table.** Sharpe /
+drawdown are not in `GET /threads` today. `list_threads` already calls
+`graph.aget_state(config)` per thread; extend it to also pull the best param
+set's `sharpe_is` / `profit_factor` / `max_dd` from
+`snapshot.values["gate_decisions"]["backtest"]` (already in the checkpoint — no
+new query) for validated/paper threads, and for live/paper containers read the
+in-orchestrator Freqtrade exporter (`collect_freqtrade_metrics`, Stage 10e.2) or
+the Prometheus `/metrics` it feeds. Recommend embedding the backtest summary into
+the existing `/threads` payload (cheapest — one endpoint, no new query) and
+sourcing live P&L/drawdown from the exporter.
+
+**On "pause" controls (clarification, not a silent gap).** v1 has **no
+operator-initiated pause**: per BRD §5.6 a `live_pause` is produced only by the
+coordinator vote or the out-of-band kill switch, and per SPEC §4.3 every
+`live_pause` is HITL with no auto-resume. The dashboard already surfaces those
+`live_pause_review` cards. If the operator wants a manual "pause/stop this live
+strategy" button, that is a NEW `POST /threads/{tid}/pause` endpoint calling
+Freqtrade `/api/v1/stop` and routing the thread to `live_pause` — flag it as a
+small, optional addition for F3 (not required by the acceptance criterion, which
+is parity with the *current* CLI workflow, and the CLI has no pause either).
+
+**Acceptance criteria.** From the UI alone, the operator can do everything the
+OPERATOR_RUNBOOK currently does via PowerShell/curl:
+1. Trigger a supervisor run (with `dry_run` toggle).
+2. Manually inject a validated strategy (Feature 1) and see it appear in the
+   thread table at `stage="validation"`.
+3. Directly spawn a FreqAI template (Feature 2).
+4. See a live thread table with stage **plus** Sharpe and max-drawdown.
+5. Approve / reject at every HITL gate (already works).
+
+No remaining operator action requires dropping to PowerShell/curl for routine
+operation (DB-level dead-thread cleanup, OPERATOR_RUNBOOK §5.2, stays a CLI/admin
+task — out of scope for F3).
