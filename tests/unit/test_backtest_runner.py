@@ -98,7 +98,11 @@ def test_build_backtest_config_injects_freqai_block_only_as_extra_key() -> None:
     """Passing a freqai block adds exactly the ``freqai`` key — nothing else
     in the config changes versus the non-FreqAI form."""
     base = br._build_backtest_config(
-        strategy_class="X", pairs=["BTC/USDT"], timeframe="5m", stake_amount=100.0, max_open_trades=4
+        strategy_class="X",
+        pairs=["BTC/USDT"],
+        timeframe="5m",
+        stake_amount=100.0,
+        max_open_trades=4,
     )
     block = {"enabled": True, "identifier": "X"}
     with_freqai = br._build_backtest_config(
