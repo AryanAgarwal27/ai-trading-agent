@@ -87,6 +87,53 @@ SLOT_LINE_RE = re.compile(
 )
 
 
+# ─── Deterministic render+validate tail (shared seam, BRD §21.1.2) ─────
+
+
+def render_and_validate(
+    strategy_id: str,
+    template: str,
+    params: dict[str, Any],
+    *,
+    generated_dir: Path | None = None,
+) -> Path:
+    """Render a template's SLOT params, write the file, AST-validate it.
+
+    This is the DETERMINISTIC tail of ``generator_node`` factored out so BOTH
+    the research-path generator AND the manual-injection endpoint (BRD §21.2)
+    run ONE definition — no LLM call lives here (the param extraction stays in
+    ``generator_node``; manual injection supplies its own validated params).
+
+    Steps: load ``strategy_templates/<template>.py`` → ``render_template`` the
+    given ``params`` → write ``_generated/<strategy_id>.py`` → run the Stage 5a
+    AST allowlist (:func:`validate_strategy_source`). Returns the written path.
+
+    Raises:
+        FileNotFoundError: the template does not exist.
+        ASTValidationError: the rendered source violates the AST allowlist. The
+            file is STILL written before the raise — so the caller (the critic
+            loop, or the operator) can inspect exactly what was rejected; the
+            exception carries ``.violations``.
+
+    ``render_template`` is referenced as the module global so the existing
+    monkeypatch-the-render test path keeps working.
+    """
+    out_dir = generated_dir or GENERATED_DIR
+    template_path = TEMPLATES_DIR / f"{template}.py"
+    if not template_path.exists():
+        raise FileNotFoundError(f"Template not found: {template_path}")
+    template_source = template_path.read_text(encoding="utf-8")
+
+    rendered = render_template(template_source, params)
+
+    out_dir.mkdir(parents=True, exist_ok=True)
+    out_path = out_dir / f"{strategy_id}.py"
+    out_path.write_text(rendered, encoding="utf-8")
+
+    validate_strategy_source(rendered, filename=str(out_path))
+    return out_path
+
+
 # ─── Injection seam for the LLM call ───────────────────────────────────
 # Tests pass a stub that returns a pre-built Pydantic instance; the real
 # default builds the Sonnet 4.6 structured-output call below.
@@ -350,17 +397,17 @@ async def generator_node(
     params_instance = await extractor(proposal, template_source, schema_cls)
     params = params_instance.model_dump()
 
-    rendered = render_template(template_source, params)
-
-    out_dir.mkdir(parents=True, exist_ok=True)
-    out_path = out_dir / f"{strategy_id}.py"
-    out_path.write_text(rendered, encoding="utf-8")
-
     base_artifacts = state.get("artifacts") or {}
 
     try:
-        validate_strategy_source(rendered, filename=str(out_path))
+        # The deterministic render→write→AST tail is the shared seam (BRD
+        # §21.1.2); only the param SOURCE (the Sonnet extractor above) differs
+        # from the manual-injection path.
+        out_path = render_and_validate(strategy_id, template_name, params, generated_dir=out_dir)
     except ASTValidationError as exc:
+        # render_and_validate still wrote the file before raising — reconstruct
+        # its path so the operator + critic loop can inspect what was rejected.
+        out_path = out_dir / f"{strategy_id}.py"
         return {
             "params": params,
             "stage": "archived",
@@ -396,8 +443,7 @@ async def generator_node(
                 "verdict": "pass",
                 "rationale": (
                     f"Rendered {template_name} with "
-                    f"{len(params)} param(s) → {out_path.name} "
-                    f"({len(rendered.encode('utf-8'))} bytes); AST-clean."
+                    f"{len(params)} param(s) → {out_path.name}; AST-clean."
                 ),
                 "confidence": 1.0,
             },

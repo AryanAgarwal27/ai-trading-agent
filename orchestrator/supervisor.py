@@ -75,6 +75,11 @@ from langgraph.store.base import BaseStore
 from pydantic import BaseModel, ConfigDict, Field
 
 from orchestrator.agents.generator import SHIPPED_TEMPLATES
+from orchestrator.gates.spawn_vocab import (
+    DEFAULT_PAIRS,
+    PAIR_UNIVERSE,
+    check_spawn_vocabulary,
+)
 from orchestrator.gates.thresholds import MAX_CONCURRENT_STRATEGIES
 from orchestrator.observability.events import (
     _connect_app_db,
@@ -108,13 +113,10 @@ _AUDIT_SOURCE = "supervisor_decision"
 # The researcher node overwrites ``template`` in graph state once it chooses
 # one; the registry seed is "pending" until ``sync_registry_stage`` mirrors the
 # chosen value back per the mirror contract below (D-10, closed Stage 10f).
-_DEFAULT_PAIRS: tuple[str, ...] = ("BTC/USDT", "ETH/USDT", "SOL/USDT", "BNB/USDT")  # SPEC §1 Q2
-# The pair universe (SPEC §1 Q2) — the spawn-vocabulary whitelist for pairs,
-# derived from _DEFAULT_PAIRS so the two never drift. A spawn naming any pair
-# outside this set has no cached OHLCV / Binance whitelist entry and is rejected
-# at the spawn boundary (D-16). Single source of truth = _DEFAULT_PAIRS above;
-# the template whitelist is generator.SHIPPED_TEMPLATES (BRD §8.1).
-_PAIR_UNIVERSE: frozenset[str] = frozenset(_DEFAULT_PAIRS)
+# DEFAULT_PAIRS / PAIR_UNIVERSE (SPEC §1 Q2) + the spawn-vocabulary gate now live
+# in orchestrator.gates.spawn_vocab (D-16, BRD §21.1.1) so aspawn_strategy AND the
+# manual-injection endpoint (BRD §21.2) share ONE definition; imported above. The
+# template whitelist is generator.SHIPPED_TEMPLATES (BRD §8.1).
 _DEFAULT_TIMEFRAME = "5m"
 _PENDING_TEMPLATE = "pending"
 _RETIRE_REASON = "retired_by_supervisor"
@@ -527,6 +529,50 @@ SUPERVISOR_TOOLS = READ_TOOLS + [list_strategies]
 # writes + the telemetry row into one transaction.
 
 
+# Seed stages a registry row may be inserted at (BRD §21.1.4). ``aspawn_strategy``
+# seeds "research" (research-first lifecycle); the manual-injection endpoint
+# (BRD §21.2) seeds "validation" (research is skipped). The stage is a controlled
+# internal literal — never request-derived — so embedding it in the INSERT is
+# safe; it is allowlisted here defensively.
+_SEED_STAGES: frozenset[str] = frozenset({"research", "validation"})
+
+
+async def _insert_registry_row(
+    conn: psycopg.AsyncConnection,
+    *,
+    strategy_id: str,
+    thread_id: str,
+    name: str,
+    template: str,
+    pairs: list[str],
+    timeframe: str,
+    stage: str,
+) -> None:
+    """Insert one ``strategy_registry`` row (BRD §21.1.4 — shared seam).
+
+    The single INSERT that BOTH the supervisor spawn and the manual-injection
+    endpoint use, so the registry-row shape can never drift between them.
+    ``stage`` is the only thing that differs between callers (research vs
+    validation) and is allowlisted against :data:`_SEED_STAGES` (a controlled
+    internal literal, not request input). ``ON CONFLICT (strategy_id) DO NOTHING``
+    keeps a re-issued spawn idempotent. Caller owns the connection + transaction;
+    this does NOT commit.
+    """
+    if stage not in _SEED_STAGES:
+        raise ValueError(f"_insert_registry_row: unexpected seed stage {stage!r}")
+    async with conn.cursor() as cur:
+        await cur.execute(
+            f"""
+            INSERT INTO strategy_registry
+              (strategy_id, thread_id, name, template, stage, pairs,
+               timeframe, started_at, last_updated)
+            VALUES (%s, %s, %s, %s, '{stage}', %s, %s, now(), now())
+            ON CONFLICT (strategy_id) DO NOTHING
+            """,
+            (strategy_id, thread_id, name, template, json.dumps(pairs), timeframe),
+        )
+
+
 async def aspawn_strategy(
     spawn_thread_fn: SpawnThreadFn,
     conn: psycopg.AsyncConnection,
@@ -569,34 +615,14 @@ async def aspawn_strategy(
 
     Caller owns the connection + transaction; this does NOT commit.
     """
-    if template is not None and template not in SHIPPED_TEMPLATES:
+    vocab_error = check_spawn_vocabulary(template, pairs)
+    if vocab_error is not None:
         logger.warning(
-            "spawn refused: template=%r not in shipped templates %s "
-            "(D-16 vocabulary gate) — no registry row written",
-            template,
-            sorted(SHIPPED_TEMPLATES),
+            "spawn refused: %s %s (D-16 vocabulary gate) — no registry row written",
+            vocab_error.reason,
+            vocab_error.detail,
         )
-        return {
-            "spawned": False,
-            "reason": "unknown_template",
-            "template": template,
-            "allowed_templates": sorted(SHIPPED_TEMPLATES),
-        }
-    if pairs is not None:
-        invalid_pairs = [p for p in pairs if p not in _PAIR_UNIVERSE]
-        if invalid_pairs:
-            logger.warning(
-                "spawn refused: pairs %s outside the SPEC §1 Q2 universe %s "
-                "(D-16 vocabulary gate) — no registry row written",
-                invalid_pairs,
-                sorted(_PAIR_UNIVERSE),
-            )
-            return {
-                "spawned": False,
-                "reason": "pairs_outside_universe",
-                "invalid_pairs": invalid_pairs,
-                "allowed_pairs": sorted(_PAIR_UNIVERSE),
-            }
+        return {"spawned": False, "reason": vocab_error.reason, **vocab_error.detail}
 
     snapshot = await aget_portfolio_snapshot(conn)
     active = snapshot["active"]
@@ -617,27 +643,19 @@ async def aspawn_strategy(
     thread_id = f"strategy_{strategy_id}"
     resolved_name = name or f"strategy_{strategy_id[:8]}"
     resolved_template = template or _PENDING_TEMPLATE
-    resolved_pairs = pairs if pairs is not None else list(_DEFAULT_PAIRS)
+    resolved_pairs = pairs if pairs is not None else list(DEFAULT_PAIRS)
     resolved_timeframe = timeframe or _DEFAULT_TIMEFRAME
 
-    async with conn.cursor() as cur:
-        await cur.execute(
-            """
-            INSERT INTO strategy_registry
-              (strategy_id, thread_id, name, template, stage, pairs,
-               timeframe, started_at, last_updated)
-            VALUES (%s, %s, %s, %s, 'research', %s, %s, now(), now())
-            ON CONFLICT (strategy_id) DO NOTHING
-            """,
-            (
-                strategy_id,
-                thread_id,
-                resolved_name,
-                resolved_template,
-                json.dumps(resolved_pairs),
-                resolved_timeframe,
-            ),
-        )
+    await _insert_registry_row(
+        conn,
+        strategy_id=strategy_id,
+        thread_id=thread_id,
+        name=resolved_name,
+        template=resolved_template,
+        pairs=resolved_pairs,
+        timeframe=resolved_timeframe,
+        stage="research",
+    )
 
     # Kick the per-strategy graph. Under the runner this seam ENQUEUES the
     # strategy_id; the runner drains the queue AFTER commit so the kicked graph
@@ -854,7 +872,7 @@ _SUPERVISOR_PROMPT += (
     f"- template: OMIT it (preferred — the researcher chooses), or name EXACTLY one "
     f"of: {', '.join(sorted(SHIPPED_TEMPLATES))}. Do NOT invent templates.\n"
     f"- pairs: omit for the default universe, or use a SUBSET of: "
-    f"{', '.join(sorted(_PAIR_UNIVERSE))}. No other pairs exist.\n"
+    f"{', '.join(sorted(PAIR_UNIVERSE))}. No other pairs exist.\n"
 )
 
 
