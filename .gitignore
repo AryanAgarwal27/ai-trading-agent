@@ -89,3 +89,5 @@ tests/integration/_last_*.txt
 backups/
 *.dump
 *.dump.partial
+
+outputs_proxy/

@@ -97,6 +97,10 @@ extend-exclude = [
     # part of the pytest suite; ruff would otherwise flag their import
     # ordering / formatting.
     "scripts/smoke_*.py",
+    # Dev/triage walk-forward proxy (NOT our Freqtrade pipeline; a standalone
+    # simulator for first-pass strategy triage). Same posture as the smoke
+    # probes — not in the pytest suite, not mypy-checked, excluded from lint.
+    "scripts/proxy_walkforward.py",
 ]
 
 [tool.ruff.lint]
