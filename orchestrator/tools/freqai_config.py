@@ -90,6 +90,43 @@ def extract_class_int(strategy_path: Path, attr: str) -> int | None:
     return None
 
 
+def extract_class_bool(strategy_path: Path, attr: str) -> bool | None:
+    """Return a ``bool`` class attribute (e.g. ``can_short``), or None.
+
+    Generic strategy-introspection reader — lives here alongside
+    :func:`extract_class_int` / :func:`extract_class_number` (the module's other
+    AST class-attribute readers) rather than in its own module. Used by the
+    backtest runner / lookahead / paper_spawn to detect ``can_short = True``
+    (Stage 13 Phase 1, BRD §22.1) the same way FreqAI detection reads pins off
+    the rendered strategy — the strategy file is the single source of truth.
+
+    ``ast.literal_eval`` only resolves a literal ``True`` / ``False``; a computed
+    or referenced value returns None (treated as "not statically True" by
+    :func:`strategy_can_short`, which fails closed to long-only).
+    """
+    cls = _class_def(strategy_path)
+    if cls is None:
+        return None
+    for stmt in cls.body:
+        value = _assigned_value(stmt, attr)
+        if value is not None:
+            parsed = ast.literal_eval(value)
+            return parsed if isinstance(parsed, bool) else None
+    return None
+
+
+def strategy_can_short(strategy_path: Path) -> bool:
+    """True iff the strategy class statically sets ``can_short = True``.
+
+    The single source of truth for "is this a short-capable strategy" (BRD
+    §22.1). Fails CLOSED: anything other than a literal ``True`` — absent
+    attribute, ``False``, or a non-literal expression — is long-only. Reading
+    the (rendered) strategy file keeps this in lockstep with what Freqtrade
+    actually runs, exactly like the FreqAI ``extract_freqai_pins`` detection.
+    """
+    return extract_class_bool(strategy_path, "can_short") is True
+
+
 def extract_class_number(strategy_path: Path, attr: str) -> int | float | None:
     """Return an int OR float class attribute, or None.
 

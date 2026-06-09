@@ -40,6 +40,7 @@ from orchestrator.tools.freqai_config import (
     extract_class_int,
     extract_freqai_pins,
     freqai_model_for,
+    strategy_can_short,
 )
 
 log = logging.getLogger(__name__)
@@ -184,6 +185,14 @@ async def run_backtest(
         )
         freqai_model = freqai_model_for(strategy_class)
 
+    # Short detection (BRD §22.1, Stage 13 Phase 1): a strategy that sets
+    # ``can_short = True`` needs a FUTURES backtest config — Freqtrade only
+    # evaluates enter_short/exit_short in futures/margin trading mode. The flag
+    # is read off the (rendered) strategy file via the single-source-of-truth
+    # detector, exactly like the FreqAI pins above. A long-only strategy leaves
+    # this False and the config below is byte-identical to the spot form.
+    can_short = strategy_can_short(strategy_path)
+
     config = _build_backtest_config(
         strategy_class=strategy_class,
         pairs=pairs,
@@ -191,6 +200,7 @@ async def run_backtest(
         stake_amount=stake_amount,
         max_open_trades=max_open_trades,
         freqai=freqai_block,
+        can_short=can_short,
     )
     config_path = worker_dir / "config.json"
     config_path.write_text(json.dumps(config, indent=2))
@@ -341,6 +351,22 @@ def _extract_strategy_class_name(strategy_path: Path) -> str:
     )
 
 
+def _to_futures_pair(pair: str) -> str:
+    """Convert a spot pair to its Binance USDⓈ-M perpetual notation.
+
+    Freqtrade futures mode whitelists the settled-perpetual symbol
+    (``BASE/QUOTE:SETTLE``), and the downloaded futures OHLCV is stored under
+    that name — a spot ``BTC/USDT`` whitelist in futures mode finds no data.
+    ``BTC/USDT`` → ``BTC/USDT:USDT`` (USDT-margined). Idempotent: a pair that
+    already carries a ``:settle`` suffix is returned unchanged, so an operator
+    who supplies futures notation directly is not double-suffixed.
+    """
+    if ":" in pair:
+        return pair
+    quote = pair.split("/", 1)[1] if "/" in pair else pair
+    return f"{pair}:{quote}"
+
+
 def _build_backtest_config(
     *,
     strategy_class: str,
@@ -349,6 +375,7 @@ def _build_backtest_config(
     stake_amount: float,
     max_open_trades: int,
     freqai: dict[str, Any] | None = None,
+    can_short: bool = False,
 ) -> dict[str, Any]:
     """Construct the minimum Freqtrade config to backtest.
 
@@ -363,6 +390,17 @@ def _build_backtest_config(
     ONLY for FreqAI strategies (BRD §7.3/§21.3). For a non-FreqAI strategy it is
     ``None`` and the returned config is byte-identical to the Stage 3/4 form —
     a FreqAI strategy without it errors "freqAI is not enabled" (exit 2).
+
+    ``can_short`` (BRD §22.1, Stage 13 Phase 1): when True the strategy emits
+    short signals, which Freqtrade only evaluates in FUTURES trading mode. The
+    config then sets ``trading_mode="futures"`` + ``margin_mode="isolated"`` and
+    converts the pair whitelist to perpetual notation (``BTC/USDT:USDT``).
+    Leverage stays at the Freqtrade 1× default — Phase 1 tests the short SIGNAL,
+    not leverage (a Phase-2 live concern, BRD §22.2). When ``can_short`` is False
+    (the long-only / spot default) EVERY value below is byte-identical to the
+    pre-Stage-13 form: ``trading_mode="spot"``, the spot ``pair_whitelist``, and
+    NO ``margin_mode`` key. This containment is regression-pinned in
+    ``tests/unit/test_backtest_config_futures.py``.
     """
     config: dict[str, Any] = {
         "max_open_trades": max_open_trades,
@@ -371,7 +409,9 @@ def _build_backtest_config(
         "tradable_balance_ratio": 0.99,
         "fiat_display_currency": "USD",
         "timeframe": timeframe,
-        "trading_mode": "spot",  # BRD §1: spot-only
+        # BRD §1 spot-only by default; BRD §22.1 flips to futures ONLY for a
+        # short-capable strategy (backtest evaluation only — no live exposure).
+        "trading_mode": "futures" if can_short else "spot",
         "dry_run": True,
         "cancel_open_orders_on_exit": False,
         "unfilledtimeout": {"entry": 10, "exit": 10},
@@ -390,7 +430,7 @@ def _build_backtest_config(
             "name": "binance",
             "key": "",
             "secret": "",
-            "pair_whitelist": pairs,
+            "pair_whitelist": [_to_futures_pair(p) for p in pairs] if can_short else pairs,
             "pair_blacklist": [],
             "ccxt_config": {"enableRateLimit": True},
             "ccxt_async_config": {"enableRateLimit": True},
@@ -399,6 +439,12 @@ def _build_backtest_config(
         "dataformat_ohlcv": "feather",
         "strategy": strategy_class,
     }
+    if can_short:
+        # Isolated margin caps a position's loss at its own posted margin (the
+        # bounded-loss property Phase 2's live risk model depends on, BRD §22.2);
+        # set here so the backtest mirrors the eventual live mode. Added only on
+        # the futures path so the spot config stays byte-identical.
+        config["margin_mode"] = "isolated"
     if freqai is not None:
         config["freqai"] = freqai
     return config

@@ -30,6 +30,13 @@ import uuid
 from pathlib import Path
 from typing import Any, TypedDict
 
+# Single source of truth for can_short detection (BRD §22.1). freqai_config is a
+# stdlib-only leaf util, so importing this one detector does NOT create the
+# backtest_runner lifecycle coupling this module deliberately avoids (see
+# `_extract_strategy_class_name` below). ``_to_futures_pair`` is inlined instead
+# of imported for the same independence reason — it is a trivial string transform.
+from orchestrator.tools.freqai_config import strategy_can_short
+
 log = logging.getLogger(__name__)
 
 REPO_ROOT = Path(__file__).resolve().parent.parent.parent
@@ -108,7 +115,12 @@ async def run_lookahead_analysis(
 
     strategy_class = _extract_strategy_class_name(strategy_path)
     config_path = worker_dir / "config.json"
-    _write_minimal_config(config_path, pairs=pairs, timeframe=timeframe)
+    # BRD §22.1: a short-capable strategy is lookahead-analysed in the SAME
+    # futures trading mode it will be backtested in (mirrors backtest_runner). If
+    # lookahead ran spot while the backtest runs futures, the bias check would
+    # not cover the short side. Detected off the rendered file (single SoT).
+    can_short = strategy_can_short(strategy_path)
+    _write_minimal_config(config_path, pairs=pairs, timeframe=timeframe, can_short=can_short)
 
     cmd = _build_docker_cmd(
         worker_dir=worker_dir,
@@ -227,13 +239,34 @@ def _build_docker_cmd(
     ]
 
 
+def _to_futures_pair(pair: str) -> str:
+    """``BTC/USDT`` → ``BTC/USDT:USDT`` (Binance USDⓈ-M perpetual notation).
+
+    Inlined copy of ``backtest_runner._to_futures_pair`` — duplicated rather than
+    imported to keep this module independent of backtest_runner (same rationale
+    as ``_extract_strategy_class_name``). Idempotent on an already-suffixed pair.
+    """
+    if ":" in pair:
+        return pair
+    quote = pair.split("/", 1)[1] if "/" in pair else pair
+    return f"{pair}:{quote}"
+
+
 def _write_minimal_config(
     config_path: Path,
     *,
     pairs: list[str],
     timeframe: str,
+    can_short: bool = False,
 ) -> None:
-    """Write a minimal Freqtrade config.json sufficient for lookahead-analysis."""
+    """Write a minimal Freqtrade config.json sufficient for lookahead-analysis.
+
+    ``can_short`` (BRD §22.1): a short-capable strategy is analysed in futures
+    trading mode — ``trading_mode="futures"`` + ``margin_mode="isolated"`` + the
+    pair whitelist in perpetual notation — matching its backtest config. When
+    False (the default) every value is byte-identical to the pre-Stage-13 spot
+    form (``trading_mode="spot"``, ``margin_mode=""``, the spot whitelist).
+    """
     import json
 
     config = {
@@ -245,8 +278,8 @@ def _write_minimal_config(
         "dry_run": True,
         "cancel_open_orders_on_exit": False,
         "timeframe": timeframe,
-        "trading_mode": "spot",
-        "margin_mode": "",
+        "trading_mode": "futures" if can_short else "spot",
+        "margin_mode": "isolated" if can_short else "",
         "unfilledtimeout": {"entry": 10, "exit": 10},
         "entry_pricing": {
             "price_side": "same",
@@ -264,7 +297,7 @@ def _write_minimal_config(
             "secret": "",
             "ccxt_config": {},
             "ccxt_async_config": {},
-            "pair_whitelist": pairs,
+            "pair_whitelist": [_to_futures_pair(p) for p in pairs] if can_short else pairs,
             "pair_blacklist": [],
         },
         "pairlists": [{"method": "StaticPairList"}],
