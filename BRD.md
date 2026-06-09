@@ -26,6 +26,8 @@
 
 **Markets.** Crypto **spot only** on Binance, Bybit, Kraken, or OKX (operator picks one in Stage 0). No futures, no margin, no leverage in v1.
 
+> **SUPERSEDED in part by §22 (Stage 13, 2026-06-09).** The "spot only / no futures, no margin, no leverage" constraint is an *operator-revisable* market-scope choice, not one of the §1.1 safety non-negotiables. §22 adds **short-selling capability** in two gated phases: **Phase 1** lets templates emit short signals and runs them through the validation gauntlet in a **backtest-only futures trading mode** (zero live/real-money exposure) to prove whether shorting has edge; **Phase 2** (only if Phase 1 finds edge) adds **live short execution on Binance futures/margin** behind a hard leverage+stop+liquidation risk model (§22.2). Until Phase 2 ships and is operator-approved, the **live and paper execution paths remain long-only spot** and every §1.1 rule still holds. See §22 for the full contract and build checklist.
+
 **LLM autonomy mode.** *Propose-and-approve.* The LLM autonomously researches, generates parameter sets, runs backtests, runs paper-trade monitoring, and runs live-trade monitoring. A human approves every transition at `paper_gate` and `live_gate`, and reviews every `live_pause`.
 
 ### 1.1 Non-negotiable rules
@@ -801,6 +803,7 @@ At 4–6 strategies per quarter through the full pipeline: **~$100–$200/quarte
 | 10 | Observability + DR | LangSmith on; Prometheus scraping Freqtrade APIs; nightly `pg_dump` to off-box; reconciliation script on orchestrator startup |
 | 11 | Hardening | AST validator, structured output, daily loss limit, concentration enforcement, secrets review, port audit |
 | 12 | Manual validation, direct FreqAI, operator UI | see **§21** for the full spec. A hand-supplied strategy (template + explicit params + pairs/timeframe) runs the existing validation gauntlet with **zero researcher/generator/critic LLM calls**; a FreqAI template completes train → backtest → gate (or surfaces a clear FreqAI setup error); the operator can drive every action in the OPERATOR_RUNBOOK from a web UI instead of PowerShell/curl. Decouples strategy CREATION from VALIDATION. |
+| 13 | Short-selling capability | see **§22** for the full spec (SPEC-only as of 2026-06-09; supersedes the §1 long-only-spot scope). **Phase 1:** templates emit short signals (`can_short=True`, `enter_short`/`exit_short`) and the validation gauntlet evaluates them in a **backtest-only futures trading mode** against the SAME BRD §10 gates — zero live/real-money exposure. **Phase 2 (only if Phase 1 proves edge):** live short execution on Binance futures/margin behind a hard leverage+stop+isolated-margin+liquidation risk model (§22.2). |
 
 ### Stage 0 — Spec + tooling
 
@@ -1472,3 +1475,465 @@ OPERATOR_RUNBOOK currently does via PowerShell/curl:
 No remaining operator action requires dropping to PowerShell/curl for routine
 operation (DB-level dead-thread cleanup, OPERATOR_RUNBOOK §5.2, stays a CLI/admin
 task — out of scope for F3).
+
+---
+
+## 22. Short-selling capability (Stage 13)
+
+> **Status: SPEC ONLY.** This section is the contract Stage 13 is built from.
+> It introduces **NO code** — per SPEC §4.4 rule 3 it lands as a standalone
+> docs commit; implementation lands in later commits, each gated on this spec
+> and on operator review of the full plan.
+>
+> **This section SUPERSEDES the long-only-spot market scope of §1** ("spot
+> only … no futures, no margin, no leverage in v1"). That was an
+> operator-revisable *market-scope* choice — NOT one of the §1.1 safety
+> non-negotiables — and the operator has deliberately revised it (see SPEC §6
+> 2026-06-09). The §1.1 rules (templates-only, Freqtrade-only execution, real
+> HITL gates, ≥30-day paper, separate keys, Postgres-from-day-one, out-of-band
+> kill switch) all still hold and are *extended*, not weakened, by §22.
+
+### 22.0 Why (operator decision)
+
+The validation window is a **bear market** (Nov 2025–May 2026: every SPEC §1 Q2
+pair fell 12–39%, with a ~−25% crash in one fold — SPEC §6 2026-06-09). Every
+long-only strategy tested has failed: the backtest-passing ones fail the
+robustness gate on fee+regime fragility, and the only long-only shape that
+stays positive through a bearish window is a thin, selective regime-filtered
+entry. A long-only spot system structurally *cannot* profit from the dominant
+move of its own validation period (price falling). The operator has decided to
+add **short-selling** so the system can profit in bear regimes, and **accepts
+liquidation risk** in exchange for a calculated-risk management system around
+it (§22.2).
+
+This is a deliberate, contract-level change, split into two phases so that the
+**expensive, dangerous half (live margin execution) is only built if the cheap,
+safe half (backtest validation) first proves shorting has edge.**
+
+- **Phase 1 — short signals in BACKTEST / VALIDATION only.** No live risk, no
+  real money, no futures *execution*. Prove or disprove edge through the SAME
+  gauntlet and gates that judge long strategies.
+- **Phase 2 — LIVE short execution on Binance futures/margin.** Only justified,
+  and only begun, **if Phase 1 finds edge.** This is where the full risk model
+  lives, because this is where real capital can be lost beyond the spot bound.
+
+**Gating rule (non-negotiable):** Phase 2 implementation does not start until
+(a) Phase 1 is shipped and (b) at least one short-capable strategy has cleared
+the full Phase-1 validation gauntlet (passed the BRD §10 gates) on a real
+`POST /strategies/validate` run — i.e. shorting has *demonstrated* edge on
+honest walk-forward, not just been hypothesized. If Phase 1 shows no short
+strategy can pass the gates, Phase 2 is abandoned and the system stays
+long-only spot live.
+
+---
+
+### 22.1 PHASE 1 — short signals in backtest / validation only
+
+**Goal.** Let strategy templates emit short entries/exits (`enter_short` /
+`exit_short`) and have the validation gauntlet (research → 6-fold anchored
+walk-forward backtest → backtest gate → robustness → `risk_analyst` →
+`paper_gate`) evaluate them, **with zero live or real-money exposure and zero
+change to the live execution path.** The only mechanism that changes is the
+*backtest* Freqtrade trading mode; everything that touches real money stays
+long-only spot.
+
+**Design — what changes.**
+
+1. **Template contract (§8) gains a short side.** Today every template hard-sets
+   `can_short = False  # BRD §1: spot-only, long-only` and only writes
+   `enter_long` / `exit_long` columns (e.g.
+   `strategy_templates/mean_reversion_template.py:55`,
+   `bb_regime_reversion_template.py:56`, `donchian_regime_trend_template.py:53`).
+   Phase 1 adds a *new* class of short-capable template whose structural shell
+   sets `can_short = True` and whose `populate_entry_trend` /
+   `populate_exit_trend` may set `enter_short` / `exit_short` (Freqtrade's
+   native short columns) **in addition to** the long columns. The structural
+   shell stays hand-written and untouchable (§8 rule 1); the short-side
+   thresholds become new `# SLOT:` lines. **Existing long-only templates are
+   left exactly as they are** — `can_short = False` is still valid and still the
+   default; short capability is opt-in per template, never a global flip.
+
+2. **Co-located Pydantic schema (§8 rule 3) gains short slots.** A short-capable
+   template's `*_schema.py` adds the short-side fields (e.g. an
+   `rsi_short_threshold`, a short stoploss / take-profit) with the same
+   `Field(ge=, le=)` discipline. `load_schema(template)` and the generator's
+   structured-output extractor fill them exactly like long slots — **no new LLM
+   path, no free-form code** (§1.1 rule 1 holds verbatim).
+
+3. **AST validator (`orchestrator/security/ast_validator.py`) — UNCHANGED.**
+   Verified: shorting needs no new imports (still `talib` / `freqtrade` /
+   `pandas` / `numpy`) and introduces no forbidden name. `enter_short` /
+   `exit_short` are DataFrame column assignments, not imports or calls, so the
+   allowlist + `FORBIDDEN_NAMES` walk passes a short template unchanged. The
+   allowlist intentionally stays as narrow as it is.
+
+4. **Backtest trading mode flips to futures — IN BACKTEST ONLY.** The
+   load-bearing change. `_build_backtest_config`
+   (`orchestrator/tools/backtest_runner.py:374`) hard-codes
+   `"trading_mode": "spot"  # BRD §1: spot-only`. Phase 1 makes this
+   **per-strategy**: a short-capable strategy (template `can_short = True`)
+   renders its backtest config with `"trading_mode": "futures"` +
+   `"margin_mode": "isolated"` and a `leverage` of **1× in Phase 1** (no
+   leverage — a 1× short on futures is the cleanest way to backtest the short
+   *signal* without conflating it with leverage risk, which is a Phase-2
+   concern). A long-only strategy renders byte-identical spot config as today.
+   The same flip must be mirrored in the **lookahead-analysis** config
+   (`orchestrator/tools/lookahead.py:248-249`, currently
+   `"trading_mode": "spot"`, `"margin_mode": ""`) so the §5.3 `lookahead_gate`
+   analyses the strategy in the same mode it will be backtested in — otherwise
+   lookahead runs spot while the backtest runs futures and the bias check is
+   meaningless for the short side.
+
+5. **Futures OHLCV + funding/mark data must exist for the backtest.** A futures
+   backtest needs futures candles (and, for honest P&L, funding-rate + mark-price
+   series). The Stage 3 download (`download-data … --exchange binance`) pulls
+   spot candles only. Phase 1 needs a futures data pull
+   (`download-data --trading-mode futures --candle-types futures funding_rate mark`)
+   for the SPEC §1 Q2 pairs/timeframes. **This is a Docker/data step the operator
+   runs** (operator checkpoint — see checklist).
+
+6. **Gates handle short metrics by being direction-agnostic — confirm, do not
+   assume.** Freqtrade computes Sharpe, profit factor, drawdown, and trade counts
+   from realized trade P&L regardless of trade *direction*, so `gate_backtest`,
+   the OOS/walk-forward gate, and the robustness workers (`monte_carlo_worker`,
+   `regime_worker`, `fee_stress_worker`) operate on the same numbers and apply
+   the **same BRD §10 thresholds unchanged** — that is the whole point (prove
+   short edge against the *same* bar). Two short-specific confirmations the
+   implementation must make: (a) the **fee-stress** worker must include futures
+   *taker* fees (futures fee schedule differs from spot) and (b) **funding cost**
+   must flow into the backtest P&L (Freqtrade futures backtest accounts for
+   funding when the data is present) so a short that only "wins" by ignoring
+   funding bleed fails honestly. No new threshold is added in Phase 1 — if a
+   short strategy can't clear the existing gates, it has no edge.
+
+7. **`risk_analyst` (§5.4) prompt gains short awareness.** The Opus verdict node
+   should note when a strategy's edge comes from the short side and reason about
+   short-specific fragility (funding drag, short squeezes, the asymmetry that a
+   short's loss is unbounded as price rises) — a prompt change, not a gate
+   change. The verdict still routes to `paper_gate` or `archive` exactly as
+   today.
+
+**What STAYS long-only spot in Phase 1 (the containment boundary).**
+
+- **The entire LIVE path is untouched:** `live-base.json`
+  (`"trading_mode": "spot"`, `"margin_mode": ""`), `render_live_config` /
+  `spawn_live_container` (`orchestrator/subgraphs/live.py`), the live stake cap
+  (`capped_stake = min(stake_intent, LIVE_CAPITAL_CAP_USD)`), the kill switch
+  (`orchestrator/scheduler.py`), and the live secrets (`BINANCE_LIVE_API_*`) all
+  stay exactly as shipped. No real-money code path learns the word "short" in
+  Phase 1.
+- **The PAPER path stays long-only spot, and short-capable strategies are
+  BLOCKED from promotion to paper in Phase 1.** `paper-base.json` stays
+  `"trading_mode": "spot"`. A short-capable strategy that *passes* `paper_gate`
+  must NOT spawn into a spot paper container (it cannot short there). Phase 1
+  adds a guard at `paper_spawn` (mirroring the D-9 "block the gate" pattern):
+  if `can_short = True` (or trading_mode would be futures) and Phase 2 is not
+  shipped, refuse promotion and record a clear
+  `gate_decisions["paper_gate"]["status"] = "short_paper_deferred_to_phase2"`
+  hold — the strategy's validation verdict stands as the Phase-1 deliverable,
+  but it does not paper-trade until Phase 2's paper/live margin path exists.
+  This keeps Phase 1 strictly "validation proves edge; nothing executes."
+  *(Open sub-decision flagged for the operator at Phase-1 build time: whether to
+  instead allow a futures **dry-run** paper container — still no real money — so
+  short strategies get a 30-day paper observation before Phase 2. Deferred,
+  because a futures paper container is most of Phase 2's spawn plumbing and
+  belongs with it; see DEFERRED D-21.)*
+
+**Risk model (Phase 1).** Trivial by construction: **zero live exposure, zero
+real money.** A backtest in `trading_mode: "futures"` at 1× leverage with
+`dry_run` is a simulation over historical candles — no exchange order, no
+margin account, no liquidation. The only "risk" is an *honesty* risk — that a
+short backtest overstates edge by mis-accounting fees or funding — which §22.1
+items 6 mitigate (futures fees + funding in P&L) and which the existing
+robustness gate (fee-stress) and the §1.1-rule-4 30-day paper requirement
+(deferred to Phase 2 for shorts) are the backstops for.
+
+**Files / subsystems that change (Phase 1).**
+
+| Subsystem | Change | Contained vs ripples |
+|---|---|---|
+| `strategy_templates/<new short template>.py` + `_schema.py` + `_README.md` | NEW short-capable template(s): `can_short = True`, `enter_short`/`exit_short`, short SLOTs | **Contained** — new files; existing templates untouched |
+| `orchestrator/agents/generator.py` | register new template in `SHIPPED_TEMPLATES` / `_SCHEMA_CLASS_NAMES` (D-16 single-source set) | **Contained** — additive set membership; render/AST tail unchanged |
+| `orchestrator/tools/backtest_runner.py` (`_build_backtest_config`) | `trading_mode`/`margin_mode`/`leverage` become per-strategy (futures+isolated+1× for short-capable; spot otherwise) | **Ripples** — touches the one config builder every backtest uses; long path must stay byte-identical (regression-pin it) |
+| `orchestrator/tools/lookahead.py` | mirror the same per-strategy trading-mode in the lookahead config | **Contained** — same flip, one place |
+| `orchestrator/subgraphs/validation.py` | confirm fee-stress uses futures fees + funding flows into backtest P&L; no threshold change | **Contained** — verification + small config wiring |
+| `orchestrator/agents/risk_analyst.py` (prompt) | short-awareness in the rationale prompt | **Contained** — prompt only |
+| `orchestrator/subgraphs/paper.py` (`paper_spawn` guard) | block short-capable promotion to spot paper in Phase 1 (D-9-style "block the gate") | **Contained** — guard + status field; reuses an existing pattern |
+| `orchestrator/gates/thresholds.py` | **NO change** in Phase 1 (same gates judge short edge) | — |
+| `orchestrator/security/ast_validator.py` | **NO change** (verified — no new imports/names) | — |
+
+**Operator checkpoints (Phase 1).** Downloading futures + funding-rate + mark
+OHLCV via the Freqtrade Docker image, and running the first real
+`POST /strategies/validate` of a short template end-to-end against that data,
+are Docker/data steps **the operator runs** (marked `[OPERATOR]` in the
+checklist). CC writes the code and the templates; the operator pulls the data
+and runs the gauntlet.
+
+**Acceptance criteria (Phase 1).**
+
+1. A short-capable strategy (template `can_short = True`, schema-valid short
+   params) runs the **full validation gauntlet** — research/generator/critic OR
+   `POST /strategies/validate` manual inject (BRD §21 F1), then 6-fold anchored
+   walk-forward backtest in `trading_mode: "futures"` 1× → `gate_backtest` →
+   robustness → `risk_analyst` → `paper_gate` — and **either passes or fails the
+   SAME BRD §10 gates** as a long strategy. The backtest demonstrably executed
+   short trades (verify `enter_short`/`exit_short` trades present in the parsed
+   `BacktestResult`).
+2. **Zero live/real-money exposure:** no live container, no paper container, no
+   futures account touched. A short strategy that passes `paper_gate` halts at
+   the Phase-1 `paper_spawn` guard with `status="short_paper_deferred_to_phase2"`
+   (verify no Freqtrade container spawned).
+3. The long-only path is provably unchanged: an existing long template's
+   rendered backtest config is byte-identical to pre-Stage-13 (regression test
+   on `_build_backtest_config` for a `can_short = False` strategy).
+4. **The Phase-1 verdict is the Phase-2 gate:** the run produces a clear
+   pass/fail record per the gating rule (§22.0). At least one short strategy
+   passing the gates is the precondition to begin Phase 2.
+
+---
+
+### 22.2 PHASE 2 — LIVE short execution (only if Phase 1 finds edge)
+
+> **Precondition (hard):** do not begin Phase 2 implementation until §22.0's
+> gating rule is met — Phase 1 shipped AND ≥1 short strategy has passed the full
+> validation gauntlet. This is the load-bearing half of §22; the risk model
+> below is the reason short-selling is safe to take live at all.
+
+**Goal.** Real short trading on **Binance USDⓈ-M futures (perpetuals),
+isolated margin, conservative leverage**, live, with a risk model under which a
+single position's **maximum loss is bounded by a hard leverage + stop +
+liquidation policy** — restoring the bounded-loss property that spot gave for
+free and that naive margin trading destroys.
+
+**Why the current $500 model breaks under margin (the core problem).** In spot,
+loss is bounded for free: you can only lose what you posted (price floors at 0,
+and the stoploss exits long before that), so `LIVE_CAPITAL_CAP_USD = 500` with
+`capped_stake = min(stake_intent, 500)` (`orchestrator/subgraphs/live.py`) means
+the catastrophic account loss ≈ $500 and a single position's loss ≤ its stake.
+**A short on margin breaks every assumption in that math:**
+
+- A short's loss is **unbounded to the upside** — price can rise arbitrarily,
+  so notional loss has no natural ceiling.
+- With leverage *L*, a posted margin *M* controls notional *N = M·L*; an adverse
+  move of only ≈ `(1/L − maintenanceMarginRate)` **liquidates** the position,
+  losing ~the full margin *M* (isolated) — and under **cross** margin the loss
+  can spill into the rest of the balance and even go **negative** (you owe the
+  exchange), exceeding principal.
+- So `stake_amount` no longer means "max loss." The spot cap math
+  (`min(stake, 500)`) silently under-bounds risk: a $125 margin at 5× is $625
+  notional with a liquidation only ~20% away.
+
+**The risk model (the hard policy that re-bounds single-position loss).** Layered,
+all of these together, so the bound holds even if one layer fails:
+
+1. **Isolated margin, never cross.** `margin_mode: "isolated"` is hard-set in the
+   live futures config and asserted at config-write (mirroring how
+   `render_live_config` hard-asserts `dry_run: false`). Isolated caps a
+   position's loss at *its own posted margin* — a cross-margin liquidation that
+   reaches into the whole balance (and can exceed principal) is **structurally
+   forbidden**, not merely avoided.
+2. **Hard, conservative leverage cap.** New `MAX_LEVERAGE` in
+   `orchestrator/gates/thresholds.py` (operator wants conservative — **propose
+   `MAX_LEVERAGE = 2`, hard ceiling 3**; operator signs off the value, recorded
+   in SPEC §2). Enforced in two places: the strategy's Freqtrade `leverage()`
+   callback returns `min(requested, MAX_LEVERAGE)`, AND the live config /
+   spawn path refuses to start a container whose effective leverage exceeds the
+   cap. Lower *L* pushes the liquidation price further from entry, buying room
+   for the stop to fire first.
+3. **Stop-loss strictly inside the liquidation distance (the load-bearing
+   invariant).** New `MIN_LIQUIDATION_BUFFER_PCT`: the strategy's hard
+   `stoploss` distance must be ≤ a fraction (propose 50%) of the liquidation
+   distance implied by its leverage, so under normal conditions the **stop exits
+   before liquidation** and the realized loss is the (small) stop loss, not the
+   (full-margin) liquidation. At `MAX_LEVERAGE = 2` liquidation is ~50% away; a
+   −5%…−10% stop fires far earlier. A strategy whose stop is *outside* its
+   liquidation buffer is rejected by a new validation/admission gate — it is not
+   allowed to go live.
+4. **Position sizing under margin.** `stake_amount` is reinterpreted as **posted
+   margin**, and the cap is applied to BOTH margin and notional: sum of posted
+   margins ≤ `LIVE_CAPITAL_CAP_USD`, and `notional = margin·leverage` is itself
+   capped so total notional exposure stays within an operator-set multiple of
+   the $500 (propose: total notional ≤ 1×–2× `LIVE_CAPITAL_CAP_USD`, never the
+   uncapped `M·L`). The Binance **futures** minimum notional differs from spot,
+   so the min-notional sanity check (today implicit in the ~$125/position spot
+   math) is recomputed for futures. `MAX_CONCURRENT_LIVE_STRATEGIES = 1` and the
+   stake-subdivision concern already flagged in `thresholds.py` carry straight
+   into this.
+5. **Funding-rate accounting.** Perpetual shorts pay or receive funding every 8h.
+   Live P&L, the daily-loss limit, and the drawdown computation must include
+   accrued funding (a persistent funding bleed can drain a position that the
+   price chart says is flat). The kill-switch drawdown denominator must be
+   *equity including unrealized + funding*, not realized-only.
+6. **Kill switch + drawdown + daily-loss limits rebuilt for margin.** Today
+   `_kill_reason` (`orchestrator/scheduler.py`) fires on `max_drawdown ≥ 0.12`
+   or `consecutive_losses ≥ 10`, polling `/api/v1/profit` + `/trades` every 5
+   min — all premised on bounded spot loss and a slow-moving account. Margin
+   needs:
+   - **A new liquidation-proximity trigger** — the primary new safety. Poll the
+     futures position (`/api/v1/status` carries `liquidation_price`, `leverage`,
+     `isolated`; or the futures `/profit`) and fire `POST /api/v1/forceexit`
+     (or `/stop`) when **mark price comes within `KILL_SWITCH_MARGIN_RATIO` of
+     the liquidation price** (new threshold — propose firing at margin ratio /
+     liquidation-distance well before the exchange would liquidate). Because a
+     5-minute poll can be too slow for a fast adverse move, **the per-trade
+     stoploss-inside-liquidation invariant (item 3) is the primary bound and the
+     kill switch is the secondary net** — the spec must say so explicitly so the
+     poll cadence is never mistaken for the main protection.
+   - **Drawdown / daily-loss computed on margin equity** (item 5), and the 12%
+     global-drawdown + −3% daily-loss limits re-validated for the leverage in
+     use (a 12% account move arrives `L`× faster under leverage).
+   - The kill switch must still run **out-of-band of the graph** (§1.1 rule 7),
+     now also surviving as the liquidation guardian.
+7. **Futures account / API / KYC prerequisites (operator).** A Binance USDⓈ-M
+   **futures** account is separate from spot: it needs its own enablement,
+   derivatives **KYC** (note: SPEC §6 records India regional gating already
+   blocked *spot* API access at KYC level 2 — **futures/derivatives access is
+   typically more restricted and may be unavailable in the operator's
+   jurisdiction; this is a hard operator pre-flight that could block Phase 2
+   entirely**), and a **separate futures API key** with *Futures trading
+   permission enabled* and **withdrawals disabled** (§1.1 rule 5 extended: live
+   futures keys are distinct from both paper and live-spot keys —
+   `secrets.load_live_credentials`' `SecretCollisionError` must be extended to a
+   futures-key triple). The first real futures dry-run and the first tiny live
+   short are operator-run exchange steps.
+8. **HITL gates adapt (still real gates — §1.1 rule 3).** `paper_gate`,
+   `live_gate`, and `live_pause_review` cards (SPEC §4.1) gain short/leverage
+   context: leverage in use, liquidation price + distance, the stop-vs-liquidation
+   buffer, accrued/expected funding, and isolated-margin confirmation, rendered
+   **above** the metrics so the operator approves a live short with the
+   liquidation picture front-and-center. **New explicit risk gates** (validation
+   + live-admission, in `thresholds.py` + the live path):
+   `MAX_LEVERAGE`, `MIN_LIQUIDATION_BUFFER_PCT`, `KILL_SWITCH_MARGIN_RATIO`,
+   `MAX_TOTAL_NOTIONAL` (or a notional multiple of `LIVE_CAPITAL_CAP_USD`), and
+   an `isolated`-margin assertion. A strategy failing any is refused live
+   admission regardless of HITL — HITL can only *reject*, never *override* a hard
+   risk gate (same asymmetry as the kill switch overriding the graph).
+
+**Files / subsystems that change (Phase 2).**
+
+| Subsystem | Change | Contained vs ripples |
+|---|---|---|
+| `freqtrade/user_data/configs/live-base.json` | `trading_mode: "futures"`, `margin_mode: "isolated"`, leverage wiring for short-capable live strategies | **Ripples** — the live contract surface; long-spot live must stay supported (per-strategy, not global) |
+| `orchestrator/subgraphs/live.py` (`render_live_config`, `spawn_live_container`, stake cap) | margin-aware sizing (margin vs notional caps), leverage cap enforcement, isolated assertion, futures key wiring | **Ripples** — the money path; highest-care changes |
+| `orchestrator/gates/thresholds.py` | NEW: `MAX_LEVERAGE`, `MIN_LIQUIDATION_BUFFER_PCT`, `KILL_SWITCH_MARGIN_RATIO`, `MAX_TOTAL_NOTIONAL` | **Contained** — additive constants (recorded in SPEC §2) |
+| `orchestrator/scheduler.py` (`kill_switch_poll_job`, `_kill_reason`, `daily_loss_job`) | liquidation-proximity trigger; drawdown/daily-loss on margin equity incl. funding; futures endpoints | **Ripples** — out-of-band safety; must stay graph-independent |
+| `orchestrator/security/secrets.py` | futures-key triple + extended `SecretCollisionError` (paper ≠ live-spot ≠ live-futures) | **Contained** — extends an existing seam |
+| short-capable templates | Freqtrade `leverage()` callback returning `min(req, MAX_LEVERAGE)`; futures-aware stoploss | **Contained** — per-template method |
+| `dashboard/app.py` + `GET /threads` | leverage / liquidation-distance / funding / isolated context on the HITL cards (SPEC §4.1) | **Contained** — extends existing cards |
+| `orchestrator/subgraphs/paper.py` | replace the Phase-1 `short_paper_deferred_to_phase2` guard with a real futures (dry-run first, then live) paper path | **Ripples** — unblocks what Phase 1 deferred |
+
+**Risk model — acceptance (Phase 2).** A **documented risk model** in which:
+1. a single short position's **maximum loss is bounded** by the hard
+   leverage + stop + isolated-margin policy (isolated margin caps loss at posted
+   margin; the stop sits provably inside the liquidation distance via
+   `MIN_LIQUIDATION_BUFFER_PCT`; leverage ≤ `MAX_LEVERAGE`), and a strategy that
+   cannot satisfy the buffer is refused live admission;
+2. the **kill switch triggers on margin / liquidation proximity** (new
+   `KILL_SWITCH_MARGIN_RATIO` trigger), out-of-band of the graph, on margin
+   equity including funding — and the spec states plainly that the per-trade
+   stop is the primary bound and the poll the secondary net;
+3. **every live short still passes HITL** at `live_gate` with the full
+   leverage/liquidation/funding picture, and no hard risk gate can be overridden
+   by approval;
+4. exchange/KYC/API prerequisites are operator-verified before the first live
+   short (separate futures key, withdrawals disabled, isolated margin, tiny
+   first position).
+
+**Operator checkpoints (Phase 2).** Futures-account enablement + derivatives
+KYC + futures-API-key creation (withdrawals disabled), the first real futures
+dry-run container, and the first tiny live short are all `[OPERATOR]` exchange
+steps. CC builds the risk model, gates, sizing math, kill-switch logic, and
+HITL surfaces; the operator runs every step that touches a real futures account.
+
+---
+
+### 22.3 Build checklist (executable plan — Phase 1 then Phase 2)
+
+Each step is `[CC]` (code — Claude Code does it) or `[OPERATOR]` (Docker /
+real-exchange — operator does it). **No Phase-2 step starts until §22.0's
+gating rule is met.** Each `[CC]` code step follows SPEC §4.4 (SPEC/contract
+edits in their own commit ahead of dependent code) and lands tested.
+
+**PHASE 1 — backtest/validation short capability (no live risk)**
+
+- [ ] **P1-1 `[CC]`** Add a short-capable template (start with one pure-TA
+  shape, e.g. a Bollinger/RSI mean-reversion that also shorts the upper band):
+  new `*_template.py` with `can_short = True`, `enter_short`/`exit_short`,
+  short `# SLOT:`s; co-located `*_schema.py` with short `Field(ge=,le=)` slots;
+  `*_README.md` hypothesis. Existing templates untouched.
+- [ ] **P1-2 `[CC]`** Register the new template in `SHIPPED_TEMPLATES` /
+  `_SCHEMA_CLASS_NAMES` (`orchestrator/agents/generator.py`) — D-16 single
+  source of truth. (Auto-flows into `POST /strategies/validate` and the
+  supervisor vocabulary.)
+- [ ] **P1-3 `[CC]`** Make `_build_backtest_config`
+  (`orchestrator/tools/backtest_runner.py`) per-strategy: `trading_mode:
+  "futures"` + `margin_mode: "isolated"` + `leverage: 1` for `can_short = True`
+  templates; byte-identical spot config otherwise. Regression-pin the long-only
+  output.
+- [ ] **P1-4 `[CC]`** Mirror the same per-strategy trading mode in the
+  lookahead-analysis config (`orchestrator/tools/lookahead.py`).
+- [ ] **P1-5 `[CC]`** Confirm + wire futures fees and funding into the backtest
+  P&L and the `fee_stress_worker` (`orchestrator/subgraphs/validation.py`); no
+  threshold change. Add a test that a short backtest's trades carry funding.
+- [ ] **P1-6 `[CC]`** Add the `paper_spawn` Phase-1 guard
+  (`orchestrator/subgraphs/paper.py`): block short-capable promotion to the
+  spot paper container, record `status="short_paper_deferred_to_phase2"`
+  (D-9-style block-the-gate). Test: short strategy passing `paper_gate` spawns
+  no container.
+- [ ] **P1-7 `[CC]`** Short-awareness in the `risk_analyst` prompt
+  (`orchestrator/agents/risk_analyst.py`).
+- [ ] **P1-8 `[OPERATOR]`** Download Binance **futures** OHLCV + funding-rate +
+  mark data for the SPEC §1 Q2 pairs/timeframes via the Freqtrade Docker image
+  (`download-data --trading-mode futures --candle-types futures funding_rate
+  mark …`). *(Docker / data — operator runs.)*
+- [ ] **P1-9 `[OPERATOR]`** Run the first short template end-to-end through
+  `POST /strategies/validate` against that futures data; confirm short trades
+  executed in the backtest and the run reaches `paper_gate` with a real
+  pass/fail verdict. *(This run is the Phase-2 gate.)*
+- [ ] **P1-10 `[CC]`** Record the Phase-1 result: if a short strategy passed the
+  gates → shorting has edge → Phase 2 is justified (SPEC §6 note). If none
+  passed → Phase 2 is abandoned; system stays long-only spot live.
+
+**PHASE 2 — live short execution (ONLY if P1-9/P1-10 proved edge)**
+
+- [ ] **P2-1 `[OPERATOR]`** Pre-flight: confirm Binance **futures/derivatives**
+  access is available in the operator's jurisdiction and KYC tier (could block
+  Phase 2 entirely). Enable the futures account; create a **separate futures API
+  key** with Futures-trading permission and **withdrawals disabled**. *(Exchange
+  — operator runs.)*
+- [ ] **P2-2 `[CC]`** SPEC §2 + `thresholds.py` (own commit, ahead of code):
+  add `MAX_LEVERAGE` (propose 2, ceiling 3 — operator signs off),
+  `MIN_LIQUIDATION_BUFFER_PCT`, `KILL_SWITCH_MARGIN_RATIO`, `MAX_TOTAL_NOTIONAL`.
+- [ ] **P2-3 `[CC]`** Extend `secrets.py` to a futures-key triple +
+  `SecretCollisionError` (paper ≠ live-spot ≠ live-futures).
+- [ ] **P2-4 `[CC]`** `leverage()` callback on short-capable templates returning
+  `min(requested, MAX_LEVERAGE)`; futures-aware stoploss within the liquidation
+  buffer.
+- [ ] **P2-5 `[CC]`** `live-base.json` + `render_live_config` /
+  `spawn_live_container` (`orchestrator/subgraphs/live.py`): per-strategy
+  `trading_mode: "futures"` + `margin_mode: "isolated"` (asserted), margin-aware
+  sizing (margin + notional caps), leverage-cap + isolated assertions. Long-spot
+  live must stay supported.
+- [ ] **P2-6 `[CC]`** Live-admission risk gate: refuse to admit a strategy whose
+  stop is outside `MIN_LIQUIDATION_BUFFER_PCT` or whose leverage/notional
+  exceeds the caps — HITL cannot override.
+- [ ] **P2-7 `[CC]`** Rebuild the kill switch (`orchestrator/scheduler.py`):
+  liquidation-proximity trigger (`KILL_SWITCH_MARGIN_RATIO`, futures endpoints,
+  `forceexit`); drawdown + daily-loss on margin equity incl. funding; keep
+  out-of-band of the graph.
+- [ ] **P2-8 `[CC]`** Replace the Phase-1 `paper_spawn` deferral with the real
+  futures paper path (**dry-run first**), then the live promotion path.
+- [ ] **P2-9 `[CC]`** HITL cards + `GET /threads` (`dashboard/app.py`):
+  leverage / liquidation-distance / stop-vs-liquidation buffer / funding /
+  isolated context above the metrics (SPEC §4.1).
+- [ ] **P2-10 `[OPERATOR]`** First real **futures dry-run** container against the
+  futures key; verify `/api/v1/status` reports isolated margin + the expected
+  leverage + a sane liquidation price. *(Docker / exchange — operator runs.)*
+- [ ] **P2-11 `[OPERATOR]`** First **tiny live short** (well under
+  `LIVE_CAPITAL_CAP_USD`) through `live_gate` HITL; verify the kill switch fires
+  on a synthetic margin-proximity breach before liquidation. *(Real money,
+  smallest possible — operator runs.)*
+
+> **STOP for operator review.** This §22 plan (both phases + checklist) is the
+> contract. Operator reviews the full plan before any Stage 13 implementation
+> begins; Phase 2 is additionally gated on Phase 1 proving edge (§22.0).
