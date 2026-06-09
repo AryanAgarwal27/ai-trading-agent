@@ -61,6 +61,7 @@ GENERATED_DIR = TEMPLATES_DIR / "_generated"
 _SCHEMA_CLASS_NAMES: dict[str, str] = {
     "mean_reversion_template": "MeanReversionParams",
     "bb_regime_reversion_template": "BbRegimeReversionParams",
+    "bb_regime_short_template": "BbRegimeShortParams",
     "donchian_regime_trend_template": "DonchianRegimeTrendParams",
     "freqai_classifier_template": "FreqaiClassifierParams",
     "freqai_regressor_template": "FreqaiRegressorParams",
