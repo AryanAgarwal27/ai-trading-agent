@@ -60,6 +60,7 @@ from orchestrator.observability.events import publish_gate_pending, publish_thre
 from orchestrator.observability.log import get_logger
 from orchestrator.security.secrets import EnvSecretProvider, SecretProvider
 from orchestrator.state import AgentVote, StrategyState
+from orchestrator.tools.freqai_config import strategy_can_short
 from orchestrator.tools.freqtrade_api import FreqtradeAPI, FreqtradeCredentials
 from orchestrator.tools.freqtrade_lifecycle import (
     WORKERS_ROOT,
@@ -306,6 +307,41 @@ async def paper_spawn(
             ),
         }
     strategy_path = Path(strategy_path_str)
+
+    # ─── BRD §22.1 containment guard (Stage 13 Phase 1) — THE SAFETY BOUNDARY ──
+    # A short-capable strategy reaches here only after passing the full
+    # validation gauntlet + the human paper_gate approval — its VALIDATION
+    # verdict is the Phase-1 deliverable. But it MUST NOT promote to the spot
+    # paper/live path: paper-base.json is trading_mode=spot and cannot execute a
+    # short, and LIVE short execution is Phase 2 (BRD §22.2, not yet shipped).
+    # Block here BEFORE any port allocation / registry-spawn write / container
+    # spawn (mirrors the D-9 "block the gate" pattern). The strategy archives
+    # with a clear DEFERRAL marker (not a failure) — it is validated, just not
+    # paper/live-traded until Phase 2. This is the line that keeps Phase 1's
+    # "zero live risk" promise: short strategies can be evaluated but nothing
+    # short ever spawns a container in Phase 1.
+    if strategy_can_short(strategy_path):
+        existing_gates = state.get("gate_decisions") or {}
+        get_logger("paper_spawn").info(
+            "short_paper_deferred_to_phase2",
+            payload={"strategy_id": strategy_id},
+        )
+        return {
+            "stage": "archived",
+            "failure_reason": (
+                "short_paper_deferred_to_phase2: short-capable strategies are "
+                "validated but not paper/live-traded until Stage 13 Phase 2 "
+                "(live futures/margin risk model, BRD §22.2)"
+            ),
+            "gate_decisions": {
+                **existing_gates,
+                "paper_gate": {
+                    **(existing_gates.get("paper_gate") or {}),
+                    "status": "short_paper_deferred_to_phase2",
+                    "by": "system",
+                },
+            },
+        }
 
     thread_id = _thread_id_for(config, strategy_id)
     identity = {

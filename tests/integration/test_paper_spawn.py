@@ -101,9 +101,51 @@ def _empty_config() -> dict[str, Any]:
 # and existence checks pass in case the helper grows one later.
 REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 DUMMY_STRATEGY = REPO_ROOT / "strategy_templates" / "mean_reversion_template.py"
+SHORT_STRATEGY = REPO_ROOT / "strategy_templates" / "bb_regime_short_template.py"
 
 
 # ───────────────────────── tests ─────────────────────────
+
+
+async def test_paper_spawn_blocks_short_capable_strategy() -> None:
+    """BRD §22.1 containment guard (Stage 13 P1-6) — THE Phase-1 safety boundary.
+
+    A short-capable strategy (``can_short = True``) that has passed the gauntlet
+    + paper_gate MUST NOT promote to the spot paper path. paper_spawn blocks it
+    BEFORE any container spawn or registry write: it archives with a
+    ``short_paper_deferred_to_phase2`` deferral marker, and neither the
+    spawn helper nor the registry writer is ever called (no container, no row).
+
+    DB-free by construction: the guard returns before any DB access and both
+    side-effecting seams are stubbed, so no registry row is ever written (no
+    cleanup fixture needed).
+    """
+    strategy_id = f"sp-{uuid.uuid4().hex[:8]}"
+
+    spawn_called = {"value": False}
+    registry_called = {"value": False}
+
+    async def stub_spawn(**_kwargs: Any) -> str:
+        spawn_called["value"] = True
+        return "http://127.0.0.1:9999"
+
+    async def stub_registry(**_kwargs: Any) -> None:
+        registry_called["value"] = True
+
+    # Point generated_strategy_path at the real short template (can_short=True).
+    state = _minimal_state(strategy_id, str(SHORT_STRATEGY))
+    result = await paper_spawn(
+        cast(Any, state),
+        cast(Any, _empty_config()),
+        spawn_container_fn=stub_spawn,
+        registry_writer_fn=stub_registry,
+    )
+
+    assert result["stage"] == "archived"
+    assert result["failure_reason"].startswith("short_paper_deferred_to_phase2")
+    assert result["gate_decisions"]["paper_gate"]["status"] == "short_paper_deferred_to_phase2"
+    assert not spawn_called["value"], "short strategy must NOT spawn a paper container"
+    assert not registry_called["value"], "short strategy must NOT write a registry row"
 
 
 async def test_paper_spawn_writes_registry_row_before_spawn_call(
