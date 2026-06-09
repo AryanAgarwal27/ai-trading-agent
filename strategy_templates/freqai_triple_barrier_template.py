@@ -52,13 +52,17 @@ Freqtrade's config ``timeframe`` overrides it, and ``build_freqai_config`` filte
 template runs at ``"1h"`` (research §E recommends testing 1h, where the per-trade
 edge survives fees better) by passing ``timeframe="1h"`` to the backtest/spawn.
 
-NB (research §D, "confirm the probability column name for your FreqAI version"):
-for a string target ``&-trade`` ∈ {"up","down"}, FreqAI emits per-class
-probability columns named ``&-trade_<class>_proba`` — so ``&-trade_up_proba`` is
-P(up). This is the SAME convention the shipped ``freqai_classifier_template``
-relies on (``&-action_up_proba``); the Stage 12 integration test asserts the
-column exists so a version bump that renames it is caught, not silently
-zero-entry.
+NB (research §D, "confirm the probability column name for your FreqAI version" —
+and we DID, against freqtrade 2026.4's stable_freqai source): for a string target
+``&-trade`` ∈ {"up","down"}, ``BaseClassifierModel.predict`` builds the
+probability columns with ``columns=self.model.classes_`` — i.e. named after the
+CLASS VALUES themselves — and ``DataKitchen.get_predictions_to_append`` appends
+them UNPREFIXED. So P(up) is the plain column ``"up"`` (and ``"down"`` is
+P(down)); the predicted-label column is ``&-trade``. This is the research's
+original convention (``df["up"]``), confirmed by the Stage 12 freqtrade
+integration test — which initially FAILED on a wrong ``&-trade_up_proba`` guess
+(KeyError in ``populate_entry_trend``), proving the test is a real version-rename
+canary, not a rubber stamp.
 """
 
 # ruff: noqa: F401 (freqtrade/talib imports resolved only inside the container)
@@ -317,7 +321,9 @@ class FreqaiTripleBarrierClassifier(IStrategy):
         dataframe["atr"] = ta.ATR(dataframe, timeperiod=14)
         dataframe["adx"] = ta.ADX(dataframe, timeperiod=14)
         dataframe["ema200"] = ta.EMA(dataframe, timeperiod=200)
-        # FreqAI populates do_predict, &-trade, and &-trade_<class>_proba here.
+        # FreqAI populates do_predict, the predicted-label column &-trade, and one
+        # probability column PER CLASS VALUE — "up" and "down" (NOT a
+        # &-trade_<class>_proba name). See the module docstring NB.
         dataframe = self.freqai.start(dataframe, metadata, self)
         return dataframe
 
@@ -328,7 +334,7 @@ class FreqaiTripleBarrierClassifier(IStrategy):
         dataframe.loc[
             (
                 (dataframe["do_predict"] == 1)
-                & (dataframe["&-trade_up_proba"] > self.entry_proba)
+                & (dataframe["up"] > self.entry_proba)
                 & (dataframe["adx"] > self.adx_min)
                 & (dataframe["close"] > dataframe["ema200"])
                 & (dataframe["volume"] > 0)  # exchange downtime guard
@@ -342,7 +348,7 @@ class FreqaiTripleBarrierClassifier(IStrategy):
     def populate_exit_trend(self, dataframe: DataFrame, metadata: dict) -> DataFrame:
         """Long exit: model flips bearish (P(up) < 0.5). ATR target/stop = callbacks."""
         dataframe.loc[
-            ((dataframe["do_predict"] == 1) & (dataframe["&-trade_up_proba"] < 0.5)),
+            ((dataframe["do_predict"] == 1) & (dataframe["up"] < 0.5)),
             "exit_long",
         ] = 1
         return dataframe

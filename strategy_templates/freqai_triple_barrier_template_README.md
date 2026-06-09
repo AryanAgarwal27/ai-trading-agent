@@ -160,10 +160,12 @@ Same gauntlet as the other FreqAI templates (BRD §5.4, §10, as re-tuned
   only `set_freqai_targets` may reference forward bars (the barrier walk),
   and FreqAI strips the trailing `label_period_candles` rows so it is a
   legitimate label, not a leak.
-- The classifier must actually train and emit `&-trade_up_proba`. The
-  Stage 12 freqtrade-marked integration test asserts the column exists
-  after one real train→backtest fold — a FreqAI-version rename of the
-  probability column is caught there, not silently as "zero entries".
+- The classifier must actually train and emit the `up` probability column.
+  The Stage 12 freqtrade-marked integration test runs one real
+  train→backtest fold — a FreqAI-version rename of the probability column
+  surfaces there as a `KeyError` in `populate_entry_trend`, not silently as
+  "zero entries". (It already earned its keep: the first draft guessed
+  `&-trade_up_proba` and the test caught it — the real column is `up`.)
 - Treat any Sharpe ≥ 1.5 with deep suspicion (Deflated Sharpe Ratio;
   42 days OOS). The gate is positive-in-≥4/6-folds + PF > 1.2 (SPEC §6).
 
@@ -191,7 +193,10 @@ Same gauntlet as the other FreqAI templates (BRD §5.4, §10, as re-tuned
    yields an all-"down" target; the classifier has one class and predicts
    a constant. The per-fold consistency gate (SPEC §6 `MIN_POSITIVE_FOLDS`)
    surfaces this as a failing fold rather than a hidden degenerate model.
-7. **Probability-column name drift.** `&-trade_up_proba` is the FreqAI
-   convention for a string target `&-trade`; a version bump that renames
-   it makes the entry condition silently never fire. The integration test
-   is the canary — keep it green.
+7. **Probability-column name drift.** For a string target `&-trade`,
+   freqtrade 2026.4 names the per-class probability columns after the class
+   VALUES (`up`, `down`) — so the entry reads `df["up"]`, not a
+   `&-trade_up_proba` form (which a wrong-guess first draft tripped on). A
+   version bump that renames the column makes the entry `KeyError` rather
+   than silently never fire. The integration test is the canary — keep it
+   green.
