@@ -176,6 +176,11 @@ async def run_backtest(
             timeframe=timeframe,
             label_period_candles=label_period,
             identifier=strategy_class,
+            # Read the tunable model/DI/weight SLOT class attributes off the
+            # (rendered) strategy so the slot is the single source of truth for
+            # model_training_parameters (the triple-barrier classifier); a
+            # template without them (regressor) is unaffected.
+            strategy_path=strategy_path,
         )
         freqai_model = freqai_model_for(strategy_class)
 

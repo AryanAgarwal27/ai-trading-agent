@@ -90,6 +90,98 @@ def extract_class_int(strategy_path: Path, attr: str) -> int | None:
     return None
 
 
+def extract_class_number(strategy_path: Path, attr: str) -> int | float | None:
+    """Return an int OR float class attribute, or None.
+
+    Generalises :func:`extract_class_int` to the float SLOTs the triple-barrier
+    template exposes (``learning_rate``, ``DI_threshold``, …). ``bool`` is
+    rejected (it subclasses ``int``) so a ``True``/``False`` attribute never
+    leaks in as ``1``/``0``.
+    """
+    cls = _class_def(strategy_path)
+    if cls is None:
+        return None
+    for stmt in cls.body:
+        value = _assigned_value(stmt, attr)
+        if value is not None:
+            parsed = ast.literal_eval(value)
+            if isinstance(parsed, bool):
+                return None
+            if isinstance(parsed, int | float):
+                return parsed
+    return None
+
+
+# LightGBM ``model_training_parameters`` that ship as SLOTs on a FreqAI template
+# (research §D2 — the triple-barrier classifier). Read OFF the rendered class so
+# the slot is the single source of truth; any FreqAI template exposing these
+# class attributes gets them carried into the runtime config. The regressor /
+# classifier do not expose them → empty dict → LightGBM defaults (unchanged).
+_MODEL_PARAM_SLOTS: tuple[str, ...] = (
+    "n_estimators",
+    "learning_rate",
+    "num_leaves",
+    "max_depth",
+    "min_child_samples",
+    "lambda_l1",
+    "lambda_l2",
+    "feature_fraction",
+    "bagging_fraction",
+)
+
+
+def extract_model_training_parameters(strategy_path: Path) -> dict[str, Any]:
+    """Assemble ``model_training_parameters`` from the template's SLOT class attrs.
+
+    Returns only the model params present on the class (so a template without
+    them yields ``{}`` and LightGBM uses its own defaults). When ANY are present
+    it also sets ``bagging_freq=1`` — ``bagging_fraction`` is inert without a
+    non-zero ``bagging_freq``, so the research's row-subsample only takes effect
+    once bagging is enabled.
+    """
+    out: dict[str, Any] = {}
+    for name in _MODEL_PARAM_SLOTS:
+        value = extract_class_number(strategy_path, name)
+        if value is not None:
+            out[name] = value
+    if out:
+        out["bagging_freq"] = 1
+    return out
+
+
+def _timeframe_minutes(timeframe: str) -> int:
+    """Convert a Freqtrade timeframe string (``"5m"`` / ``"1h"`` / ``"1d"``) to minutes."""
+    unit = timeframe[-1].lower()
+    value = int(timeframe[:-1])
+    if unit == "m":
+        return value
+    if unit == "h":
+        return value * 60
+    if unit == "d":
+        return value * 24 * 60
+    raise ValueError(f"unsupported timeframe unit in {timeframe!r}")
+
+
+def _resolve_include_timeframes(pin_value: Any, base_timeframe: str) -> list[str]:
+    """Runtime ``include_timeframes``: base TF + the pin's strictly-higher TFs.
+
+    FreqAI requires the base/strategy timeframe to be present and rejects an
+    informative timeframe FASTER than the base. So a template pinning
+    ``["5m", "1h"]`` runs as ``["5m", "1h"]`` at a 5m base but ``["1h"]`` at a 1h
+    base (the sub-base 5m is dropped) — which is what makes the triple-barrier
+    template 1h-capable from the same file (research §E). A missing/empty pin
+    falls back to just the base timeframe (the regressor/classifier behaviour).
+    """
+    if not pin_value or not isinstance(pin_value, list | tuple):
+        return [base_timeframe]
+    base_min = _timeframe_minutes(base_timeframe)
+    out = [base_timeframe]
+    for tf in pin_value:
+        if isinstance(tf, str) and tf not in out and _timeframe_minutes(tf) > base_min:
+            out.append(tf)
+    return out
+
+
 def freqai_model_for(strategy_class: str) -> str:
     """Select the ``--freqaimodel`` keyed off the template's class name (BRD §8.1).
 
@@ -108,29 +200,68 @@ def build_freqai_config(
     label_period_candles: int,
     identifier: str,
     indicator_periods_candles: tuple[int, ...] = _DEFAULT_INDICATOR_PERIODS,
+    strategy_path: Path | None = None,
 ) -> dict[str, Any]:
     """Build the runtime ``freqai`` config block from the strategy's §7.3 pins.
 
     Carries the pins verbatim (train/backtest windows, retrain/expiration, purge,
     and the pins' ``feature_parameters`` — DI_threshold + outlier rejection) and
     adds the runtime fields Freqtrade REQUIRES that the pins omit:
-    ``enabled``, ``identifier``, ``feature_parameters.include_timeframes`` (the
-    base timeframe), ``include_corr_pairlist`` ([]), ``label_period_candles``
-    (which MUST match the strategy's slot), ``indicator_periods_candles`` (the
-    periods FreqAI iterates in ``feature_engineering_expand_all``),
-    ``data_split_parameters`` and ``model_training_parameters``.
+    ``enabled``, ``identifier``, ``feature_parameters.include_timeframes``,
+    ``include_corr_pairlist``, ``label_period_candles`` (which MUST match the
+    strategy's slot), ``indicator_periods_candles``, ``data_split_parameters``
+    and ``model_training_parameters``.
+
+    ``include_timeframes`` / ``include_corr_pairlist`` are taken from the pins
+    when present (a template may pin a multi-timeframe / corr-pair feature scope,
+    e.g. the triple-barrier classifier's ``["5m", "1h"]`` + BTC/ETH); the
+    timeframes are resolved against the base timeframe so the same template runs
+    at 1h (see :func:`_resolve_include_timeframes`). A template that pins neither
+    (the regressor / classifier) gets ``[timeframe]`` + ``[]`` — unchanged.
+
+    ``strategy_path`` (optional): when given, the tunable SLOT class attributes
+    are read OFF the rendered template and assembled into the runtime config —
+    ``model_training_parameters`` from the LightGBM SLOTs and
+    ``feature_parameters.{DI_threshold,weight_factor}`` overriding any pin. This
+    keeps the SLOT the single source of truth for the tunable subset (no literal
+    duplicated in the ``freqai_config`` dict). A template without those class
+    attributes (the regressor, whose ``DI_threshold`` is a pin) is unaffected.
     """
     pin_features = dict(pins.get("feature_parameters") or {})
+    # include_timeframes / include_corr_pairlist are resolved explicitly (the
+    # base timeframe must be present, sub-base TFs dropped), so pop them out of
+    # the generic pin merge below.
+    include_timeframes = _resolve_include_timeframes(
+        pin_features.pop("include_timeframes", None), timeframe
+    )
+    pin_corr = pin_features.pop("include_corr_pairlist", None)
+    include_corr_pairlist = (
+        [p for p in pin_corr if isinstance(p, str)] if isinstance(pin_corr, list | tuple) else []
+    )
     feature_parameters: dict[str, Any] = {
-        "include_timeframes": [timeframe],
-        "include_corr_pairlist": [],
+        "include_timeframes": include_timeframes,
+        "include_corr_pairlist": include_corr_pairlist,
         "label_period_candles": label_period_candles,
         "include_shifted_candles": 2,
         "indicator_periods_candles": list(indicator_periods_candles),
-        # Pins' feature params (DI_threshold, use_SVM_to_remove_outliers) last so
-        # the BRD §7.3 values win on any overlap.
+        # Remaining pins (DI_threshold, use_SVM_to_remove_outliers, an overriding
+        # include_shifted_candles / indicator_periods_candles, …) win on overlap.
         **pin_features,
     }
+
+    # Tunable model + DI/weight SLOTs live as class attributes on the (rendered)
+    # template; read them off the class so the slot is the single source of truth
+    # and the runtime config still carries the full research block.
+    model_training_parameters: dict[str, Any] = {}
+    if strategy_path is not None:
+        di_threshold = extract_class_number(strategy_path, "DI_threshold")
+        if di_threshold is not None:
+            feature_parameters["DI_threshold"] = di_threshold
+        weight_factor = extract_class_number(strategy_path, "weight_factor")
+        if weight_factor is not None:
+            feature_parameters["weight_factor"] = weight_factor
+        model_training_parameters = extract_model_training_parameters(strategy_path)
+
     return {
         "enabled": True,
         "identifier": identifier,
@@ -141,5 +272,5 @@ def build_freqai_config(
         "purge_old_models": pins.get("purge_old_models", 2),
         "feature_parameters": feature_parameters,
         "data_split_parameters": {"test_size": 0.33, "shuffle": False},
-        "model_training_parameters": {},
+        "model_training_parameters": model_training_parameters,
     }
