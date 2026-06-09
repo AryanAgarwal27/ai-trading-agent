@@ -18,6 +18,7 @@ Three groups, all offline (no LLM, no Docker):
 from __future__ import annotations
 
 import json
+from pathlib import Path
 from typing import Any
 from unittest.mock import MagicMock, patch
 
@@ -25,12 +26,41 @@ import pytest
 from pydantic import ValidationError
 
 from orchestrator.agents.risk_analyst import (
+    _BASE_KICKOFF,
     RiskVerdict,
     _build_risk_analyst_agent,
+    _build_risk_kickoff,
     _current_robustness_summary,
     read_robustness_summary,
     verdict_to_command,
 )
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
+TEMPLATES_DIR = REPO_ROOT / "strategy_templates"
+
+# ─── 0. short-aware kickoff (BRD §22.1, Stage 13 P1-7) ──────────────────────
+
+
+def test_kickoff_flags_short_capable_strategy() -> None:
+    """A short-capable strategy_path makes the kickoff carry the short rule."""
+    state = {"strategy_path": str(TEMPLATES_DIR / "bb_regime_short_template.py")}
+    kickoff = _build_risk_kickoff(state)
+    assert "SHORT-CAPABLE" in kickoff
+    assert "funding" in kickoff.lower()
+    assert kickoff.endswith(_BASE_KICKOFF)  # base instruction preserved
+
+
+def test_kickoff_unchanged_for_long_strategy() -> None:
+    """A long-only strategy keeps the base kickoff (no short framing)."""
+    state = {"strategy_path": str(TEMPLATES_DIR / "mean_reversion_template.py")}
+    assert _build_risk_kickoff(state) == _BASE_KICKOFF
+
+
+def test_kickoff_unchanged_when_no_strategy_path() -> None:
+    """Missing strategy_path → base kickoff (fail closed to long-only)."""
+    assert _build_risk_kickoff({}) == _BASE_KICKOFF
+    assert _build_risk_kickoff({"strategy_path": "/does/not/exist.py"}) == _BASE_KICKOFF
+
 
 # ─── 1. read_robustness_summary tool ────────────────────────────────────
 

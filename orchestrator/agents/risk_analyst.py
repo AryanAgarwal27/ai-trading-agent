@@ -41,6 +41,7 @@ from __future__ import annotations
 
 import json
 from contextvars import ContextVar
+from pathlib import Path
 from typing import Any, Literal
 
 from langchain_core.messages import HumanMessage
@@ -49,6 +50,7 @@ from langgraph.types import Command
 from pydantic import BaseModel, Field
 
 from orchestrator.observability.log import get_logger
+from orchestrator.tools.freqai_config import strategy_can_short
 
 # ─── Context-local robustness summary (used by the tool) ────────────────
 # The node function sets this before invoking the agent; the tool reads
@@ -162,7 +164,26 @@ Read these rules and follow them strictly:
    are finite. Reject marginal strategies. Approve only when the
    robustness evidence is decisively strong.
 
-4. Emit a RiskVerdict with: decision (approve/reject), primary_concern
+4. **SHORT-CAPABLE strategies (BRD §22.1, Stage 13 Phase 1) — extra
+   scrutiny.** If the kickoff tells you this strategy is SHORT-CAPABLE, the
+   edge comes (wholly or partly) from the short side and you must weigh
+   short-specific fragility the long-side gates do not capture:
+   - **Funding drag.** A perpetual short PAYS funding while held — a
+     persistent, recurring cost. The fee-stress numbers capture trading fees,
+     not funding; a short whose edge is thin relative to plausible funding
+     bleed is fragile even if the fee-stress degradation clears.
+   - **Upside tail / short-squeeze.** A short's loss is UNBOUNDED as price
+     rises. A thin average edge can be erased by one sharp rally; favour
+     evidence of consistency (per-fold positivity) over a high mean.
+   - **Bear-window short-beta.** The validation window is a bear market, so a
+     short will look good simply by being short. Ask whether the edge is a
+     genuine timing edge or just "short beta" that would invert in a recovery —
+     the latter is not a robust edge.
+   A short edge that is thin, funding-sensitive, or merely bear-beta should be
+   REJECTED: live short execution (Phase 2, BRD §22.2) is only justified by a
+   ROBUST short edge, and rejecting here costs nothing (no live exposure).
+
+5. Emit a RiskVerdict with: decision (approve/reject), primary_concern
    (one sentence), rationale (2–4 sentences citing specific numbers),
    confidence (0.0–1.0).
 
@@ -214,6 +235,31 @@ def _build_risk_analyst_agent() -> Any:
 
 # ─── Node function (used by the validation subgraph) ───────────────────
 
+_BASE_KICKOFF = "Read the robustness summary and emit your verdict."
+
+
+def _build_risk_kickoff(state: dict[str, Any]) -> str:
+    """Build the agent kickoff, flagging SHORT-CAPABLE strategies (BRD §22.1).
+
+    A short strategy's edge depends on the short side, so the analyst is told to
+    apply the short-specific risk rule (funding drag, upside tail, bear-window
+    short-beta). Short capability is read off the rendered strategy file (single
+    source of truth). Guarded and fail-closed: a missing ``strategy_path``, a
+    non-existent file, or a long-only strategy all return the unchanged base
+    kickoff — so existing long-only behaviour is untouched.
+    """
+    strategy_path_str = state.get("strategy_path")
+    if strategy_path_str:
+        path = Path(strategy_path_str)
+        if path.exists() and strategy_can_short(path):
+            return (
+                "This strategy is SHORT-CAPABLE (Stage 13 Phase 1 — backtest-only "
+                "futures, 1x leverage; BRD §22.1). Its edge depends on the short "
+                "side, so apply rule 4 (funding drag, short-squeeze/upside tail, "
+                "bear-window short-beta) in addition to the usual checks. " + _BASE_KICKOFF
+            )
+    return _BASE_KICKOFF
+
 
 async def risk_analyst_node(
     state: dict[str, Any],
@@ -237,16 +283,12 @@ async def risk_analyst_node(
     """
     get_logger("risk_analyst").info("enter", payload={"strategy_id": state.get("strategy_id")})
     summary = json.dumps(state.get("gate_decisions", {}).get("robustness", {}))
+    kickoff = _build_risk_kickoff(state)
+
     token = _current_robustness_summary.set(summary)
     try:
         agent = _build_risk_analyst_agent()
-        result = await agent.ainvoke(
-            {
-                "messages": [
-                    HumanMessage(content="Read the robustness summary and emit your verdict.")
-                ]
-            }
-        )
+        result = await agent.ainvoke({"messages": [HumanMessage(content=kickoff)]})
     finally:
         _current_robustness_summary.reset(token)
 
