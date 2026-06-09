@@ -74,7 +74,21 @@ from orchestrator.tools.backtest_runner import (
     cleanup_stale_workers,
     run_backtest,
 )
+from orchestrator.tools.freqai_config import strategy_can_short
 from orchestrator.tools.regime import classify_regime
+
+# ─── Fee-stress regimes (BRD §5.4 robustness + §22.1 honest short costing) ──
+# The fee-stress worker re-runs the best param set at 2× and 3× the exchange's
+# base taker fee to test fragility to a fee hike. The base fee differs by market:
+#   • SPOT  — Binance spot taker ≈ 0.10% → 2×/3× = (0.002, 0.003). Unchanged.
+#   • FUTURES — Binance USDⓈ-M taker ≈ 0.05% → 2×/3× = (0.0010, 0.0015). A
+#     short strategy (BRD §22.1) backtests in futures mode, so stressing it at
+#     the SPOT pair would over-penalise it (4–6× the real futures taker); using
+#     the futures schedule costs it honestly. The baseline fold backtests already
+#     use the futures taker automatically (fee=None → Freqtrade picks the
+#     worst-tier fee for the trading_mode set in _build_backtest_config).
+_SPOT_FEE_STRESS: tuple[float, float] = (0.002, 0.003)
+_FUTURES_FEE_STRESS: tuple[float, float] = (0.0010, 0.0015)
 
 # BaseCheckpointSaver is generic on the serializer type; we don't constrain
 # it here, so accept any concrete saver (InMemorySaver for tests,
@@ -972,6 +986,17 @@ async def fee_stress_worker(state: ValidationState) -> dict[str, Any]:
     baseline_sharpe = statistics.fmean(r["is_sharpe"] for r in filtered)
     sample_fold = next((f for f in folds if f["fold_id"] == filtered[0]["fold_id"]), folds[0])
 
+    # BRD §22.1: cost short strategies on the FUTURES fee schedule. A short
+    # strategy backtests in futures mode (run_backtest detects can_short and sets
+    # trading_mode="futures"); stress it at the futures taker, not the spot taker.
+    # Funding-rate cost — a real, persistent cost of holding a short — flows into
+    # these futures backtests automatically via the futures trading_mode + the
+    # operator-downloaded funding_rate/mark candles (BRD §22.3 P1-8); there is no
+    # separate funding knob, so a short that only "wins" by ignoring funding fails
+    # honestly here.
+    can_short = strategy_can_short(Path(state["strategy_path"]))
+    fee_2x_value, fee_3x_value = _FUTURES_FEE_STRESS if can_short else _SPOT_FEE_STRESS
+
     fee_2x = await run_backtest(
         Path(state["strategy_path"]),
         pairs=state["pairs"],
@@ -979,7 +1004,7 @@ async def fee_stress_worker(state: ValidationState) -> dict[str, Any]:
         timerange=sample_fold["timerange"],
         fold_id=f"fee_stress_2x_{sample_fold['fold_id']}",
         param_set_id=str(best_id),
-        fee=0.002,
+        fee=fee_2x_value,
     )
     fee_3x = await run_backtest(
         Path(state["strategy_path"]),
@@ -988,7 +1013,7 @@ async def fee_stress_worker(state: ValidationState) -> dict[str, Any]:
         timerange=sample_fold["timerange"],
         fold_id=f"fee_stress_3x_{sample_fold['fold_id']}",
         param_set_id=str(best_id),
-        fee=0.003,
+        fee=fee_3x_value,
     )
 
     deg_2x = _degradation(baseline_sharpe, fee_2x["is_sharpe"])
@@ -1006,6 +1031,11 @@ async def fee_stress_worker(state: ValidationState) -> dict[str, Any]:
                     "degradation_3x": deg_3x,
                     "fee_2x_artifact": fee_2x["raw_zip_path"],
                     "fee_3x_artifact": fee_3x["raw_zip_path"],
+                    # Honest record of which fee schedule was applied (spot vs
+                    # futures) so the gate + dashboard are not misread (BRD §22.1).
+                    "fee_mode": "futures" if can_short else "spot",
+                    "fee_2x_value": fee_2x_value,
+                    "fee_3x_value": fee_3x_value,
                 },
             )
         ]

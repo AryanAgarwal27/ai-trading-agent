@@ -33,14 +33,20 @@ from typing import Any, cast
 import pytest
 
 from orchestrator.subgraphs.validation import (
+    _FUTURES_FEE_STRESS,
+    _SPOT_FEE_STRESS,
     ValidationState,
     _bootstrap_5th_percentile,
     _degradation,
     _load_trade_returns_from_artifact,
+    fee_stress_worker,
     gate_robustness,
     monte_carlo_worker,
 )
 from orchestrator.tools.backtest_runner import cleanup_stale_workers
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
+TEMPLATES_DIR = REPO_ROOT / "strategy_templates"
 
 # ─── 1. Monte Carlo bootstrap math ──────────────────────────────────────
 
@@ -303,6 +309,85 @@ def test_monte_carlo_worker_reads_trades_from_zipped_artifact(tmp_path: Path) ->
     assert isinstance(payload["pct_5_final_equity"], float)
     # Mostly-positive returns → 5th-percentile final equity should be ≈ 1.0 or above.
     assert payload["median_final_equity"] > 0.95
+
+
+# ─── 6. fee_stress futures-vs-spot fee selection (BRD §22.1, Stage 13 P1-5) ──
+
+
+def _fee_stress_state(strategy_path: Path) -> dict[str, Any]:
+    """Minimal ValidationState for fee_stress_worker with one baseline fold."""
+    return {
+        "strategy_path": str(strategy_path),
+        "pairs": ["BTC/USDT"],
+        "timeframe": "15m",
+        "folds": [{"fold_id": "f1", "timerange": "20251101-20251201"}],
+        "backtest_results": [
+            {
+                "param_set_id": "ps1",
+                "pair": "BTC/USDT",
+                "timeframe": "15m",
+                "fold_id": "f1",
+                "is_sharpe": 1.0,
+                "oos_sharpe": 0.0,
+                "profit_factor": 1.5,
+                "max_dd": 0.05,
+                "trades": 40,
+                "raw_zip_path": "/tmp/x.zip",
+            },
+        ],
+        "gate_decisions": {"backtest": {"best_param_set_id": "ps1"}},
+    }
+
+
+async def _run_fee_stress_capturing_fees(
+    monkeypatch: pytest.MonkeyPatch, strategy_path: Path
+) -> tuple[list[float], dict[str, Any]]:
+    """Run fee_stress_worker with a stubbed run_backtest that records each fee."""
+    seen_fees: list[float] = []
+
+    async def fake_run_backtest(_strategy_path: Path, **kwargs: Any) -> dict[str, Any]:
+        seen_fees.append(kwargs["fee"])
+        return {
+            "param_set_id": "ps1",
+            "pair": "BTC/USDT",
+            "timeframe": "15m",
+            "fold_id": kwargs.get("fold_id", "f"),
+            "is_sharpe": 0.8,
+            "oos_sharpe": 0.0,
+            "profit_factor": 1.3,
+            "max_dd": 0.06,
+            "trades": 40,
+            "raw_zip_path": "/tmp/stress.zip",
+        }
+
+    monkeypatch.setattr("orchestrator.subgraphs.validation.run_backtest", fake_run_backtest)
+    result = await fee_stress_worker(cast(ValidationState, _fee_stress_state(strategy_path)))
+    [rr] = result["robustness_results"]
+    return seen_fees, rr["payload"]
+
+
+@pytest.mark.asyncio
+async def test_fee_stress_uses_futures_fees_for_short_strategy(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A short-capable strategy is fee-stressed on the FUTURES taker schedule."""
+    short_template = TEMPLATES_DIR / "bb_regime_short_template.py"
+    seen_fees, payload = await _run_fee_stress_capturing_fees(monkeypatch, short_template)
+    assert seen_fees == list(_FUTURES_FEE_STRESS)
+    assert payload["fee_mode"] == "futures"
+    assert (payload["fee_2x_value"], payload["fee_3x_value"]) == _FUTURES_FEE_STRESS
+
+
+@pytest.mark.asyncio
+async def test_fee_stress_uses_spot_fees_for_long_strategy(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A long-only strategy keeps the unchanged SPOT fee-stress schedule."""
+    long_template = TEMPLATES_DIR / "mean_reversion_template.py"
+    seen_fees, payload = await _run_fee_stress_capturing_fees(monkeypatch, long_template)
+    assert seen_fees == list(_SPOT_FEE_STRESS)
+    assert payload["fee_mode"] == "spot"
+    assert (payload["fee_2x_value"], payload["fee_3x_value"]) == _SPOT_FEE_STRESS
 
 
 def test_load_trades_returns_empty_on_missing_artifact() -> None:
