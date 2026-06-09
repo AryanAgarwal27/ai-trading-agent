@@ -222,15 +222,20 @@ async def run_backtest(
     )
     stdout_bytes, stderr_bytes, returncode = await _run_subprocess(cmd, timeout_s)
 
+    # Compute the tails ONCE, regardless of exit code: Freqtrade can exit 0 yet
+    # produce no results (e.g. a futures backtest that errors softly, or zero
+    # trades), so the diagnostic the no-artifacts path needs lives in the SAME
+    # captured stdout/stderr the non-zero-exit branch uses.
+    stderr_tail = _tail(stderr_bytes)
+    stdout_tail = _tail(stdout_bytes)
+
     if returncode != 0:
-        stderr_tail = _tail(stderr_bytes)
-        stdout_tail = _tail(stdout_bytes)
         # Surface Freqtrade's REAL error in the message (not just an unread
         # attribute): str(exc) is what the logged failure_reason / manual-inject
         # _drive() log shows, so the exit code alone made every backtest failure
         # undebuggable. Mirrors orchestrator/tools/lookahead.py. Freqtrade writes
         # its ERROR/traceback to stderr; fall back to stdout when stderr is empty.
-        diagnostic = stderr_tail.strip() or stdout_tail.strip() or "(no stderr/stdout captured)"
+        diagnostic = _subprocess_diagnostic(stderr_tail, stdout_tail)
         raise BacktestError(
             f"freqtrade backtesting exited with code {returncode}; stderr tail: {diagnostic}",
             returncode=returncode,
@@ -239,7 +244,13 @@ async def run_backtest(
             worker_dir=worker_dir,
         )
 
-    stats_path, raw_zip_path = _locate_result_artifacts(worker_dir)
+    # Exit 0 but no results is the OTHER failure mode (commit 918fad3 fixed the
+    # non-zero branch; this surfaces stdout/stderr for the exit-0-no-artifacts
+    # branch too, e.g. a short/futures backtest that produced no trades or hit a
+    # soft Freqtrade error). Pass the tails so the locator's raises carry them.
+    stats_path, raw_zip_path = _locate_result_artifacts(
+        worker_dir, stderr_tail=stderr_tail, stdout_tail=stdout_tail
+    )
     stats = _parse_backtest_stats(stats_path, strategy_class=strategy_class)
 
     return BacktestResult(
@@ -551,7 +562,12 @@ def _run_subprocess_sync(cmd: list[str], timeout_s: int) -> tuple[bytes, bytes, 
     return result.stdout, result.stderr, result.returncode
 
 
-def _locate_result_artifacts(worker_dir: Path) -> tuple[Path, Path | None]:
+def _locate_result_artifacts(
+    worker_dir: Path,
+    *,
+    stderr_tail: str = "",
+    stdout_tail: str = "",
+) -> tuple[Path, Path | None]:
     """Find the most recent backtest result artifacts in ``worker_dir``.
 
     Freqtrade 2026.x writes a ``backtest-result-<ts>.json`` and a
@@ -559,11 +575,20 @@ def _locate_result_artifacts(worker_dir: Path) -> tuple[Path, Path | None]:
     ``.json`` for stats parsing — it has the full top-level summary without
     needing to crack open the zip. The zip is recorded in the
     ``BacktestResult.raw_zip_path`` for downstream retention.
+
+    ``stderr_tail`` / ``stdout_tail`` are the captured subprocess output from the
+    (exit-0) run; they are appended to the "missing"/"no artifacts" errors so an
+    exit-0-but-no-results failure is debuggable (it carries Freqtrade's real
+    message), not just a bare "no artifacts found" (Stage 13 P1-9 fix).
     """
+    diagnostic = _subprocess_diagnostic(stderr_tail, stdout_tail)
     results_dir = worker_dir / "backtest_results"
     if not results_dir.exists():
         raise BacktestError(
-            f"backtest_results/ missing under worker {worker_dir.name}",
+            f"backtest_results/ missing under worker {worker_dir.name} "
+            f"(Freqtrade exited 0 but wrote no results); stderr tail: {diagnostic}",
+            stderr_tail=stderr_tail,
+            stdout_tail=stdout_tail,
             worker_dir=worker_dir,
         )
 
@@ -584,8 +609,15 @@ def _locate_result_artifacts(worker_dir: Path) -> tuple[Path, Path | None]:
             reverse=True,
         )
         if not zip_candidates:
+            # Exit 0 but no result file — the silent failure mode the operator
+            # hit on the first short futures backtest (P1-9). Surface Freqtrade's
+            # captured output so the cause (zero trades / soft error / missing
+            # futures config field) is visible instead of an opaque "no artifacts".
             raise BacktestError(
-                f"no backtest-result-* artifacts found under {results_dir}",
+                f"no backtest-result-* artifacts found under {results_dir} "
+                f"(Freqtrade exited 0 but wrote no results); stderr tail: {diagnostic}",
+                stderr_tail=stderr_tail,
+                stdout_tail=stdout_tail,
                 worker_dir=worker_dir,
             )
         # Extract the embedded JSON in-place.
@@ -648,3 +680,14 @@ def _tail(b: bytes, max_chars: int = 1500) -> str:
     """Last ``max_chars`` characters of decoded ``b``, for diagnostics."""
     text = b.decode("utf-8", errors="replace")
     return text[-max_chars:] if len(text) > max_chars else text
+
+
+def _subprocess_diagnostic(stderr_tail: str, stdout_tail: str) -> str:
+    """Best diagnostic string from captured subprocess output.
+
+    Freqtrade writes its ERROR/traceback to stderr; fall back to stdout when
+    stderr is empty (some soft failures / zero-trade notices print to stdout).
+    Shared by the non-zero-exit branch AND the exit-0-no-artifacts branch so
+    both failure modes surface Freqtrade's real message (commit 918fad3 +
+    Stage 13 P1-9 debuggability fix)."""
+    return stderr_tail.strip() or stdout_tail.strip() or "(no stderr/stdout captured)"

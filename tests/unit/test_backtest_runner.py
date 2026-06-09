@@ -79,6 +79,51 @@ async def test_backtest_error_message_falls_back_to_stdout_when_stderr_empty(
     assert sentinel in str(excinfo.value)
 
 
+async def test_no_artifacts_error_includes_stderr_tail(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Exit 0 but NO result file must surface Freqtrade's captured output in the
+    BacktestError message (Stage 13 P1-9 debuggability fix).
+
+    This is the failure mode the operator hit on the first short futures backtest:
+    Freqtrade ran, exited 0, wrote no ``backtest-result-*`` artifact, and the old
+    'no artifacts found' error swallowed the real cause. Now the stderr/stdout
+    tail rides along."""
+    sentinel = "ERROR - OperationalException: no pair data / short futures soft-fail"
+
+    async def _fake_run(cmd: list[str], timeout_s: int) -> tuple[bytes, bytes, int]:
+        # Exit 0, real error on stderr, but write NO result artifacts into the
+        # worker's backtest_results/ dir (run_backtest creates it empty).
+        return (b"backtest progress 100%", sentinel.encode(), 0)
+
+    monkeypatch.setattr(br, "WORKERS_DIR", tmp_path / "_workers")
+    monkeypatch.setattr(br, "_run_subprocess", _fake_run)
+
+    with pytest.raises(br.BacktestError) as excinfo:
+        await br.run_backtest(
+            MEAN_REVERSION,
+            pairs=["BTC/USDT"],
+            timeframe="5m",
+            timerange="20250101-20250108",
+        )
+
+    exc = excinfo.value
+    assert "no backtest-result" in str(exc)
+    # The load-bearing assertion: the exit-0-no-artifacts path now carries
+    # Freqtrade's real message, so it is debuggable.
+    assert sentinel in str(exc), f"stderr cause missing from no-artifacts message: {exc}"
+    assert sentinel in exc.stderr_tail
+
+
+def test_locate_artifacts_missing_dir_includes_diagnostic(tmp_path: Path) -> None:
+    """The missing-backtest_results/ branch also surfaces the tail."""
+    worker_dir = tmp_path / "w1"
+    worker_dir.mkdir()  # but NO backtest_results/ subdir
+    with pytest.raises(br.BacktestError) as excinfo:
+        br._locate_result_artifacts(worker_dir, stderr_tail="ERROR - boom", stdout_tail="")
+    assert "ERROR - boom" in str(excinfo.value)
+
+
 # ─── FreqAI config injection (commit 2 — the exit-2 fix) ────────────────
 
 
