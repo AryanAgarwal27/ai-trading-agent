@@ -35,6 +35,7 @@ TEMPLATE_SPECS: list[tuple[str, str]] = [
     ("mean_reversion_template", "MeanReversionParams"),
     ("freqai_classifier_template", "FreqaiClassifierParams"),
     ("freqai_regressor_template", "FreqaiRegressorParams"),
+    ("freqai_triple_barrier_template", "FreqaiTripleBarrierParams"),
 ]
 
 

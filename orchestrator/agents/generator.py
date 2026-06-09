@@ -62,6 +62,7 @@ _SCHEMA_CLASS_NAMES: dict[str, str] = {
     "mean_reversion_template": "MeanReversionParams",
     "freqai_classifier_template": "FreqaiClassifierParams",
     "freqai_regressor_template": "FreqaiRegressorParams",
+    "freqai_triple_barrier_template": "FreqaiTripleBarrierParams",
 }
 
 # The shipped-template registry — the SINGLE source of truth for "which templates
