@@ -699,12 +699,15 @@ All thresholds live in `orchestrator/gates/thresholds.py`. **Do not put threshol
 # orchestrator/gates/thresholds.py
 
 # Backtest hard gate (in-sample, anchored 6-fold walk-forward)
-MIN_TRADES_IS = 150
+# NOTE: the backtest-gate values carry SPEC-recorded operator re-tunes (this
+# block tracks thresholds.py; full rationale in the SPEC §6 change-log).
+MIN_TRADES_IS = 90                  # re-tuned 150→90 on 2026-06-09 (SPEC §2/§6)
 MIN_TRADES_PER_FOLD = 5             # guard zero-trade folds (walk-forward outside cache)
 MIN_OOS_TRADES = 30
-MIN_SHARPE_IS = 1.5
-MIN_PROFIT_FACTOR_IS = 1.5
+MIN_SHARPE_IS = 0.5                 # re-tuned 1.5→0.5 on 2026-06-08 (SPEC §2/§6)
+MIN_PROFIT_FACTOR_IS = 1.2          # re-tuned 1.5→1.2 on 2026-06-08 (SPEC §2/§6)
 MAX_DRAWDOWN_IS = 0.20
+MIN_POSITIVE_FOLDS = 4              # cross-fold consistency: ≥4/6 folds positive (added 2026-06-08, SPEC §2/§6)
 
 # OOS / walk-forward gate
 MIN_OOS_RATIO = 0.6                 # mean OOS Sharpe / IS Sharpe
@@ -738,7 +741,7 @@ MAX_CONCURRENT_STRATEGIES = 4       # supervisor capacity gate (total non-archiv
 MAX_CONCURRENT_LIVE_STRATEGIES = 1  # capital-bound (SPEC §1 Q3 = $500 whole-amount per live spawn)
 ```
 
-**These values are operator-tunable in `SPEC.md` during Stage 0.** Defaults above stand otherwise. Re-tune after the first 10 strategies have completed a lifecycle.
+**These values are operator-tunable in `SPEC.md`.** They were re-tuned after the first ~10 strategies completed a lifecycle (the trigger named below): the backtest hard gate now reads `MIN_SHARPE_IS=0.5`, `MIN_PROFIT_FACTOR_IS=1.2`, `MIN_TRADES_IS=90`, plus the new `MIN_POSITIVE_FOLDS=4` cross-fold consistency gate. `thresholds.py` is the runtime source of truth; this block tracks it and the SPEC §2 override ledger + §6 change-log carry the dated rationale. Further re-tunes follow the same path (a dated SPEC §6 entry + this block + `thresholds.py` + `test_thresholds.py` EXPECTED in lockstep).
 
 ---
 

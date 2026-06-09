@@ -36,11 +36,12 @@ THRESHOLDS_FILE = ORCHESTRATOR_ROOT / "gates" / "thresholds.py"
 # after the first 10 strategies"), so the runtime source of truth (thresholds.py)
 # carries the SPEC override and this table tracks it. The 2026-06-08 re-tune
 # (SPEC §6) changed MIN_SHARPE_IS 1.5→0.5, MIN_PROFIT_FACTOR_IS 1.5→1.2, and
-# added MIN_POSITIVE_FOLDS=4. If a value changes again, the SPEC §6 change-log,
+# added MIN_POSITIVE_FOLDS=4; the 2026-06-09 re-tune (SPEC §6) changed
+# MIN_TRADES_IS 150→90. If a value changes again, the SPEC §6 change-log, BRD §10,
 # thresholds.py, and this table move in lockstep (SPEC §4.4 rule 3).
 EXPECTED: dict[str, int | float] = {
-    # Backtest hard gate (in-sample) — SPEC §6 2026-06-08 re-tune applied.
-    "MIN_TRADES_IS": 150,
+    # Backtest hard gate (in-sample) — SPEC §6 2026-06-08 + 2026-06-09 re-tunes.
+    "MIN_TRADES_IS": 90,
     "MIN_TRADES_PER_FOLD": 5,
     "MIN_OOS_TRADES": 30,
     "MIN_SHARPE_IS": 0.5,

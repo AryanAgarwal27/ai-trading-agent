@@ -29,8 +29,26 @@ from __future__ import annotations
 # ─── Backtest hard gate (in-sample, anchored 6-fold walk-forward) ───────
 # Failing any of these routes the strategy to archive before robustness runs.
 
-MIN_TRADES_IS: int = 150
-"""Minimum total IS trades across all folds. Fewer = statistically uninformative."""
+MIN_TRADES_IS: int = 90
+"""Minimum total IS trades across all folds. **Re-tuned 150 → 90 on 2026-06-09
+(SPEC §2/§6).**
+
+Operator decision (BRD §10 makes these values SPEC-tunable after the first ~10
+strategies; same mechanism as the 2026-06-08 re-tune above). On the SPEC §1 Q2
+four-pair universe (BTC/ETH/SOL/BNB) across six one-month OOS folds, a *selective*
+regime-filtered long-only strategy — the only shape that stays positive through a
+bearish anchored window — fires only ~90–135 times; reaching 150 would force
+looser entries into low-quality chop, exactly the over-trading-into-fees failure
+the earlier strategies showed (Sharpe −8 to −105). The statistical-significance
+role the 150 floor carried is now covered by the newer consistency gates:
+``MIN_TRADES_PER_FOLD`` (every fold is exercised — no silent zero-trade fold) and
+``MIN_POSITIVE_FOLDS`` (4/6 folds must be independently positive — the anti-luck
+check the 2026-06-08 re-tune added). 90 trades = a 15/fold average. Raise it back
+once the pair universe widens or the anchored window includes a trending regime
+that supports more quality trades. (The two regime-filtered templates that
+motivated this were triaged on a NON-authoritative proxy walk-forward; real
+validation via ``POST /strategies/validate`` is the authority — proxy Sharpe/PF
+figures are deliberately NOT recorded here as fact.)"""
 
 MIN_TRADES_PER_FOLD: int = 5
 """Minimum trades in ANY single fold. Guards Flag 1 (Stage 7h): if the
