@@ -45,7 +45,7 @@ a small fixed take-profit), with a hard stop catching the rest.
 {
   "template": "bb_regime_short_template",
   "name": "bb_regime_short_v1",
-  "pairs": ["BTC/USDT:USDT", "ETH/USDT:USDT", "SOL/USDT:USDT", "BNB/USDT:USDT"],
+  "pairs": ["BTC/USDT", "ETH/USDT", "SOL/USDT", "BNB/USDT"],
   "timeframe": "15m",
   "params": {"bb_period": 20, "bb_std": 2.3, "rsi_period": 14,
              "rsi_sell_threshold": 70, "ema_trend_period": 200,
@@ -53,6 +53,15 @@ a small fixed take-profit), with a hard stop catching the rest.
 }
 ```
 
+> **Submit SPOT pair notation** (`BTC/USDT`, not `BTC/USDT:USDT`).
+> `POST /strategies/validate` validates `pairs ⊆ PAIR_UNIVERSE`, and the universe
+> is the SPEC §1 Q2 **spot** set (`BTC/USDT`, `ETH/USDT`, `SOL/USDT`, `BNB/USDT`);
+> a `:USDT` pair is rejected as `pairs_outside_universe`. Because this template is
+> short-capable, the backtest runner internally converts each pair to its
+> perpetual form (`BTC/USDT` → `BTC/USDT:USDT`) when it builds the futures config
+> — the operator never types the `:USDT` suffix. The downloaded futures data
+> (P1-8) IS stored under the `:USDT` name, which is why the runner converts.
+>
 > **No proxy walk-forward numbers are recorded here.** Unlike the long
 > `bb_regime_reversion_template`, this short template has **not** been triaged on
 > the standalone proxy simulator — the short side needs futures + funding data the
@@ -61,8 +70,3 @@ a small fixed take-profit), with a hard stop catching the rest.
 > backtest gauntlet, P1-9 in BRD §22.3) once the operator has downloaded the
 > futures/funding/mark data (P1-8). Do not trust any performance claim for this
 > template until that run completes.
->
-> Note the **futures pair notation** (`BTC/USDT:USDT`) in the params block: a
-> futures backtest whitelists the settled-perpetual symbol, not the spot
-> `BTC/USDT`. The backtest config builder converts SPEC §1 Q2 spot pairs to this
-> form for short-capable strategies.
