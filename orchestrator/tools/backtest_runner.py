@@ -409,10 +409,21 @@ def _build_backtest_config(
     Leverage stays at the Freqtrade 1× default — Phase 1 tests the short SIGNAL,
     not leverage (a Phase-2 live concern, BRD §22.2). When ``can_short`` is False
     (the long-only / spot default) EVERY value below is byte-identical to the
-    pre-Stage-13 form: ``trading_mode="spot"``, the spot ``pair_whitelist``, and
-    NO ``margin_mode`` key. This containment is regression-pinned in
-    ``tests/unit/test_backtest_config_futures.py``.
+    pre-Stage-13 form: ``trading_mode="spot"``, the spot ``pair_whitelist``, NO
+    ``margin_mode`` key, and ``use_order_book=False`` pricing. This containment is
+    regression-pinned in ``tests/unit/test_backtest_config_futures.py``.
+
+    **Futures pricing (P1-9 fix):** Binance futures (swap) tickers don't carry a
+    usable price, so Freqtrade's ``validate_pricing`` rejects ticker pricing
+    (``use_order_book=False``) with "Ticker pricing not available for Binance" —
+    the config error that produced an exit-0-no-results run. The futures branch
+    therefore uses ORDER-BOOK pricing (``use_order_book=True``), which
+    ``fetchL2OrderBook`` supports — mirroring ``live-base.json`` (which already
+    uses ``use_order_book: true``). Spot stays on ticker pricing, unchanged.
     """
+    # P1-9: Binance futures requires order-book pricing (ticker pricing is
+    # unavailable); spot keeps the original ticker pricing → byte-identical.
+    use_order_book = can_short
     config: dict[str, Any] = {
         "max_open_trades": max_open_trades,
         "stake_currency": "USDT",
@@ -428,13 +439,13 @@ def _build_backtest_config(
         "unfilledtimeout": {"entry": 10, "exit": 10},
         "entry_pricing": {
             "price_side": "same",
-            "use_order_book": False,
+            "use_order_book": use_order_book,
             "price_last_balance": 0.0,
             "check_depth_of_market": {"enabled": False},
         },
         "exit_pricing": {
             "price_side": "same",
-            "use_order_book": False,
+            "use_order_book": use_order_book,
             "price_last_balance": 0.0,
         },
         "exchange": {

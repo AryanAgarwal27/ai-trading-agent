@@ -265,10 +265,17 @@ def _write_minimal_config(
     trading mode — ``trading_mode="futures"`` + ``margin_mode="isolated"`` + the
     pair whitelist in perpetual notation — matching its backtest config. When
     False (the default) every value is byte-identical to the pre-Stage-13 spot
-    form (``trading_mode="spot"``, ``margin_mode=""``, the spot whitelist).
+    form (``trading_mode="spot"``, ``margin_mode=""``, the spot whitelist,
+    ``use_order_book=False``).
+
+    P1-9 fix: Binance futures has no ticker pricing, so the futures branch uses
+    order-book pricing (``use_order_book=True``) to match the backtest config;
+    spot keeps ticker pricing, unchanged.
     """
     import json
 
+    # P1-9: Binance futures requires order-book pricing; spot keeps ticker pricing.
+    use_order_book = can_short
     config = {
         "max_open_trades": 4,
         "stake_currency": "USDT",
@@ -283,12 +290,12 @@ def _write_minimal_config(
         "unfilledtimeout": {"entry": 10, "exit": 10},
         "entry_pricing": {
             "price_side": "same",
-            "use_order_book": False,
+            "use_order_book": use_order_book,
             "order_book_top": 1,
         },
         "exit_pricing": {
             "price_side": "same",
-            "use_order_book": False,
+            "use_order_book": use_order_book,
             "order_book_top": 1,
         },
         "exchange": {

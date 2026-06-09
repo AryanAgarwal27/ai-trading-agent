@@ -84,6 +84,9 @@ def test_backtest_config_futures_for_short() -> None:
     assert cfg["trading_mode"] == "futures"
     assert cfg["margin_mode"] == "isolated"
     assert cfg["exchange"]["pair_whitelist"] == ["BTC/USDT:USDT", "ETH/USDT:USDT"]
+    # P1-9: Binance futures requires order-book pricing (no ticker pricing).
+    assert cfg["entry_pricing"]["use_order_book"] is True
+    assert cfg["exit_pricing"]["use_order_book"] is True
 
 
 def _expected_spot_config(
@@ -149,6 +152,9 @@ def test_backtest_config_spot_is_byte_identical() -> None:
     )
     assert cfg == expected
     assert "margin_mode" not in cfg
+    # P1-9: spot keeps ticker pricing (use_order_book False) — unchanged.
+    assert cfg["entry_pricing"]["use_order_book"] is False
+    assert cfg["exit_pricing"]["use_order_book"] is False
 
 
 def test_backtest_config_default_can_short_is_spot() -> None:
@@ -193,6 +199,8 @@ def test_lookahead_config_futures_for_short(tmp_path: Path) -> None:
     assert cfg["trading_mode"] == "futures"
     assert cfg["margin_mode"] == "isolated"
     assert cfg["exchange"]["pair_whitelist"] == ["BTC/USDT:USDT", "SOL/USDT:USDT"]
+    assert cfg["entry_pricing"]["use_order_book"] is True
+    assert cfg["exit_pricing"]["use_order_book"] is True
 
 
 def test_lookahead_config_spot_unchanged(tmp_path: Path) -> None:
@@ -204,3 +212,5 @@ def test_lookahead_config_spot_unchanged(tmp_path: Path) -> None:
     assert cfg["trading_mode"] == "spot"
     assert cfg["margin_mode"] == ""  # lookahead's spot form carries an empty margin_mode
     assert cfg["exchange"]["pair_whitelist"] == ["BTC/USDT"]
+    assert cfg["entry_pricing"]["use_order_book"] is False  # spot keeps ticker pricing
+    assert cfg["exit_pricing"]["use_order_book"] is False
