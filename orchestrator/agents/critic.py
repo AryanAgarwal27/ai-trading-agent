@@ -76,6 +76,8 @@ TEMPLATES_DIR = REPO_ROOT / "strategy_templates"
 # (would create a cycle once researcher imports anything from critic).
 TemplateName = Literal[
     "mean_reversion_template",
+    "bb_regime_reversion_template",
+    "donchian_regime_trend_template",
     "freqai_classifier_template",
     "freqai_regressor_template",
 ]

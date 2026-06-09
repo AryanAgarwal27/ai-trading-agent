@@ -76,6 +76,8 @@ def _make_stub_extractor(params_instance: BaseModel) -> Any:
     "template_name",
     [
         "mean_reversion_template",
+        "bb_regime_reversion_template",
+        "donchian_regime_trend_template",
         "freqai_classifier_template",
         "freqai_regressor_template",
     ],
@@ -111,6 +113,8 @@ def test_render_template_substitutes_slot_lines() -> None:
     "template_name",
     [
         "mean_reversion_template",
+        "bb_regime_reversion_template",
+        "donchian_regime_trend_template",
         "freqai_classifier_template",
         "freqai_regressor_template",
     ],
