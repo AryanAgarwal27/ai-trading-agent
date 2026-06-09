@@ -327,6 +327,56 @@ async def test_manual_inject_rejections_write_no_row(
         assert after == before, "a rejected manual injection must write NO registry row"
 
 
+async def test_manual_inject_n_folds_without_data_start_is_422(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Stage 13: n_folds without data_start is ambiguous → 422, no row written."""
+    research_ran: list[str] = []
+    async with _app_with_manual_inject_graph(monkeypatch, research_ran) as client:
+        before = await _registry_count()
+        resp = await client.post(
+            "/strategies/validate",
+            json={
+                "template": "mean_reversion_template",
+                "params": _valid_mean_reversion_params(),
+                "pairs": ["BTC/USDT"],
+                "timeframe": "15m",
+                "n_folds": 4,  # no data_start
+            },
+            headers={"X-Operator-Token": TEST_OPERATOR_TOKEN},
+        )
+        assert resp.status_code == 422, resp.text
+        assert resp.json()["detail"]["reason"] == "n_folds_requires_data_start"
+        assert await _registry_count() == before
+
+
+async def test_manual_inject_out_of_range_data_start_is_422(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Stage 13: a data_start the cache can't honor → clear 422, no row written.
+
+    1900-01-01 is before any cached candle (or there's no cached feather at all in
+    a fresh CI env) — both resolve to the walk_forward_window_out_of_range reason.
+    """
+    research_ran: list[str] = []
+    async with _app_with_manual_inject_graph(monkeypatch, research_ran) as client:
+        before = await _registry_count()
+        resp = await client.post(
+            "/strategies/validate",
+            json={
+                "template": "mean_reversion_template",
+                "params": _valid_mean_reversion_params(),
+                "pairs": ["BTC/USDT"],
+                "timeframe": "15m",
+                "data_start": "1900-01-01",
+            },
+            headers={"X-Operator-Token": TEST_OPERATOR_TOKEN},
+        )
+        assert resp.status_code == 422, resp.text
+        assert resp.json()["detail"]["reason"] == "walk_forward_window_out_of_range"
+        assert await _registry_count() == before
+
+
 async def test_manual_inject_paper_gate_approve_spawns_paper(
     cleanup_strategy_ids: list[str], monkeypatch: pytest.MonkeyPatch
 ) -> None:

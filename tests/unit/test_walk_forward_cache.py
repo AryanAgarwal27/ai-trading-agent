@@ -17,12 +17,17 @@ from __future__ import annotations
 
 from datetime import UTC, date, datetime
 from pathlib import Path
+from typing import Any
 
 import pyarrow as pa
 import pyarrow.feather as feather
 import pytest
 
+from orchestrator.subgraphs import validation as wf
 from orchestrator.subgraphs.validation import (
+    _default_walk_forward_start,
+    check_walk_forward_window_fits,
+    prepare_validation_inputs,
     read_feather_date_range,
     walk_forward_from_cache,
 )
@@ -126,3 +131,95 @@ def test_cache_too_short_for_one_fold_raises_explicitly(tmp_path: Path) -> None:
 
     with pytest.raises(ValueError, match="too short"):
         walk_forward_from_cache(path)
+
+
+# ─── Stage 13: configurable walk-forward window (data_start override) ───────
+
+
+def _cache_a_feather(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, lo: date, hi: date) -> None:
+    """Place a BTC/USDT 15m feather where _anchor_feather_path looks for it."""
+    binance = tmp_path / "binance"
+    binance.mkdir()
+    _make_feather(binance / "BTC_USDT-15m.feather", lo, hi)
+    monkeypatch.setattr(wf, "SHARED_DATA_DIR", tmp_path)
+
+
+def test_window_fits_returns_none_for_in_range_start(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An explicit data_start whose 10mo/6-fold window sits inside the cache → OK."""
+    _cache_a_feather(tmp_path, monkeypatch, date(2024, 1, 1), date(2025, 6, 1))
+    # 2024-02-01 + 10mo = 2024-12-01, inside [2024-01-01, 2025-06-01].
+    assert check_walk_forward_window_fits(["BTC/USDT"], "15m", date(2024, 2, 1)) is None
+
+
+def test_window_before_cache_start_is_rejected(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _cache_a_feather(tmp_path, monkeypatch, date(2024, 1, 1), date(2025, 6, 1))
+    err = check_walk_forward_window_fits(["BTC/USDT"], "15m", date(2023, 1, 1))
+    assert err is not None
+    assert "before the cached range start" in err
+
+
+def test_window_past_cache_end_is_rejected(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A data_start so late the 10-month window overruns max_date → clear error."""
+    _cache_a_feather(tmp_path, monkeypatch, date(2024, 1, 1), date(2024, 12, 1))
+    err = check_walk_forward_window_fits(["BTC/USDT"], "15m", date(2024, 9, 1))
+    assert err is not None
+    assert "runs past the cached range end" in err
+
+
+def test_window_check_no_cached_feather_is_rejected(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(wf, "SHARED_DATA_DIR", tmp_path)  # empty → no feather
+    err = check_walk_forward_window_fits(["BTC/USDT"], "15m", date(2024, 2, 1))
+    assert err is not None
+    assert "no cached OHLCV" in err
+
+
+def test_window_check_fewer_folds_fit_a_short_cache(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A window that overruns at 6 folds (10mo) fits at 3 folds (7mo) from an
+    earlier start — the operator can dial n_folds down to fit a shorter span."""
+    _cache_a_feather(tmp_path, monkeypatch, date(2024, 1, 1), date(2024, 12, 1))
+    # 6 folds (10mo) from 2024-09-01 → ends 2025-07-01, past the 2024-12-01 max.
+    assert check_walk_forward_window_fits(["BTC/USDT"], "15m", date(2024, 9, 1)) is not None
+    # 3 folds (7mo) from 2024-05-01 → ends exactly 2024-12-01 (== max) → fits.
+    assert check_walk_forward_window_fits(["BTC/USDT"], "15m", date(2024, 5, 1), n_folds=3) is None
+
+
+# ─── prepare_validation_inputs honors / ignores the override ────────────────
+
+
+def test_prepare_validation_inputs_honors_data_start_override() -> None:
+    """An explicit data_start in artifacts anchors the folds there (Stage 13)."""
+    state: dict[str, Any] = {
+        "artifacts": {"walk_forward_override": {"data_start": "2024-09-01", "n_folds": 6}},
+    }
+    out = prepare_validation_inputs(state)  # type: ignore[arg-type]
+    folds = out["folds"]
+    assert len(folds) == 6
+    # Anchored: every fold's train_start == data_start; fold 1 train_start too.
+    assert folds[0]["train_timerange"].split("-")[0] == "20240901"
+    assert folds[-1]["train_timerange"].split("-")[0] == "20240901"
+
+
+def test_prepare_validation_inputs_override_n_folds() -> None:
+    state: dict[str, Any] = {
+        "artifacts": {"walk_forward_override": {"data_start": "2024-09-01", "n_folds": 3}},
+    }
+    out = prepare_validation_inputs(state)  # type: ignore[arg-type]
+    assert len(out["folds"]) == 3
+
+
+def test_prepare_validation_inputs_default_window_when_no_override() -> None:
+    """No override + no resolvable feather → byte-identical today-365 default."""
+    state: dict[str, Any] = {"artifacts": {}}  # no override, no pairs/tf → heuristic fallback
+    out = prepare_validation_inputs(state)  # type: ignore[arg-type]
+    folds = out["folds"]
+    assert len(folds) == 6
+    expected_start = _default_walk_forward_start().strftime("%Y%m%d")
+    assert folds[0]["train_timerange"].split("-")[0] == expected_start

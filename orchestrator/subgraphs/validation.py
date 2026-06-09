@@ -374,6 +374,58 @@ def walk_forward_from_cache(
     )
 
 
+def check_walk_forward_window_fits(
+    pairs: list[str],
+    timeframe: str,
+    data_start: date,
+    *,
+    n_folds: int = 6,
+    train_months: int = 4,
+    test_months: int = 1,
+) -> str | None:
+    """Validate an operator-specified walk-forward window fits the cached data.
+
+    Stage 13: the default planner anchors the window to the cache's MOST RECENT
+    span (``walk_forward_from_cache`` anchors the last OOS fold to ``max_date``),
+    so it always tests the latest ~10 months — currently a bear market. To
+    diagnose regime-vs-no-edge, the operator may pass an explicit earlier
+    ``data_start``. This guards that request: it returns ``None`` if the anchored
+    window ``[data_start, last-OOS-test-end]`` sits inside the cached feather's
+    real range, otherwise a clear, human-readable error string (the endpoint
+    raises it as a 422). It never lets a window run past the cached candles into
+    the zero-trade-fold hazard.
+
+    Returns the error string (caller → 422) or ``None`` if the window fits.
+    """
+    if n_folds < 1:
+        return f"n_folds must be >= 1; got {n_folds}"
+    feather_path = _anchor_feather_path(pairs, timeframe)
+    if feather_path is None:
+        anchor = pairs[0] if pairs else "<none>"
+        return (
+            f"no cached OHLCV for {anchor} {timeframe} under {SHARED_DATA_DIR}/binance — "
+            "cannot honor an explicit data_start; download the data first, or omit "
+            "data_start to use the default (cache-anchored) window"
+        )
+    min_date, max_date = read_feather_date_range(feather_path)
+    # Anchored window for n folds spans train + (n-1) slides + test months (BRD §5.4).
+    span_months = train_months + (n_folds - 1) + test_months
+    last_test_end = _add_months(data_start, span_months)
+    cache = f"cache {min_date.isoformat()}..{max_date.isoformat()}"
+    if data_start < min_date:
+        return (
+            f"data_start {data_start.isoformat()} is before the cached range start "
+            f"{min_date.isoformat()} ({cache})"
+        )
+    if last_test_end > max_date:
+        return (
+            f"requested window {data_start.isoformat()}..{last_test_end.isoformat()} "
+            f"({n_folds} folds = {span_months}mo) runs past the cached range end "
+            f"{max_date.isoformat()} ({cache}); reduce n_folds or move data_start earlier"
+        )
+    return None
+
+
 def _anchor_feather_path(pairs: list[str] | None, timeframe: str | None) -> Path | None:
     """Resolve the anchor pair's cached feather, or None if unresolvable.
 
@@ -431,15 +483,29 @@ def prepare_validation_inputs(state: ValidationState) -> dict[str, Any]:
         updates["param_sets"] = [{"id": ps_id, **params}]
 
     if "folds" not in state:
-        feather_path = _anchor_feather_path(state.get("pairs"), state.get("timeframe"))
-        if feather_path is not None:
-            # Real cache range (Stage 8i) — window provably inside the data.
-            updates["folds"] = walk_forward_from_cache(feather_path)
+        override = (state.get("artifacts") or {}).get("walk_forward_override") or {}
+        override_start = override.get("data_start")
+        if override_start:
+            # Stage 13: operator-specified window. Anchor folds at the REQUESTED
+            # data_start (an earlier span — e.g. a bull phase — not the cache's
+            # most-recent window) so failures can be diagnosed as regime-specific
+            # vs no-edge. The endpoint already validated this window fits the
+            # cache (check_walk_forward_window_fits → 422 otherwise), so plan it
+            # directly rather than re-anchoring to the latest candles.
+            updates["folds"] = plan_walk_forward(
+                data_start=date.fromisoformat(override_start),
+                n_folds=int(override.get("n_folds") or 6),
+            )
         else:
-            # No resolvable feather (offline test / pre-download): fall back
-            # to the today-365 heuristic so a data-less caller still gets a
-            # plan rather than crashing.
-            updates["folds"] = plan_walk_forward(data_start=_default_walk_forward_start())
+            feather_path = _anchor_feather_path(state.get("pairs"), state.get("timeframe"))
+            if feather_path is not None:
+                # Real cache range (Stage 8i) — window provably inside the data.
+                updates["folds"] = walk_forward_from_cache(feather_path)
+            else:
+                # No resolvable feather (offline test / pre-download): fall back
+                # to the today-365 heuristic so a data-less caller still gets a
+                # plan rather than crashing.
+                updates["folds"] = plan_walk_forward(data_start=_default_walk_forward_start())
 
     return updates
 

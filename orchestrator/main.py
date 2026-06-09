@@ -33,7 +33,7 @@ import uuid
 from collections import defaultdict
 from collections.abc import AsyncIterator
 from contextlib import AsyncExitStack, asynccontextmanager
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 from functools import partial
 from secrets import compare_digest
 from typing import Any
@@ -184,6 +184,22 @@ class ManualValidateBody(BaseModel):
     pairs: list[str] = Field(description="Trading pairs; a non-empty subset of PAIR_UNIVERSE.")
     timeframe: str = Field(description="Freqtrade timeframe, e.g. '5m'.")
     name: str | None = Field(default=None, description="Optional human label.")
+    # Stage 13: walk-forward window override. The default planner anchors the
+    # 6-fold window to the cache's MOST RECENT ~10 months (currently a bear
+    # market); pass an explicit earlier ``data_start`` to test the strategy on a
+    # different span (e.g. a bull phase) and diagnose regime-vs-no-edge. Omitting
+    # ``data_start`` keeps the byte-identical default behaviour. ``n_folds``
+    # (optional) tunes the fold count and REQUIRES ``data_start`` (else 422). The
+    # endpoint validates the window fits the 730-day cache (422 if it would push
+    # folds past available data).
+    data_start: date | None = Field(
+        default=None,
+        description="Walk-forward anchor (ISO date, e.g. '2024-09-01'). Default: cache-anchored.",
+    )
+    n_folds: int | None = Field(
+        default=None,
+        description="Walk-forward fold count override; requires data_start. Default: 6.",
+    )
 
 
 # ─── Env helpers ───────────────────────────────────────────────────────
@@ -1130,6 +1146,34 @@ async def validate_strategy_manual(
         ) from exc
     params = validated.model_dump()
 
+    # ── 2b. Walk-forward window override (Stage 13) — validate BEFORE any write. ──
+    # n_folds is a modifier of an explicit data_start; alone it is ambiguous
+    # (it would silently change the cache-anchored window's fold count), so reject.
+    if body.n_folds is not None and body.data_start is None:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail={
+                "reason": "n_folds_requires_data_start",
+                "message": "n_folds override requires an explicit data_start",
+            },
+        )
+    if body.data_start is not None:
+        # Local import mirrors the lifespan's (keeps validation's pyarrow/graph
+        # surface off main's module-load path).
+        from orchestrator.subgraphs.validation import check_walk_forward_window_fits
+
+        window_error = check_walk_forward_window_fits(
+            body.pairs,
+            body.timeframe,
+            body.data_start,
+            n_folds=body.n_folds or 6,
+        )
+        if window_error is not None:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail={"reason": "walk_forward_window_out_of_range", "message": window_error},
+            )
+
     # ── 3. Deterministic render + AST allowlist (no LLM). ──
     strategy_id = uuid.uuid4().hex
     thread_id = f"strategy_{strategy_id}"
@@ -1165,6 +1209,15 @@ async def validate_strategy_manual(
     thread_locks: defaultdict[str, asyncio.Lock] = request.app.state.thread_locks
     config = {"configurable": {"thread_id": thread_id}}
     now_iso = datetime.now(UTC).isoformat()
+    # Stage 13: stash any walk-forward override in artifacts (a free-form channel
+    # preserved across the as_node seed) so prepare_validation_inputs anchors the
+    # folds at the operator's data_start. Absent → default cache-anchored window.
+    artifacts: dict[str, Any] = {"generated_strategy_path": str(strategy_path)}
+    if body.data_start is not None:
+        artifacts["walk_forward_override"] = {
+            "data_start": body.data_start.isoformat(),
+            "n_folds": body.n_folds or 6,
+        }
     # Seed only real StrategyState channels (BRD §5.7). ``strategy_path`` is NOT a
     # parent channel — the validation subgraph derives it from
     # ``artifacts.generated_strategy_path`` in prepare_validation_inputs, exactly
@@ -1180,7 +1233,7 @@ async def validate_strategy_manual(
         "stage": "validation",
         "started_at": now_iso,
         "last_updated": now_iso,
-        "artifacts": {"generated_strategy_path": str(strategy_path)},
+        "artifacts": artifacts,
     }
 
     async with thread_locks[thread_id]:
